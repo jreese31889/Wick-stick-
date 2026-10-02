@@ -18,7 +18,11 @@ export type AnimationState =
   | 'ATTACK_LIGHT_3'
   | 'ATTACK_HEAVY'
   | 'ATTACK_KICK'
+  | 'ATTACK_SWEEP'
+  | 'ATTACK_FLYING_KICK'
   | 'ATTACK_GUN_SHOT'
+  | 'ATTACK_SPECIAL'
+  | 'ATTACK_SUPER'
   | 'HURT'
   | 'KNOCKBACK';
 
@@ -82,6 +86,9 @@ export interface InputState {
   interactJustPressed: boolean;
   focus: boolean;
   focusJustPressed: boolean;
+  /** Combo-meter special / super move (keyboard chord, PUNCH+KICK chord, pad chord) */
+  special: boolean;
+  specialJustPressed: boolean;
 }
 
 export interface PlayerPhysics {
@@ -139,7 +146,18 @@ export interface BladeSlashArc {
   maxLife: number;
 }
 
-export type EnemyType = 'BASIC' | 'RUSHER' | 'HEAVY' | 'DEFENDER' | 'ELITE' | 'BOSS' | 'MARQUIS';
+export type EnemyType =
+  | 'BASIC'
+  | 'RUSHER'
+  | 'HEAVY'
+  | 'DEFENDER'
+  | 'ELITE'
+  | 'GUNNER'
+  | 'BOSS'
+  | 'MARQUIS'
+  | 'BERSERKER'
+  | 'ACROBAT'
+  | 'SNIPER';
 
 export type EnemyActionState =
   | 'IDLE'
@@ -148,6 +166,8 @@ export type EnemyActionState =
   | 'ATTACK'
   | 'RECOVERY'
   | 'BLOCK'
+  | 'DODGE'
+  | 'COUNTER'
   | 'HURT'
   | 'STAGGER'
   | 'KNOCKBACK'
@@ -163,7 +183,6 @@ export interface Hitbox {
   knockbackX: number;
   knockbackY: number;
   hitStopFrames: number;
-  soundType: 'punch' | 'heavy' | 'kick' | 'parry' | 'whoosh' | 'slam';
 }
 
 export interface DamagePopup {
@@ -287,6 +306,30 @@ export interface GoldCoin {
   value: number;
 }
 
+export interface HealthPack {
+  id: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  rot: number;
+  vRot: number;
+  life: number;
+  healAmount: number;
+}
+
+export interface EnemyBullet {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  maxLife: number;
+  damage: number;
+  /** Sniper rounds ignore the player's guard — dodge is the only answer */
+  pierceBlock?: boolean;
+}
+
 export type RoomTheme = 'CONTINENTAL_LOUNGE' | 'NEON_GALLERY' | 'RAINY_ALLEY' | 'PENTHOUSE_SUITE';
 
 export type PerkId =
@@ -305,4 +348,11 @@ export interface PerkDef {
   description: string;
   icon: string;
 }
+
+// ============================================================
+// COMBAT DEPTH (workstream 2): player specials, reinforcements, hazards
+// ============================================================
+
+/** Combo-meter finishers. Costs are declared on PlayerController. */
+export type SpecialMoveId = 'SPIN_SLASH' | 'EXECUTIONER';
 

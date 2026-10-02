@@ -1,8 +1,16 @@
-import { AnimationState, InputState, PerkId, PlayerPhysics, StickFigurePose, WeaponType } from '../types/game';
+import { AnimationState, InputState, PerkId, PlayerPhysics, SpecialMoveId, StickFigurePose, WeaponType } from '../types/game';
 import { clamp, lerp } from './MathUtils';
 import { AnimationController } from './AnimationController';
 import { StickRig } from './StickRig';
 import { SoundFX } from './SoundFX';
+import { Ragdoll } from './Ragdoll';
+
+/** Rate-limited step toward a target: reaches it exactly, at any frame rate. */
+function moveToward(current: number, target: number, maxDelta: number): number {
+  const delta = target - current;
+  if (Math.abs(delta) <= maxDelta) return target;
+  return current + Math.sign(delta) * maxDelta;
+}
 
 export class PlayerController {
   public physics: PlayerPhysics;
@@ -10,6 +18,12 @@ export class PlayerController {
   private animController = new AnimationController();
   public rig = new StickRig();
   public currentPose: StickFigurePose;
+
+  // Ragdoll for the death kill-cam (rendered instead of the keyframed rig)
+  public ragdoll: Ragdoll | null = null;
+  // Last received blow, used to seed the death ragdoll's tumble
+  public lastHitKbx = 0;
+  public lastHitKby = 0;
 
   // Constants
   private readonly RUN_SPEED = 320;
@@ -25,11 +39,48 @@ export class PlayerController {
   private jumpBufferTimer = 0;
   private coyoteTimer = 0;
 
-  // Combat combo tracking
+  // Hysteresis for the gait selector so RUN/WALK/IDLE can't flicker as the
+  // speed hovers on a boundary (a flicker would restart the pose cross-fade
+  // every frame and make the legs stutter).
+  private locomotionState: 'IDLE' | 'WALK' | 'RUN' = 'IDLE';
+  /** How long the hurt flinch owns the pose before locomotion resumes. */
+  private static readonly HURT_HOLD = 0.35;
+
+  // Combat combo tracking (string step) + CombatDirector chain finisher flag
   private comboStep = 0;
   private comboTimer = 0;
+  /** Armed by CombatDirector once a chain crosses 5x — next press is the finisher. */
+  public finisherArmed = false;
   public hasFiredBulletThisShot = false;
   public hasThrownKnifeThisFrame = false;
+  /**
+   * SHOOT edge for the pistol, deferred to CombatDirector: only the director
+   * can see live enemies, so it decides between a point-blank PISTOL WHIP and
+   * a real shot (ammo spend, recoil, tracer) and resolves the result here.
+   */
+  public pendingPistolShot = false;
+  /**
+   * Seconds spent at (nearly) full run speed with the stick held — the KICK
+   * button turns into a FLYING KICK once this crosses FLYING_KICK_SUSTAIN.
+   */
+  private runSustainTimer = 0;
+  private static readonly FLYING_KICK_SUSTAIN = 0.3;
+
+  // ---- Combo-meter specials (charged by landing hits, paid for by CombatDirector) ----
+  /** Mirror of CombatDirector.stats.comboCount, synced every frame by the director. */
+  public comboMeter = 0;
+  /** Set on trigger; the director validates the cost, burns the meter and resolves the hit. */
+  public pendingSpecial: SpecialMoveId | null = null;
+  /** One-frame flag: the special chord was pressed without enough combo in the tank. */
+  public specialDenied = false;
+  /** i-frames covering the special / super animation. */
+  public specialInvulnTimer = 0;
+  private specialDenyCooldown = 0;
+
+  /** Combo points burned by SPIN_SLASH. */
+  public static readonly SPECIAL_COST = 5;
+  /** Combo points burned by the EXECUTIONER super. */
+  public static readonly SUPER_COST = 15;
 
   constructor(startX: number = 0, startY: number = 0) {
     this.physics = {
@@ -88,6 +139,8 @@ export class PlayerController {
       interactJustPressed: false,
       focus: false,
       focusJustPressed: false,
+      special: false,
+      specialJustPressed: false,
     };
 
     this.currentPose = this.animController.generatePose(
@@ -134,6 +187,8 @@ export class PlayerController {
     if (this.physics.perks['KEVLAR_WEAVE']) {
       damage *= 0.8; // 20% ballistic weave protection
     }
+    this.lastHitKbx = knockbackX;
+    this.lastHitKby = knockbackY;
     this.physics.health = Math.max(0, this.physics.health - damage);
     this.physics.velocity.x = knockbackX;
     this.physics.velocity.y = knockbackY;
@@ -146,6 +201,9 @@ export class PlayerController {
     this.physics.stateTimer += dt;
     this.comboTimer = Math.max(0, this.comboTimer - dt);
     this.hasThrownKnifeThisFrame = false;
+    this.specialDenied = false;
+    if (this.specialInvulnTimer > 0) this.specialInvulnTimer = Math.max(0, this.specialInvulnTimer - dt);
+    if (this.specialDenyCooldown > 0) this.specialDenyCooldown = Math.max(0, this.specialDenyCooldown - dt);
 
     // Twin-stick aim calculation (Right Stick / Touch aim)
     if (input.aimActive) {
@@ -201,21 +259,53 @@ export class PlayerController {
       }
     }
 
+    // Sustained full-speed run detection — the KICK button reads this to decide
+    // between a standing power kick and a Xiao Xiao FLYING KICK.
+    const atFullRun =
+      this.physics.grounded &&
+      Math.abs(input.moveX) > 0.6 &&
+      this.physics.velocity.x !== 0 &&
+      Math.sign(input.moveX) === Math.sign(this.physics.velocity.x) &&
+      Math.abs(this.physics.velocity.x) >= this.RUN_SPEED * 0.95;
+    if (
+      atFullRun &&
+      !this.isAttackState(this.physics.state) &&
+      !this.physics.isDodging &&
+      !this.physics.isSliding &&
+      !this.physics.isBlocking
+    ) {
+      this.runSustainTimer += dt;
+    } else {
+      this.runSustainTimer = 0;
+    }
+
     // 1. STATE TRANSITION & INPUT HANDLING
     this.handleActions(input, dt);
 
     // 2. MOVEMENT & PHYSICS INTEGRATION
     this.handleMovement(input, dt);
 
-    // 3. SECONDARY RIG PHYSICS (Tie & Coat Flutter)
+    // 3. SECONDARY RIG PHYSICS (Verlet necktie pinned at collar + coat flutter)
+    const moveSpeed = Math.hypot(this.physics.velocity.x, this.physics.velocity.y);
+    const tieFlutter = Math.min(
+      1,
+      (this.isAttackState(this.physics.state) ? 0.65 : 0) +
+        (this.physics.isDodging ? 0.85 : 0) +
+        Math.min(0.5, moveSpeed / 700)
+    );
     this.rig.updatePhysics(
       this.physics.velocity.x,
       this.physics.velocity.y,
       this.physics.facingRight,
-      dt
+      dt,
+      this.currentPose.neck.x,
+      this.currentPose.neck.y,
+      tieFlutter
     );
 
     // 4. SKELETAL POSE CALCULATION
+    // Specials have their own authored poses (SPIN_SLASH whirl, EXECUTIONER
+    // wind-up), so every state maps 1:1 onto the pose it should read as.
     this.currentPose = this.animController.generatePose(
       this.physics.state,
       this.physics.stateTimer,
@@ -224,7 +314,8 @@ export class PlayerController {
       this.physics.facingRight,
       dt,
       this.physics.position.x,
-      this.physics.position.y
+      this.physics.position.y,
+      this.physics.grounded
     );
   }
 
@@ -255,6 +346,7 @@ export class PlayerController {
         this.physics.isSliding = true;
         const dir = this.physics.facingRight ? 1 : -1;
         this.physics.velocity.x = dir * this.SLIDE_SPEED;
+        SoundFX.playSlide();
         return;
       } else {
         // COMBAT DODGE ROLL
@@ -322,40 +414,68 @@ export class PlayerController {
         }
       }
 
-      if (this.physics.ammo > 0) {
-        this.physics.ammo--;
-        this.hasFiredBulletThisShot = true;
-        this.physics.isReloading = false;
-        this.setState('ATTACK_GUN_SHOT');
-        SoundFX.playGunshot();
-        const recoilDir = this.physics.facingRight ? -1 : 1;
-        this.physics.velocity.x = recoilDir * 110;
-        return;
-      } else {
-        SoundFX.playPunch('light'); // Empty chamber click
-        if (!this.physics.isReloading) {
-          this.physics.isReloading = true;
-          this.physics.reloadTimer = 0.95;
-          SoundFX.playReload();
-        }
-      }
-    }
-
-    // ATTACK COMBO TRIGGERING
-    if (input.attackJustPressed && !this.physics.isBlocking && !this.physics.isDodging) {
-      this.triggerAttack(false);
+      // Pistol: defer the whole resolution (point-blank PISTOL WHIP, real
+      // shot, or empty-chamber click) to CombatDirector — it is the only
+      // system with a view of live enemy range. No ammo is spent here.
+      this.pendingPistolShot = true;
       return;
     }
 
+    // COMBO SPECIAL / SUPER — spends the combo meter (5 / 15 points)
+    if (
+      input.specialJustPressed &&
+      !isAttacking &&
+      !this.physics.isBlocking &&
+      !this.physics.isDodging &&
+      !this.physics.isSliding &&
+      this.physics.grounded &&
+      this.specialDenyCooldown <= 0
+    ) {
+      if (this.comboMeter >= PlayerController.SUPER_COST) {
+        this.triggerSpecial('EXECUTIONER');
+        return;
+      }
+      if (this.comboMeter >= PlayerController.SPECIAL_COST) {
+        this.triggerSpecial('SPIN_SLASH');
+        return;
+      }
+      // Not enough combo stored — flash the cost and fall through so a
+      // PUNCH+KICK chord still lands the punch instead of eating the input.
+      this.specialDenied = true;
+      this.specialDenyCooldown = 0.9;
+      SoundFX.playPunch('light');
+    }
+
+    // PUNCH BUTTON — jab / cross / spinning string (short reach, fast)
+    if (input.attackJustPressed && !this.physics.isBlocking && !this.physics.isDodging) {
+      if (this.finisherArmed) {
+        this.triggerFinisher();
+      } else {
+        this.triggerPunch();
+      }
+      return;
+    }
+
+    // KICK BUTTON — long-reach power kick (heavy damage, guard crush)
     if (input.heavyAttackJustPressed && !this.physics.isBlocking && !this.physics.isDodging) {
-      this.triggerAttack(true);
+      if (this.finisherArmed) {
+        this.triggerFinisher();
+      } else {
+        this.triggerKick();
+      }
       return;
     }
 
     // RECOVERY FROM ATTACKS
     if (isAttacking) {
       const attackDuration = this.getAttackDuration(this.physics.state);
-      if (this.physics.stateTimer >= attackDuration) {
+      if (this.physics.state === 'ATTACK_FLYING_KICK') {
+        // The airborne kick holds its extension until the feet find the floor,
+        // then recovers as soon as the minimum strike time has elapsed.
+        if (this.physics.grounded && this.physics.stateTimer >= attackDuration) {
+          this.setState('IDLE');
+        }
+      } else if (this.physics.stateTimer >= attackDuration) {
         this.setState('IDLE');
       }
       return;
@@ -390,8 +510,8 @@ export class PlayerController {
     }
   }
 
-  private triggerAttack(isHeavy: boolean): void {
-    // If wielding katana, play katana slash audio and reduce durability
+  /** Blade upkeep for any armed melee strike (durability burn + slash audio). */
+  private consumeWeaponOnStrike(): void {
     if (this.physics.equippedWeapon === 'KATANA') {
       SoundFX.playBladeSlash();
       this.physics.weaponDurability--;
@@ -399,14 +519,11 @@ export class PlayerController {
         this.physics.equippedWeapon = 'UNARMED';
       }
     }
+  }
 
-    if (isHeavy) {
-      this.setState('ATTACK_HEAVY');
-      const dir = this.physics.facingRight ? 1 : -1;
-      this.physics.velocity.x = dir * 180; // Heavy forward lunge
-      this.comboStep = 0;
-      return;
-    }
+  /** PUNCH — branching jab (LIGHT_1) → cross (LIGHT_2) → spin finisher (LIGHT_3). */
+  private triggerPunch(): void {
+    this.consumeWeaponOnStrike();
 
     // Branching light combo sequence
     if (this.comboTimer > 0 && this.comboStep === 1) {
@@ -430,31 +547,135 @@ export class PlayerController {
     }
   }
 
+  /** KICK — contextual: LEG SWEEP ender, FLYING KICK out of a sprint, or power kick. */
+  private triggerKick(): void {
+    // LEG SWEEP ender: PUNCH, PUNCH, KICK — the third chain hit drops low.
+    if (this.comboTimer > 0 && this.comboStep === 2) {
+      this.consumeWeaponOnStrike();
+      this.setState('ATTACK_SWEEP');
+      const sweepDir = this.physics.facingRight ? 1 : -1;
+      this.physics.velocity.x = sweepDir * 210;
+      this.comboStep = 0;
+      this.comboTimer = 0;
+      this.runSustainTimer = 0;
+      SoundFX.playWhoosh(0.95);
+      return;
+    }
+
+    // FLYING KICK (Xiao Xiao): only launches out of a sustained full sprint.
+    if (
+      this.physics.grounded &&
+      this.runSustainTimer >= PlayerController.FLYING_KICK_SUSTAIN &&
+      Math.abs(this.physics.velocity.x) >= this.RUN_SPEED * 0.95
+    ) {
+      this.consumeWeaponOnStrike();
+      this.setState('ATTACK_FLYING_KICK');
+      const flyDir = this.physics.facingRight ? 1 : -1;
+      this.physics.velocity.x = flyDir * 470;
+      this.physics.velocity.y = -300;
+      this.physics.grounded = false;
+      this.runSustainTimer = 0;
+      this.comboStep = 0;
+      this.comboTimer = 0;
+      SoundFX.playWhoosh(1.35);
+      return;
+    }
+
+    this.consumeWeaponOnStrike();
+    this.setState('ATTACK_KICK');
+    const dir = this.physics.facingRight ? 1 : -1;
+    this.physics.velocity.x = dir * 240; // Committing forward thrust
+    this.comboStep = 0;
+    this.comboTimer = 0;
+    this.runSustainTimer = 0;
+  }
+
+  /** CHAIN FINISHER — auto-loaded once a landed combo crosses 5 hits. */
+  private triggerFinisher(): void {
+    this.consumeWeaponOnStrike();
+    this.setState('ATTACK_HEAVY');
+    const dir = this.physics.facingRight ? 1 : -1;
+    this.physics.velocity.x = dir * 260;
+    this.comboStep = 0;
+    this.comboTimer = 0;
+    SoundFX.playWhoosh(1.4);
+  }
+
+  /**
+   * SPECIAL / SUPER — consumes combo meter points once CombatDirector accepts
+   * the trigger. The move plays with i-frames; the director burns the meter
+   * and resolves the area damage during the strike window.
+   */
+  private triggerSpecial(id: SpecialMoveId): void {
+    this.consumeWeaponOnStrike();
+    this.pendingSpecial = id;
+    this.comboStep = 0;
+    this.comboTimer = 0;
+    const dir = this.physics.facingRight ? 1 : -1;
+
+    if (id === 'EXECUTIONER') {
+      this.setState('ATTACK_SUPER');
+      this.physics.velocity.x = dir * 50;
+      this.specialInvulnTimer = 0.85;
+      SoundFX.playWhoosh(1.7);
+    } else {
+      this.setState('ATTACK_SPECIAL');
+      this.physics.velocity.x = dir * 170;
+      this.specialInvulnTimer = 0.5;
+      SoundFX.playWhoosh(1.25);
+    }
+  }
+
+  /** Called by CombatDirector when the trigger cannot be honoured (grappling, out of meter). */
+  public cancelSpecial(): void {
+    this.pendingSpecial = null;
+    this.specialInvulnTimer = 0;
+    if (this.physics.state === 'ATTACK_SPECIAL' || this.physics.state === 'ATTACK_SUPER') {
+      this.physics.state = 'IDLE';
+      this.physics.stateTimer = 0;
+      this.physics.velocity.x = 0;
+    }
+  }
+
   private handleMovement(input: InputState, dt: number): void {
     const isAttacking = this.isAttackState(this.physics.state);
 
-    // Horizontal Movement
+    // Horizontal movement — rate-limited so velocity actually reaches the
+    // target (an exponential approach never arrives, which reads as input lag
+    // at the top end of the stick).
     if (!this.physics.isDodging && !this.physics.isSliding && !this.physics.isBlocking && !isAttacking) {
       const targetSpeed = input.moveX * this.RUN_SPEED;
-      
+
       if (Math.abs(input.moveX) > 0.08) {
-        // Accelerating
-        this.physics.velocity.x = lerp(this.physics.velocity.x, targetSpeed, 14 * dt);
-        this.physics.facingRight = input.moveX > 0;
+        this.physics.velocity.x = moveToward(
+          this.physics.velocity.x,
+          targetSpeed,
+          this.ACCELERATION * dt
+        );
+
+        // Pivot instead of snapping: only mirror the body once momentum agrees
+        // with the new direction (or has died), so reversing at speed reads as a
+        // plant-and-turn rather than an instant full-body flip.
+        const wantRight = input.moveX > 0;
+        if (wantRight !== this.physics.facingRight) {
+          const carrying = Math.sign(this.physics.velocity.x) === (wantRight ? 1 : -1);
+          if (Math.abs(this.physics.velocity.x) < 80 || carrying) {
+            this.physics.facingRight = wantRight;
+          }
+        }
       } else {
-        // Braking / Friction
-        const currentSpeed = Math.abs(this.physics.velocity.x);
-        const drop = this.FRICTION * dt;
-        const newSpeed = Math.max(0, currentSpeed - drop);
-        this.physics.velocity.x = (this.physics.velocity.x > 0 ? 1 : -1) * newSpeed;
+        this.physics.velocity.x = moveToward(this.physics.velocity.x, 0, this.FRICTION * dt);
       }
     } else if (this.physics.isSliding) {
-      // Slide deceleration
-      const dir = Math.sign(this.physics.velocity.x);
-      this.physics.velocity.x -= dir * 900 * dt;
+      // Constant-rate slide scrub: predictable length, ties to the 0.42s exit
+      this.physics.velocity.x = moveToward(this.physics.velocity.x, 0, 950 * dt);
+    } else if (this.physics.state === 'ATTACK_FLYING_KICK') {
+      // Airborne launch: keep the sprint's momentum and let gravity draw the
+      // arc — only a slow bleed, so the kick actually covers ground.
+      this.physics.velocity.x = moveToward(this.physics.velocity.x, 0, 110 * dt);
     } else if (this.physics.isBlocking || isAttacking) {
-      // Natural attack/block friction
-      this.physics.velocity.x *= 0.88;
+      // Natural attack/block friction — frame-rate independent decay
+      this.physics.velocity.x *= Math.exp(-7.7 * dt);
     }
 
     // Apply Gravity
@@ -485,12 +706,24 @@ export class PlayerController {
       this.physics.isWallSliding = false;
     }
 
+    // The hurt flinch owns the pose for its duration — including the frame it
+    // lands on — so the hit reaction actually plays instead of being stomped by
+    // LAND / locomotion one frame after it starts.
+    const inHurtFlinch =
+      this.physics.state === 'HURT' &&
+      this.physics.stateTimer < PlayerController.HURT_HOLD;
+
     // Ground Collision Check
     if (this.physics.position.y >= this.GROUND_Y) {
       if (!this.physics.grounded) {
         // Just landed
         this.physics.grounded = true;
-        if (!this.physics.isDodging && !this.physics.isSliding && !isAttacking) {
+        if (
+          !inHurtFlinch &&
+          !this.physics.isDodging &&
+          !this.physics.isSliding &&
+          !isAttacking
+        ) {
           this.setState('LAND');
         }
       }
@@ -499,13 +732,16 @@ export class PlayerController {
     }
 
     // State Selection for locomotion when not locked in action
-    if (this.physics.grounded && !this.physics.isDodging && !this.physics.isSliding && !this.physics.isBlocking && !isAttacking) {
+    if (inHurtFlinch) {
+      // Hold the flinch; locomotion takes back over the frame it decays.
+    } else if (this.physics.grounded && !this.physics.isDodging && !this.physics.isSliding && !this.physics.isBlocking && !isAttacking) {
       if (this.physics.state === 'LAND' && this.physics.stateTimer < 0.12) {
         // Stay in land compression briefly
-      } else if (Math.abs(this.physics.velocity.x) > 30) {
-        this.setState('RUN');
       } else {
-        this.setState('IDLE');
+        this.locomotionState = this.pickGait(Math.abs(this.physics.velocity.x));
+        if (this.locomotionState === 'RUN') this.setState('RUN');
+        else if (this.locomotionState === 'WALK') this.setState('WALK');
+        else this.setState('IDLE');
       }
     } else if (!this.physics.grounded && !isAttacking && !this.physics.isDodging) {
       if (this.physics.velocity.y < 0) {
@@ -518,11 +754,38 @@ export class PlayerController {
     this.physics.moveSpeed = Math.abs(this.physics.velocity.x);
   }
 
+  /**
+   * Gait selector with hysteresis: each state has its own enter/exit band so
+   * hovering around a speed boundary can't toggle the pose every frame.
+   */
+  private pickGait(speed: number): 'IDLE' | 'WALK' | 'RUN' {
+    switch (this.locomotionState) {
+      case 'RUN':
+        if (speed >= 130) return 'RUN';
+        return speed >= 26 ? 'WALK' : 'IDLE';
+      case 'WALK':
+        if (speed >= 170) return 'RUN';
+        return speed >= 14 ? 'WALK' : 'IDLE';
+      default:
+        if (speed >= 170) return 'RUN';
+        return speed >= 26 ? 'WALK' : 'IDLE';
+    }
+  }
+
   private setState(newState: AnimationState): void {
     if (this.physics.state !== newState) {
       this.physics.state = newState;
       this.physics.stateTimer = 0;
     }
+  }
+
+  /**
+   * Direct state injection for director-driven reactions (pistol whip,
+   * parry counter, gun-fu execution shot) — always restarts the timer.
+   */
+  public forceState(newState: AnimationState): void {
+    this.physics.state = newState;
+    this.physics.stateTimer = 0;
   }
 
   private isAttackState(s: AnimationState): boolean {
@@ -534,7 +797,12 @@ export class PlayerController {
       case 'ATTACK_LIGHT_1': return 0.20;
       case 'ATTACK_LIGHT_2': return 0.22;
       case 'ATTACK_LIGHT_3': return 0.26;
+      case 'ATTACK_KICK': return 0.34;
+      case 'ATTACK_SWEEP': return 0.30;
+      case 'ATTACK_FLYING_KICK': return 0.40;
       case 'ATTACK_HEAVY': return 0.32;
+      case 'ATTACK_SPECIAL': return 0.58;
+      case 'ATTACK_SUPER': return 0.95;
       case 'ATTACK_GUN_SHOT': return 0.22;
       default: return 0.25;
     }

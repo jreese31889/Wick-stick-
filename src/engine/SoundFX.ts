@@ -1,451 +1,264 @@
 /**
- * Procedural Web Audio API sound synthesizer for Wick Stick
- * Zero external asset dependencies, zero network latency, instant punchy audio.
+ * Sample-based Web Audio sound effects for John Stick.
+ *
+ * The 20 CC0 recordings in `public/assets/audio` (see SOURCES.md) are fetched
+ * and decoded into AudioBuffers once at init, then triggered as one-shots.
+ * Every public method keeps the exact signature of the old oscillator synth,
+ * so no call site had to change. A sample that fails to fetch/decode is simply
+ * never in the bank — playback then falls through as a silent no-op, so a dead
+ * asset can never crash the fight.
+ *
+ * Per-hit `playbackRate` jitter keeps repeated triggers (a punch string, a
+ * volley of shots) from sounding machine-gunned.
  */
+
+const SAMPLE_FILES = {
+  shot1: 'gun_pistol_shot1.ogg',
+  shot2: 'gun_pistol_shot2.ogg',
+  shot3: 'gun_pistol_shot3.ogg',
+  shot4: 'gun_pistol_shot4.ogg',
+  reload: 'sfx_reload.ogg',
+  gunCock: 'sfx_gun_cock.ogg',
+  punchLight: 'sfx_punch_light.ogg',
+  punchHeavy: 'sfx_punch_heavy.ogg',
+  kick: 'sfx_kick.ogg',
+  slam: 'sfx_slam.ogg',
+  whoosh: 'sfx_whoosh.ogg',
+  whoosh2: 'sfx_whoosh2.ogg',
+  block: 'sfx_block.ogg',
+  katana: 'sfx_katana_slash.ogg',
+  knifeThrow: 'sfx_knife_throw.ogg',
+  knifeStab: 'sfx_knife_stab.ogg',
+  glass: 'sfx_glass.ogg',
+  coin: 'sfx_coin.ogg',
+  door: 'sfx_door.ogg',
+  slide: 'sfx_slide.ogg',
+} as const;
+
+type SampleId = keyof typeof SAMPLE_FILES;
+
+/** Directory of the CC0 sample pack. */
+const AUDIO_BASE = '/assets/audio/';
+
+const SAMPLE_URLS: Record<SampleId, string> = (() => {
+  const urls = {} as Record<SampleId, string>;
+  for (const id of Object.keys(SAMPLE_FILES) as SampleId[]) {
+    urls[id] = `${AUDIO_BASE}${SAMPLE_FILES[id]}`;
+  }
+  return urls;
+})();
+
+const GUNSHOT_SAMPLES: SampleId[] = ['shot1', 'shot2', 'shot3', 'shot4'];
+
 class SoundEngine {
-  private ctx: AudioContext | null = null;
   public enabled: boolean = true;
+
+  private ctx: AudioContext | null = null;
+  private buffers = new Map<SampleId, AudioBuffer>();
+  private loadStarted = false;
+
+  /**
+   * Builds the AudioContext and starts fetching + decoding every sample.
+   * Safe to call repeatedly (from the engine constructor and from the first
+   * effect) — the fetch pass runs exactly once.
+   *
+   * Deliberately *not* run at module import: main.tsx installs the master SFX
+   * bus on AudioContext.prototype before the first context is constructed, and
+   * the engine (GameLoop) or the first played effect triggers this after that.
+   */
+  public preload(): void {
+    this.initCtx();
+    this.loadSamples();
+  }
 
   private initCtx() {
     if (!this.ctx && typeof window !== 'undefined') {
-      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       if (AudioContextClass) {
-        this.ctx = new AudioContextClass();
+        try {
+          this.ctx = new AudioContextClass();
+        } catch {
+          this.ctx = null;
+        }
       }
     }
     if (this.ctx && this.ctx.state === 'suspended') {
-      this.ctx.resume();
+      void this.ctx.resume().catch(() => undefined);
     }
   }
 
+  /** Fetch + decode the whole sample bank. Failures are dropped silently. */
+  private loadSamples(): void {
+    if (this.loadStarted) return;
+    this.initCtx();
+    const ctx = this.ctx;
+    // No context yet (blocked/unsupported): leave the latch open so the next
+    // effect retries instead of silently playing nothing forever.
+    if (!ctx || typeof fetch !== 'function') return;
+    this.loadStarted = true;
+
+    for (const id of Object.keys(SAMPLE_URLS) as SampleId[]) {
+      fetch(SAMPLE_URLS[id])
+        .then((res) => {
+          if (!res.ok) throw new Error(`sample ${id} -> ${res.status}`);
+          return res.arrayBuffer();
+        })
+        .then((raw) => ctx.decodeAudioData(raw))
+        .then((audio) => {
+          this.buffers.set(id, audio);
+        })
+        .catch(() => {
+          // Missing/broken sample: stay out of the bank, play silently.
+        });
+    }
+  }
+
+  /**
+   * One-shot sample trigger.
+   *
+   * @param volume  per-effect gain (files are peak-normalised to -1 dBFS)
+   * @param rate    playbackRate centre
+   * @param jitter  ± spread applied to playbackRate (0 disables)
+   * @param delay   seconds to schedule the start in the future
+   */
+  private playSample(id: SampleId, volume: number, rate = 1, jitter = 0, delay = 0): void {
+    if (!this.enabled) return;
+
+    // First effect of the session kicks off the bank load too (guarded).
+    if (!this.loadStarted) this.preload();
+
+    this.initCtx();
+    const ctx = this.ctx;
+    if (!ctx) return;
+
+    const buffer = this.buffers.get(id);
+    if (!buffer) return; // Not loaded (or failed to load) — silent skip.
+
+    try {
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      const jittered = jitter > 0 ? rate + (Math.random() * 2 - 1) * jitter : rate;
+      source.playbackRate.value = Math.min(3, Math.max(0.25, jittered));
+
+      const gain = ctx.createGain();
+      gain.gain.value = volume;
+      source.connect(gain);
+      // ctx.destination is patched by the master SFX bus (settings.ts).
+      gain.connect(ctx.destination);
+
+      source.start(ctx.currentTime + Math.max(0, delay));
+    } catch {
+      // Audio safety — a dead node must never take the frame down.
+    }
+  }
+
+  /** Swing / whiff air movement. Pitch parameter scales playbackRate. */
   public playWhoosh(pitchMultiplier = 1.0) {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-      const filter = this.ctx.createBiquadFilter();
-
-      const now = this.ctx.currentTime;
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(280 * pitchMultiplier, now);
-      osc.frequency.exponentialRampToValueAtTime(70 * pitchMultiplier, now + 0.12);
-
-      filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(600, now);
-      filter.frequency.exponentialRampToValueAtTime(200, now + 0.12);
-
-      gain.gain.setValueAtTime(0.01, now);
-      gain.gain.linearRampToValueAtTime(0.2, now + 0.03);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
-
-      osc.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.ctx.destination);
-
-      osc.start(now);
-      osc.stop(now + 0.13);
-    } catch {
-      // Audio safety
-    }
+    const id: SampleId = Math.random() < 0.5 ? 'whoosh' : 'whoosh2';
+    this.playSample(id, 0.4, pitchMultiplier, 0.05);
   }
 
+  /** Impacts: light jab / heavy punch / kick thud / body slam. */
   public playPunch(type: 'light' | 'heavy' | 'kick' | 'slam' = 'light') {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-
-      // 1. Transient Click / Slap
-      const clickOsc = this.ctx.createOscillator();
-      const clickGain = this.ctx.createGain();
-      clickOsc.type = 'sine';
-      clickOsc.frequency.setValueAtTime(type === 'heavy' ? 450 : 600, now);
-      clickOsc.frequency.exponentialRampToValueAtTime(80, now + 0.04);
-
-      clickGain.gain.setValueAtTime(0.35, now);
-      clickGain.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
-
-      clickOsc.connect(clickGain);
-      clickGain.connect(this.ctx.destination);
-      clickOsc.start(now);
-      clickOsc.stop(now + 0.05);
-
-      // 2. Low Frequency Sub-Bass Impact Thud
-      const bassOsc = this.ctx.createOscillator();
-      const bassGain = this.ctx.createGain();
-      bassOsc.type = 'triangle';
-
-      const baseFreq = type === 'slam' ? 95 : type === 'heavy' ? 110 : type === 'kick' ? 120 : 140;
-      const duration = type === 'slam' ? 0.25 : type === 'heavy' ? 0.22 : 0.15;
-      const volume = type === 'heavy' || type === 'slam' ? 0.45 : 0.25;
-
-      bassOsc.frequency.setValueAtTime(baseFreq, now);
-      bassOsc.frequency.exponentialRampToValueAtTime(32, now + duration);
-
-      bassGain.gain.setValueAtTime(volume, now);
-      bassGain.gain.exponentialRampToValueAtTime(0.001, now + duration);
-
-      bassOsc.connect(bassGain);
-      bassGain.connect(this.ctx.destination);
-      bassOsc.start(now);
-      bassOsc.stop(now + duration + 0.01);
-
-      // 3. Noise Crunch for Heavy / Slam hits
-      if (type === 'heavy' || type === 'slam' || type === 'kick') {
-        const bufferSize = Math.floor(this.ctx.sampleRate * 0.08);
-        const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
-        const data = buffer.getChannelData(0);
-        for (let i = 0; i < bufferSize; i++) {
-          data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.25));
-        }
-
-        const noise = this.ctx.createBufferSource();
-        noise.buffer = buffer;
-
-        const noiseFilter = this.ctx.createBiquadFilter();
-        noiseFilter.type = 'bandpass';
-        noiseFilter.frequency.setValueAtTime(type === 'slam' ? 800 : 1200, now);
-        noiseFilter.Q.setValueAtTime(2.0, now);
-
-        const noiseGain = this.ctx.createGain();
-        noiseGain.gain.setValueAtTime(0.3, now);
-        noiseGain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
-
-        noise.connect(noiseFilter);
-        noiseFilter.connect(noiseGain);
-        noiseGain.connect(this.ctx.destination);
-        noise.start(now);
-      }
-    } catch {
-      // Audio safety
+    switch (type) {
+      case 'heavy':
+        this.playSample('punchHeavy', 0.62, 1, 0.06);
+        break;
+      case 'kick':
+        this.playSample('kick', 0.6, 1, 0.06);
+        break;
+      case 'slam':
+        this.playSample('slam', 0.7, 1, 0.05);
+        break;
+      case 'light':
+      default:
+        this.playSample('punchLight', 0.55, 1, 0.06);
+        break;
     }
   }
 
+  /** Guard impact / perfect-parry deflection (same steel-block recording). */
   public playParry() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-      // High crisp metallic clink (katana / steel deflection sound)
-      const osc1 = this.ctx.createOscillator();
-      const osc2 = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-
-      osc1.type = 'sine';
-      osc2.type = 'triangle';
-
-      osc1.frequency.setValueAtTime(1420, now);
-      osc1.frequency.exponentialRampToValueAtTime(980, now + 0.25);
-
-      osc2.frequency.setValueAtTime(2150, now);
-      osc2.frequency.exponentialRampToValueAtTime(1650, now + 0.3);
-
-      gain.gain.setValueAtTime(0.4, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
-
-      osc1.connect(gain);
-      osc2.connect(gain);
-      gain.connect(this.ctx.destination);
-
-      osc1.start(now);
-      osc2.start(now);
-      osc1.stop(now + 0.32);
-      osc2.stop(now + 0.32);
-    } catch {
-      // Audio safety
-    }
+    this.playSample('block', 0.6, 1, 0.05);
   }
 
+  /** Ground slide friction. */
   public playSlide() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-      const bufferSize = Math.floor(this.ctx.sampleRate * 0.18);
-      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let i = 0; i < bufferSize; i++) {
-        data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.5));
-      }
-
-      const noise = this.ctx.createBufferSource();
-      noise.buffer = buffer;
-
-      const filter = this.ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(500, now);
-      filter.frequency.linearRampToValueAtTime(200, now + 0.18);
-
-      const gain = this.ctx.createGain();
-      gain.gain.setValueAtTime(0.18, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-
-      noise.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.ctx.destination);
-      noise.start(now);
-    } catch {
-      // Audio safety
-    }
+    this.playSample('slide', 0.5, 1, 0.05);
   }
 
+  /** Pistol report: random one of the four real recordings + rate jitter. */
   public playGunshot() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-
-      // 1. Initial explosive crack (High pass noise)
-      const bufferSize = Math.floor(this.ctx.sampleRate * 0.15);
-      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let i = 0; i < bufferSize; i++) {
-        data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.12));
-      }
-
-      const noise = this.ctx.createBufferSource();
-      noise.buffer = buffer;
-      const noiseFilter = this.ctx.createBiquadFilter();
-      noiseFilter.type = 'highpass';
-      noiseFilter.frequency.setValueAtTime(1400, now);
-      noiseFilter.frequency.exponentialRampToValueAtTime(300, now + 0.12);
-
-      const noiseGain = this.ctx.createGain();
-      noiseGain.gain.setValueAtTime(0.65, now);
-      noiseGain.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
-
-      noise.connect(noiseFilter);
-      noiseFilter.connect(noiseGain);
-      noiseGain.connect(this.ctx.destination);
-      noise.start(now);
-
-      // 2. Heavy Sub-bass blast
-      const osc = this.ctx.createOscillator();
-      const bassGain = this.ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(160, now);
-      osc.frequency.exponentialRampToValueAtTime(30, now + 0.18);
-
-      bassGain.gain.setValueAtTime(0.55, now);
-      bassGain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-
-      osc.connect(bassGain);
-      bassGain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.2);
-
-      // 3. Brass Casing ping (delayed 0.16s)
-      setTimeout(() => {
-        if (!this.ctx) return;
-        const pingOsc = this.ctx.createOscillator();
-        const pingGain = this.ctx.createGain();
-        const t = this.ctx.currentTime;
-        pingOsc.type = 'sine';
-        pingOsc.frequency.setValueAtTime(3200 + Math.random() * 600, t);
-        pingOsc.frequency.exponentialRampToValueAtTime(2400, t + 0.08);
-        pingGain.gain.setValueAtTime(0.12, t);
-        pingGain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
-        pingOsc.connect(pingGain);
-        pingGain.connect(this.ctx.destination);
-        pingOsc.start(t);
-        pingOsc.stop(t + 0.09);
-      }, 160);
-    } catch {
-      // Audio safety
-    }
+    const pick = GUNSHOT_SAMPLES[(Math.random() * GUNSHOT_SAMPLES.length) | 0];
+    this.playSample(pick, 0.5, 1, 0.06);
   }
 
+  /** Full reload foley, accented by a slide-rack cock near the end. */
   public playReload() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-      // Mechanical magazine slide rack
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(800, now);
-      osc.frequency.exponentialRampToValueAtTime(1800, now + 0.06);
-      osc.frequency.exponentialRampToValueAtTime(400, now + 0.14);
-
-      gain.gain.setValueAtTime(0.25, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
-
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.16);
-    } catch {
-      // Audio safety
-    }
+    this.playSample('reload', 0.5, 1, 0.03);
+    this.playSample('gunCock', 0.45, 1, 0.04, 0.6);
   }
 
+  /** Manual slide-rack click (empty chamber / gun-fu accents). */
+  public playGunCock() {
+    this.playSample('gunCock', 0.5, 1, 0.04);
+  }
+
+  /** Katana / blade arc. */
   public playBladeSlash() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(1800, now);
-      osc.frequency.exponentialRampToValueAtTime(350, now + 0.12);
-
-      gain.gain.setValueAtTime(0.28, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
-
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.13);
-    } catch {
-      // Audio safety
-    }
+    this.playSample('katana', 0.5, 1, 0.05);
   }
 
+  /** Thrown knife leaving the hand. */
   public playKnifeThrow() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-      osc.type = 'triangle';
-      osc.frequency.setValueAtTime(2200, now);
-      osc.frequency.exponentialRampToValueAtTime(600, now + 0.08);
-
-      gain.gain.setValueAtTime(0.25, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
-
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.09);
-    } catch {
-      // Audio safety
-    }
+    this.playSample('knifeThrow', 0.5, 1, 0.06);
   }
 
+  /** Knife burying itself in a target (impale). */
+  public playKnifeStab() {
+    this.playSample('knifeStab', 0.55, 1, 0.05);
+  }
+
+  /** Glass display / bottle shatter. */
   public playGlassShatter() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-      // 1. High frequency crystalline bursts
-      for (let i = 0; i < 3; i++) {
-        const osc = this.ctx.createOscillator();
-        const gain = this.ctx.createGain();
-        const delay = i * 0.015;
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(3400 + i * 800, now + delay);
-        osc.frequency.exponentialRampToValueAtTime(800, now + delay + 0.15);
-
-        gain.gain.setValueAtTime(0.25 / (i + 1), now + delay);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.16);
-
-        osc.connect(gain);
-        gain.connect(this.ctx.destination);
-        osc.start(now + delay);
-        osc.stop(now + delay + 0.17);
-      }
-
-      // 2. Heavy crunch impact
-      const bufferSize = Math.floor(this.ctx.sampleRate * 0.14);
-      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let i = 0; i < bufferSize; i++) {
-        data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (this.ctx.sampleRate * 0.035));
-      }
-      const noise = this.ctx.createBufferSource();
-      noise.buffer = buffer;
-      const nFilter = this.ctx.createBiquadFilter();
-      nFilter.type = 'highpass';
-      nFilter.frequency.setValueAtTime(1200, now);
-
-      const nGain = this.ctx.createGain();
-      nGain.gain.setValueAtTime(0.35, now);
-      noise.connect(nFilter);
-      nFilter.connect(nGain);
-      nGain.connect(this.ctx.destination);
-      noise.start(now);
-    } catch {
-      // Audio safety
-    }
+    this.playSample('glass', 0.55, 1, 0.05);
   }
 
+  /** Continental gold coin pickup. */
   public playCoinPickup() {
-    if (!this.enabled) return;
-    this.initCtx();
-    if (!this.ctx) return;
-
-    try {
-      const now = this.ctx.currentTime;
-      // Pure metallic two-tone Continental chime
-      const osc1 = this.ctx.createOscillator();
-      const gain1 = this.ctx.createGain();
-      osc1.type = 'sine';
-      osc1.frequency.setValueAtTime(1760, now); // A6
-      gain1.gain.setValueAtTime(0.2, now);
-      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
-      osc1.connect(gain1);
-      gain1.connect(this.ctx.destination);
-      osc1.start(now);
-      osc1.stop(now + 0.19);
-
-      const osc2 = this.ctx.createOscillator();
-      const gain2 = this.ctx.createGain();
-      osc2.type = 'sine';
-      osc2.frequency.setValueAtTime(2637, now + 0.05); // E7
-      gain2.gain.setValueAtTime(0.25, now + 0.05);
-      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
-      osc2.connect(gain2);
-      gain2.connect(this.ctx.destination);
-      osc2.start(now + 0.05);
-      osc2.stop(now + 0.29);
-    } catch {
-      // Audio safety
-    }
+    this.playSample('coin', 0.45, 1, 0.05);
   }
 
+  /** Chamber door opening. */
   public playDoorOpen() {
+    this.playSample('door', 0.5, 1, 0.03);
+  }
+
+  /** Health pack — no recording ships with the pack, so keep a soft synth chime. */
+  public playHeal() {
     if (!this.enabled) return;
     this.initCtx();
-    if (!this.ctx) return;
+    const ctx = this.ctx;
+    if (!ctx) return;
 
     try {
-      const now = this.ctx.currentTime;
-      const osc = this.ctx.createOscillator();
-      const gain = this.ctx.createGain();
-      osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(140, now);
-      osc.frequency.linearRampToValueAtTime(280, now + 0.35);
-
-      gain.gain.setValueAtTime(0.2, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
-
-      osc.connect(gain);
-      gain.connect(this.ctx.destination);
-      osc.start(now);
-      osc.stop(now + 0.42);
+      const now = ctx.currentTime;
+      const notes = [523.25, 659.25, 783.99]; // C5 -> E5 -> G5
+      notes.forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        const t = now + i * 0.07;
+        osc.frequency.setValueAtTime(freq, t);
+        gain.gain.setValueAtTime(0.2, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(t);
+        osc.stop(t + 0.31);
+      });
     } catch {
       // Audio safety
     }

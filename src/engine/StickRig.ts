@@ -1,101 +1,132 @@
 import { StickFigurePose, RigJoint, WeaponType } from '../types/game';
-import { lerp } from './MathUtils';
+import { TieRope } from './TieRope';
 
-export interface ClothPhysicsState {
-  tieAngle: number;
-  tieAngularVel: number;
-  coatFlutter: number;
-}
+/**
+ * JOB 1 (visibility): the player is authored as a bright ivory silhouette so
+ * he reads on any stage (nightclub, rooftop night, rainy alley). Every limb is
+ * drawn twice — a WIDER dark outline stroke first, the bright body stroke on
+ * top — which both separates him from the background and keeps the crisp
+ * stick-figure edge. A faint warm rim/glow sits behind the whole figure.
+ */
+const PLAYER_STYLE = {
+  /** Bright body stroke — front limbs and torso fill */
+  ivory: '#f6efdf',
+  /** Back limbs sit one shade deeper for depth without going dark */
+  ivoryBack: '#e3dbc7',
+  /** Dress shoes / fist shade: mid-tone so they never sink into a dark floor */
+  shoe: '#c9c0aa',
+  /** Dark outline pass drawn underneath everything */
+  outline: '#08090e',
+  shirt: '#ffffff',
+  shirtEdge: '#14151c',
+  tie: '#0b0c11',
+  cuff: '#ffffff',
+  /** Rim glow rgb prefix (alpha appended per draw) */
+  glow: '255, 240, 206',
+  /** Soft interior edge for the shirt / lapel work */
+  detail: '#1b1c24',
+};
+
+/** Dark under-stroke growth applied in the outline pass (half = rim width). */
+const OUTLINE_GROW = 3.6;
 
 export class StickRig {
-  private clothState: ClothPhysicsState = {
-    tieAngle: 0,
-    tieAngularVel: 0,
-    coatFlutter: 0,
-  };
+  private tieRope = new TieRope();
+  // Jacket coat tails: one short verlet rope per hip, driven by the same
+  // wind/flutter as the tie but with higher damping so the jacket reads
+  // heavier than the tie
+  private coatRopeL = new TieRope(4, 5.5, 0.993);
+  private coatRopeR = new TieRope(4, 5.5, 0.993);
+  // Coat pins captured from the live player render. updatePhysics runs before
+  // the fresh pose is generated, so pins lag one frame — exactly like the tie
+  // pin. The armed flag gates capture to the first render() after an update:
+  // afterimage ghosts render later in the same frame and must not steal pins.
+  private coatPinL = { x: 0, y: 0 };
+  private coatPinR = { x: 0, y: 0 };
+  private coatPinArmed = false;
+  private hasCoatPins = false;
 
   /**
-   * Updates dynamic secondary physics on the tie and jacket coat tails
+   * Updates dynamic secondary physics: verlet necktie rope + verlet coat tails
    */
   public updatePhysics(
     vx: number,
     vy: number,
     facingRight: boolean,
-    dt: number
+    dt: number,
+    pinX: number,
+    pinY: number,
+    flutter: number
   ): void {
-    // Tie behaves like an angular pendulum responding to horizontal acceleration and air drag
-    const moveSpeed = Math.abs(vx);
-    const facingSign = facingRight ? 1 : -1;
-    
-    // Wind push opposite to velocity
-    const targetTieAngle = (-vx * 0.05) - (facingSign * (moveSpeed > 50 ? 0.25 : 0.05));
-    const springForce = (targetTieAngle - this.clothState.tieAngle) * 35;
-    const damping = this.clothState.tieAngularVel * 12;
-    
-    this.clothState.tieAngularVel += (springForce - damping) * dt;
-    this.clothState.tieAngle += this.clothState.tieAngularVel * dt;
+    // Verlet necktie pinned at the collar — swings with momentum,
+    // lags sudden movement, flutters during fast attacks
+    this.tieRope.update(pinX, pinY, vx, vy, facingRight, dt, flutter);
 
-    // Clamp tie angle so it doesn't spin wildly
-    this.clothState.tieAngle = Math.max(-1.4, Math.min(1.4, this.clothState.tieAngle));
+    // Jacket coat tails pinned at the hip joints — same wind/flutter inputs
+    // as the tie; heavier damping makes the jacket read weightier
+    const pinLx = this.hasCoatPins ? this.coatPinL.x : pinX;
+    const pinLy = this.hasCoatPins ? this.coatPinL.y : pinY + 48;
+    const pinRx = this.hasCoatPins ? this.coatPinR.x : pinX;
+    const pinRy = this.hasCoatPins ? this.coatPinR.y : pinY + 48;
+    this.coatRopeL.update(pinLx, pinLy, vx, vy, facingRight, dt, flutter);
+    this.coatRopeR.update(pinRx, pinRy, vx, vy, facingRight, dt, flutter);
 
-    // Jacket tails flutter based on speed and vertical velocity
-    const targetFlutter = (Math.sin(performance.now() * 0.015) * Math.min(1, moveSpeed / 200)) * 0.4;
-    this.clothState.coatFlutter = lerp(this.clothState.coatFlutter, targetFlutter, 0.2);
+    // Arm coat-pin capture: the first render() after this update is the live
+    // player render (afterimage ghosts come later)
+    this.coatPinArmed = true;
   }
 
   /**
-   * Renders the stylized stick figure in a fitted black suit, white shirt, black tie, and dress shoes
+   * Renders the stylized stick figure as a bright ivory silhouette in a fitted
+   * suit: rim glow → dark outline pass → bright body pass.
+   *
+   * @param ghost afterimage trail frames skip the (relatively pricey) glow so
+   *              a full dash trail stays cheap on mobile.
    */
   public render(
     ctx: CanvasRenderingContext2D,
     pose: StickFigurePose,
     facingRight: boolean,
     debugMode: boolean = false,
-    weaponType: WeaponType = 'UNARMED'
+    weaponType: WeaponType = 'UNARMED',
+    ghost: boolean = false
   ): void {
+    // Capture coat pins from the live player render only (first render per
+    // frame). Afterimage ghosts render after this and must not overwrite them.
+    if (this.coatPinArmed) {
+      this.coatPinArmed = false;
+      const lh = pose.leftHip;
+      const rh = pose.rightHip;
+      if (
+        Number.isFinite(lh.x) &&
+        Number.isFinite(lh.y) &&
+        Number.isFinite(rh.x) &&
+        Number.isFinite(rh.y)
+      ) {
+        this.coatPinL.x = lh.x;
+        this.coatPinL.y = lh.y;
+        this.coatPinR.x = rh.x;
+        this.coatPinR.y = rh.y;
+        this.hasCoatPins = true;
+      }
+    }
+
     ctx.save();
 
     // Line caps and joins for pristine limb aesthetic
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
-    // Limb thickness constants
-    const bodyStroke = 6.5;
-    const suitBlack = '#14151a';
-    const suitHighlight = '#252834';
-    const shirtWhite = '#ffffff';
-    const tieBlack = '#0a0a0c';
-    const skinBlack = '#111216';
+    // 0. Faint rim/glow so the silhouette pops off dark backdrops
+    if (!ghost) this.renderRimGlow(ctx, pose);
 
-    // 1. BACK LEG (Drawn behind body for proper depth)
-    this.renderLeg(ctx, pose.leftHip, pose.leftKnee, pose.leftFoot, facingRight, suitBlack, '#0f1015');
+    // 1. DARK OUTLINE PASS (wider strokes, drawn underneath everything)
+    this.renderBody(ctx, pose, facingRight, weaponType, true);
 
-    // 2. BACK ARM (Drawn behind body)
-    this.renderArm(ctx, pose.leftShoulder, pose.leftElbow, pose.leftHand, suitBlack);
+    // 2. BRIGHT IVORY BODY PASS on top — leaves the dark rim around every limb
+    this.renderBody(ctx, pose, facingRight, weaponType, false);
 
-    // 3. SUIT JACKET LOWER COAT TAILS (Flaring behind legs)
-    this.renderCoatTails(ctx, pose.hips, pose.torso, facingRight, suitBlack);
-
-    // 4. TORSO & FITTED SUIT WITH SHIRT AND TIE
-    this.renderTorsoAndSuit(ctx, pose, facingRight, suitBlack, suitHighlight, shirtWhite, tieBlack);
-
-    // 5. FRONT LEG (In front of torso)
-    this.renderLeg(ctx, pose.rightHip, pose.rightKnee, pose.rightFoot, facingRight, suitBlack, '#181a22');
-
-    // 6. FRONT ARM (In front of torso)
-    this.renderArm(ctx, pose.rightShoulder, pose.rightElbow, pose.rightHand, suitBlack);
-
-    // 7. WEAPON IN HAND (Katana or Knife)
-    if (weaponType === 'KATANA') {
-      this.renderKatana(ctx, pose.rightHand, pose.rightElbow, facingRight);
-    } else if (weaponType === 'KNIFE') {
-      this.renderKnife(ctx, pose.rightHand, pose.rightElbow, facingRight);
-    }
-
-    // 8. HEAD & SILHOUETTE
-    this.renderHead(ctx, pose.head, skinBlack);
-
-    // 9. OPTIONAL DEBUG SKELETAL OVERLAY
+    // 3. OPTIONAL DEBUG SKELETAL OVERLAY
     if (debugMode) {
       this.renderDebugSkeleton(ctx, pose);
     }
@@ -103,11 +134,70 @@ export class StickRig {
     ctx.restore();
   }
 
+  /**
+   * One full figure pass. `outline === true` draws every shape a few pixels
+   * wider in near-black (no interior detail); `false` draws the bright body
+   * with its shirt, tie, cuffs and shoe highlights.
+   */
+  private renderBody(
+    ctx: CanvasRenderingContext2D,
+    pose: StickFigurePose,
+    facingRight: boolean,
+    weaponType: WeaponType,
+    outline: boolean
+  ): void {
+    const backColor = outline ? PLAYER_STYLE.outline : PLAYER_STYLE.ivoryBack;
+    const frontColor = outline ? PLAYER_STYLE.outline : PLAYER_STYLE.ivory;
+    const grow = outline ? OUTLINE_GROW : 0;
+
+    // 1. BACK LEG (Drawn behind body for proper depth)
+    this.renderLeg(ctx, pose.leftHip, pose.leftKnee, pose.leftFoot, facingRight, backColor, outline, grow);
+
+    // 2. BACK ARM (Drawn behind body)
+    this.renderArm(ctx, pose.leftShoulder, pose.leftElbow, pose.leftHand, backColor, outline, grow);
+
+    // 3. SUIT JACKET LOWER COAT TAILS (Flaring behind legs)
+    this.renderCoatTails(ctx, outline);
+
+    // 4. TORSO & FITTED SUIT WITH SHIRT AND TIE
+    this.renderTorsoAndSuit(ctx, pose, outline);
+
+    // 5. FRONT LEG (In front of torso)
+    this.renderLeg(ctx, pose.rightHip, pose.rightKnee, pose.rightFoot, facingRight, frontColor, outline, grow);
+
+    // 6. FRONT ARM (In front of torso)
+    this.renderArm(ctx, pose.rightShoulder, pose.rightElbow, pose.rightHand, frontColor, outline, grow);
+
+    // 7. WEAPON IN HAND (Katana or Knife)
+    if (weaponType === 'KATANA') {
+      this.renderKatana(ctx, pose.rightHand, pose.rightElbow, facingRight, outline);
+    } else if (weaponType === 'KNIFE') {
+      this.renderKnife(ctx, pose.rightHand, pose.rightElbow, facingRight, outline);
+    }
+
+    // 8. HEAD & SILHOUETTE
+    this.renderHead(ctx, pose.head, facingRight, outline);
+  }
+
+  /** Soft warm halo behind the figure — cheap radial gradient, drawn first. */
+  private renderRimGlow(ctx: CanvasRenderingContext2D, pose: StickFigurePose): void {
+    const cx = (pose.neck.x + pose.hips.x) * 0.5;
+    const cy = (pose.neck.y + pose.hips.y) * 0.5 - 14;
+    const radius = 96;
+    const glow = ctx.createRadialGradient(cx, cy, 6, cx, cy, radius);
+    glow.addColorStop(0, `rgba(${PLAYER_STYLE.glow}, 0.20)`);
+    glow.addColorStop(0.5, `rgba(${PLAYER_STYLE.glow}, 0.08)`);
+    glow.addColorStop(1, `rgba(${PLAYER_STYLE.glow}, 0)`);
+    ctx.fillStyle = glow;
+    ctx.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
+  }
+
   private renderKatana(
     ctx: CanvasRenderingContext2D,
     hand: RigJoint,
     elbow: RigJoint,
-    facingRight: boolean
+    facingRight: boolean,
+    outline: boolean
   ): void {
     const dx = hand.x - elbow.x;
     const dy = hand.y - elbow.y;
@@ -119,6 +209,23 @@ export class StickRig {
     ctx.save();
     ctx.translate(hand.x, hand.y);
     ctx.rotate(angle);
+
+    if (outline) {
+      // Dark under-stroke so the blade keeps an edge against the backdrop
+      ctx.strokeStyle = PLAYER_STYLE.outline;
+      ctx.lineWidth = 7;
+      ctx.beginPath();
+      ctx.moveTo(-10, 0);
+      ctx.lineTo(2, 0);
+      ctx.stroke();
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(3, 0);
+      ctx.quadraticCurveTo(28, -2, 52, -4);
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
 
     // Handle (Tsuka)
     ctx.strokeStyle = '#18181b';
@@ -160,7 +267,8 @@ export class StickRig {
     ctx: CanvasRenderingContext2D,
     hand: RigJoint,
     elbow: RigJoint,
-    facingRight: boolean
+    facingRight: boolean,
+    outline: boolean
   ): void {
     const dx = hand.x - elbow.x;
     const dy = hand.y - elbow.y;
@@ -169,6 +277,17 @@ export class StickRig {
     ctx.save();
     ctx.translate(hand.x, hand.y);
     ctx.rotate(angle);
+
+    if (outline) {
+      ctx.strokeStyle = PLAYER_STYLE.outline;
+      ctx.lineWidth = 6;
+      ctx.beginPath();
+      ctx.moveTo(-6, 0);
+      ctx.lineTo(18, 0);
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
 
     // Handle
     ctx.strokeStyle = '#27272a';
@@ -189,28 +308,45 @@ export class StickRig {
     ctx.restore();
   }
 
-  private renderHead(ctx: CanvasRenderingContext2D, head: RigJoint, color: string): void {
+  private renderHead(
+    ctx: CanvasRenderingContext2D,
+    head: RigJoint,
+    facingRight: boolean,
+    outline: boolean
+  ): void {
     const headRadius = 14;
 
+    if (outline) {
+      ctx.beginPath();
+      ctx.arc(head.x, head.y, headRadius + 2, 0, Math.PI * 2);
+      ctx.fillStyle = PLAYER_STYLE.outline;
+      ctx.fill();
+      return;
+    }
+
+    // Bright ivory skull
     ctx.beginPath();
     ctx.arc(head.x, head.y, headRadius, 0, Math.PI * 2);
-    ctx.fillStyle = color;
+    ctx.fillStyle = PLAYER_STYLE.ivory;
     ctx.fill();
+    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = PLAYER_STYLE.outline;
+    ctx.stroke();
 
-    // Subtle edge rim light for cinematic silhouette contrast
-    ctx.lineWidth = 1.5;
-    ctx.strokeStyle = '#4a5168';
+    // Eye/brow mark toward the facing so the head never reads as a blank dot
+    const f = facingRight ? 1 : -1;
+    ctx.beginPath();
+    ctx.moveTo(head.x + f * 3, head.y - 3);
+    ctx.lineTo(head.x + f * 8, head.y - 2);
+    ctx.strokeStyle = PLAYER_STYLE.detail;
+    ctx.lineWidth = 2;
     ctx.stroke();
   }
 
   private renderTorsoAndSuit(
     ctx: CanvasRenderingContext2D,
     pose: StickFigurePose,
-    facingRight: boolean,
-    suitBlack: string,
-    suitHighlight: string,
-    shirtWhite: string,
-    tieBlack: string
+    outline: boolean
   ): void {
     const { neck, torso, hips } = pose;
 
@@ -242,16 +378,25 @@ export class StickRig {
     ctx.lineTo(leftHip.x, leftHip.y);
     ctx.lineTo(leftWaist.x, leftWaist.y);
     ctx.closePath();
-    ctx.fillStyle = suitBlack;
+
+    if (outline) {
+      // Wide dark slab + stroke: the silhouette's dark rim comes from this
+      ctx.fillStyle = PLAYER_STYLE.outline;
+      ctx.fill();
+      ctx.lineWidth = OUTLINE_GROW;
+      ctx.strokeStyle = PLAYER_STYLE.outline;
+      ctx.stroke();
+      return;
+    }
+
+    ctx.fillStyle = PLAYER_STYLE.ivory;
     ctx.fill();
-    ctx.lineWidth = 1.2;
-    ctx.strokeStyle = suitHighlight;
+    ctx.lineWidth = 1.4;
+    ctx.strokeStyle = PLAYER_STYLE.outline;
     ctx.stroke();
 
     // Draw Crisp White Shirt V-Neck Collar
-    const chestCenter = { x: (neck.x + torso.x) * 0.5, y: (neck.y + torso.y) * 0.5 };
     const shirtWidth = 7;
-    const shirtDepth = 15;
     const shirtBase = {
       x: neck.x + (torso.x - neck.x) * 0.45,
       y: neck.y + (torso.y - neck.y) * 0.45,
@@ -262,18 +407,22 @@ export class StickRig {
     ctx.lineTo(neck.x + nx * shirtWidth, neck.y + ny * shirtWidth);
     ctx.lineTo(shirtBase.x, shirtBase.y);
     ctx.closePath();
-    ctx.fillStyle = shirtWhite;
+    ctx.fillStyle = PLAYER_STYLE.shirt;
     ctx.fill();
+    // Dark edge so the white shirt still reads against the ivory jacket
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = PLAYER_STYLE.shirtEdge;
+    ctx.stroke();
 
-    // Draw Dynamic Black Necktie
-    this.renderTie(ctx, neck, shirtBase, facingRight, tieBlack);
+    // Draw Dynamic Black Necktie (verlet rope simulation)
+    this.renderTie(ctx, PLAYER_STYLE.tie);
 
     // Suit Lapel Lines
     ctx.beginPath();
     ctx.moveTo(neck.x - nx * (shirtWidth + 1), neck.y - ny * (shirtWidth + 1));
     ctx.lineTo(shirtBase.x - nx * 2, shirtBase.y);
     ctx.lineTo(torso.x, torso.y);
-    ctx.strokeStyle = suitHighlight;
+    ctx.strokeStyle = PLAYER_STYLE.detail;
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
@@ -281,71 +430,35 @@ export class StickRig {
     ctx.moveTo(neck.x + nx * (shirtWidth + 1), neck.y + ny * (shirtWidth + 1));
     ctx.lineTo(shirtBase.x + nx * 2, shirtBase.y);
     ctx.lineTo(torso.x, torso.y);
-    ctx.strokeStyle = suitHighlight;
+    ctx.strokeStyle = PLAYER_STYLE.detail;
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
 
   private renderTie(
     ctx: CanvasRenderingContext2D,
-    tieBase: RigJoint,
-    shirtBase: RigJoint,
-    facingRight: boolean,
     tieColor: string
   ): void {
-    const tieLength = 22;
-    const angle = this.clothState.tieAngle;
-    
-    // Tie base knot
-    ctx.beginPath();
-    ctx.arc(tieBase.x, tieBase.y + 2, 2.5, 0, Math.PI * 2);
-    ctx.fillStyle = tieColor;
-    ctx.fill();
-
-    // Tie blade with angular swing
-    const midX = tieBase.x + Math.sin(angle) * (tieLength * 0.5);
-    const midY = tieBase.y + Math.cos(angle) * (tieLength * 0.5);
-    const tipX = tieBase.x + Math.sin(angle * 1.2) * tieLength;
-    const tipY = tieBase.y + Math.cos(angle * 1.2) * tieLength;
-
-    ctx.beginPath();
-    ctx.moveTo(tieBase.x - 2, tieBase.y + 2);
-    ctx.lineTo(tieBase.x + 2, tieBase.y + 2);
-    ctx.lineTo(midX + 3.2, midY);
-    ctx.lineTo(tipX, tipY);
-    ctx.lineTo(midX - 3.2, midY);
-    ctx.closePath();
-    ctx.fillStyle = tieColor;
-    ctx.fill();
-
-    // Tie edge highlight
-    ctx.strokeStyle = '#2c2e3b';
-    ctx.lineWidth = 0.8;
-    ctx.stroke();
+    // Verlet-simulated necktie: tapered strip through the rope points
+    this.tieRope.render(ctx, tieColor);
   }
 
   private renderCoatTails(
     ctx: CanvasRenderingContext2D,
-    hips: RigJoint,
-    torso: RigJoint,
-    facingRight: boolean,
-    suitBlack: string
+    outline: boolean
   ): void {
-    const flutter = this.clothState.coatFlutter;
-    const tailOffset = (facingRight ? -1 : 1) * (10 + flutter * 20);
-    const tailY = hips.y + 16 + Math.abs(flutter) * 6;
-
-    ctx.beginPath();
-    ctx.moveTo(hips.x - 9, hips.y);
-    ctx.lineTo(hips.x + 9, hips.y);
-    ctx.lineTo(hips.x + tailOffset + 6, tailY);
-    ctx.lineTo(hips.x + tailOffset - 6, tailY);
-    ctx.closePath();
-    ctx.fillStyle = suitBlack;
-    ctx.fill();
-    ctx.strokeStyle = '#222530';
-    ctx.lineWidth = 1;
-    ctx.stroke();
+    // Two verlet coat tails pinned at the hips, drawn as tapered cloth
+    // strips: narrow at the hip, flaring toward the hem. Widths match the old
+    // quad's proportions (18px at the hip tapering to 12px at the hem) with
+    // the same dark suit fill and edge stroke. Back-hip tail draws first so
+    // the front-hip tail overlaps it correctly.
+    if (outline) {
+      this.coatRopeL.renderCloth(ctx, PLAYER_STYLE.outline, 9 + 3, 6 + 3, PLAYER_STYLE.outline, 3);
+      this.coatRopeR.renderCloth(ctx, PLAYER_STYLE.outline, 9 + 3, 6 + 3, PLAYER_STYLE.outline, 3);
+      return;
+    }
+    this.coatRopeL.renderCloth(ctx, PLAYER_STYLE.ivoryBack, 9, 6, PLAYER_STYLE.outline, 1.2);
+    this.coatRopeR.renderCloth(ctx, PLAYER_STYLE.ivory, 9, 6, PLAYER_STYLE.outline, 1.2);
   }
 
   private renderArm(
@@ -353,13 +466,35 @@ export class StickRig {
     shoulder: RigJoint,
     elbow: RigJoint,
     hand: RigJoint,
-    suitColor: string
+    limbColor: string,
+    outline: boolean,
+    grow: number
   ): void {
+    if (outline) {
+      // Dark under-stroke: whole arm in one wide pass
+      ctx.strokeStyle = limbColor;
+      ctx.lineWidth = 6 + grow;
+      ctx.beginPath();
+      ctx.moveTo(shoulder.x, shoulder.y);
+      ctx.lineTo(elbow.x, elbow.y);
+      ctx.stroke();
+      ctx.lineWidth = 5.2 + grow;
+      ctx.beginPath();
+      ctx.moveTo(elbow.x, elbow.y);
+      ctx.lineTo(hand.x, hand.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(hand.x, hand.y, 4 + grow * 0.7, 0, Math.PI * 2);
+      ctx.fillStyle = limbColor;
+      ctx.fill();
+      return;
+    }
+
     // Upper Arm (Jacket sleeve)
     ctx.beginPath();
     ctx.moveTo(shoulder.x, shoulder.y);
     ctx.lineTo(elbow.x, elbow.y);
-    ctx.strokeStyle = suitColor;
+    ctx.strokeStyle = limbColor;
     ctx.lineWidth = 6;
     ctx.stroke();
 
@@ -367,7 +502,7 @@ export class StickRig {
     ctx.beginPath();
     ctx.moveTo(elbow.x, elbow.y);
     ctx.lineTo(hand.x, hand.y);
-    ctx.strokeStyle = suitColor;
+    ctx.strokeStyle = limbColor;
     ctx.lineWidth = 5.2;
     ctx.stroke();
 
@@ -377,15 +512,15 @@ export class StickRig {
     const cuffY = hand.y - Math.sin(armAngle) * 3;
     ctx.beginPath();
     ctx.arc(cuffX, cuffY, 2.8, 0, Math.PI * 2);
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = PLAYER_STYLE.cuff;
     ctx.fill();
 
     // Hand / Fist
     ctx.beginPath();
     ctx.arc(hand.x, hand.y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = '#111216';
+    ctx.fillStyle = PLAYER_STYLE.shoe;
     ctx.fill();
-    ctx.strokeStyle = '#323746';
+    ctx.strokeStyle = PLAYER_STYLE.outline;
     ctx.lineWidth = 1;
     ctx.stroke();
   }
@@ -396,14 +531,39 @@ export class StickRig {
     knee: RigJoint,
     foot: RigJoint,
     facingRight: boolean,
-    pantsColor: string,
-    shoeColor: string
+    limbColor: string,
+    outline: boolean,
+    grow: number
   ): void {
+    if (outline) {
+      ctx.strokeStyle = limbColor;
+      ctx.lineWidth = 7 + grow;
+      ctx.beginPath();
+      ctx.moveTo(hip.x, hip.y);
+      ctx.lineTo(knee.x, knee.y);
+      ctx.stroke();
+      ctx.lineWidth = 5.8 + grow;
+      ctx.beginPath();
+      ctx.moveTo(knee.x, knee.y);
+      ctx.lineTo(foot.x, foot.y);
+      ctx.stroke();
+      // Shoe halo
+      const f0 = facingRight ? 1 : -1;
+      ctx.beginPath();
+      this.shoePath(ctx, foot.x, foot.y, f0, 1.4);
+      ctx.fillStyle = limbColor;
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = limbColor;
+      ctx.stroke();
+      return;
+    }
+
     // Thigh (Suit Trousers)
     ctx.beginPath();
     ctx.moveTo(hip.x, hip.y);
     ctx.lineTo(knee.x, knee.y);
-    ctx.strokeStyle = pantsColor;
+    ctx.strokeStyle = limbColor;
     ctx.lineWidth = 7;
     ctx.stroke();
 
@@ -411,28 +571,39 @@ export class StickRig {
     ctx.beginPath();
     ctx.moveTo(knee.x, knee.y);
     ctx.lineTo(foot.x, foot.y);
-    ctx.strokeStyle = pantsColor;
+    ctx.strokeStyle = limbColor;
     ctx.lineWidth = 5.8;
     ctx.stroke();
 
     // Tapered Dress Shoe
-    const facingSign = facingRight ? 1 : -1;
-    const toeX = foot.x + facingSign * 11;
-    const heelX = foot.x - facingSign * 4;
-
     ctx.beginPath();
-    ctx.moveTo(heelX, foot.y - 2);
-    ctx.lineTo(toeX, foot.y);
-    ctx.lineTo(toeX, foot.y + 4.5);
-    ctx.lineTo(heelX, foot.y + 4.5);
-    ctx.closePath();
-    ctx.fillStyle = shoeColor;
+    this.shoePath(ctx, foot.x, foot.y, facingRight ? 1 : -1, 0);
+    ctx.fillStyle = PLAYER_STYLE.shoe;
     ctx.fill();
 
     // Polished shoe rim highlight
-    ctx.strokeStyle = '#3c4155';
+    ctx.strokeStyle = PLAYER_STYLE.outline;
     ctx.lineWidth = 1;
     ctx.stroke();
+  }
+
+  /** Shared shoe silhouette (grow expands the outline pass outward). */
+  private shoePath(
+    ctx: CanvasRenderingContext2D,
+    footX: number,
+    footY: number,
+    facingSign: number,
+    grow: number
+  ): void {
+    const toeX = footX + facingSign * (11 + grow);
+    const heelX = footX - facingSign * (4 + grow);
+    const top = footY - 2 - grow;
+    const bottom = footY + 4.5 + grow;
+    ctx.moveTo(heelX, top);
+    ctx.lineTo(toeX, footY);
+    ctx.lineTo(toeX, bottom);
+    ctx.lineTo(heelX, bottom);
+    ctx.closePath();
   }
 
   private renderDebugSkeleton(ctx: CanvasRenderingContext2D, pose: StickFigurePose): void {

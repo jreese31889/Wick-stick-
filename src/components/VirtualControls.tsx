@@ -1,6 +1,18 @@
 import React, { useRef, useState, useCallback } from 'react';
 import { InputManager } from '../engine/InputManager';
-import { Shield, Zap, Sparkles, Wind, Hand, ArrowUp, Crosshair, RotateCcw, Sword, LogIn, Flame } from 'lucide-react';
+import {
+  Shield,
+  Wind,
+  HandGrab,
+  HandFist,
+  Footprints,
+  ArrowUp,
+  Crosshair,
+  RotateCcw,
+  Sword,
+  LogIn,
+  Flame,
+} from 'lucide-react';
 import { WeaponType } from '../types/game';
 
 interface VirtualControlsProps {
@@ -9,10 +21,39 @@ interface VirtualControlsProps {
   nearDoor?: boolean;
 }
 
+type TouchButton =
+  | 'jump'
+  | 'dodge'
+  | 'attack'
+  | 'heavy'
+  | 'block'
+  | 'grab'
+  | 'shoot'
+  | 'reload'
+  | 'interact'
+  | 'focus';
+
+// Shared shell: thumb-sized circular button with press feedback.
+const BTN =
+  'relative flex flex-col items-center justify-center rounded-full backdrop-blur-sm ' +
+  'transition-transform active:scale-90 touch-none select-none pointer-events-auto shadow-lg';
+
+const UTILITY = 'w-11 h-11 sm:w-12 sm:h-12 portrait:w-10 portrait:h-10';
+const COMBAT = 'w-14 h-14 sm:w-16 sm:h-16 portrait:w-12 portrait:h-12';
+const HERO = 'w-20 h-20 sm:w-24 sm:h-24 landscape:w-24 landscape:h-24 portrait:w-16 portrait:h-16';
+
+const UTILITY_ICON = 'w-4 h-4 sm:w-5 sm:h-5';
+const COMBAT_ICON = 'w-5 h-5 sm:w-6 sm:h-6';
+const HERO_ICON = 'w-7 h-7 sm:w-8 sm:h-8';
+
+const UTILITY_LABEL = 'text-[7px] sm:text-[8px] font-bold uppercase tracking-wider mt-0.5';
+const COMBAT_LABEL = 'text-[9px] sm:text-[10px] font-bold uppercase tracking-wide mt-0.5';
+const HERO_LABEL = 'text-[11px] sm:text-[13px] font-black uppercase tracking-[0.15em] mt-0.5';
+
 export const VirtualControls: React.FC<VirtualControlsProps> = ({
   inputManager,
   equippedWeapon,
-  nearDoor
+  nearDoor,
 }) => {
   const joystickBaseRef = useRef<HTMLDivElement>(null);
   const joystickKnobRef = useRef<HTMLDivElement>(null);
@@ -77,7 +118,7 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
   };
 
   // Pure mobile touch button binder (No mouse listeners)
-  const bindTouchButton = (button: 'jump' | 'dodge' | 'attack' | 'heavy' | 'block' | 'grab' | 'shoot' | 'reload' | 'interact' | 'focus') => ({
+  const bindTouchButton = (button: TouchButton) => ({
     onTouchStart: (e: React.TouchEvent) => {
       e.preventDefault();
       inputManager.setVirtualButton(button, true);
@@ -100,9 +141,11 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
   });
 
   return (
-    <div className="absolute inset-0 pointer-events-none select-none touch-none z-20 flex justify-between p-3 sm:p-5 pb-6">
-      {/* LEFT: VIRTUAL JOYSTICK */}
-      <div className="flex items-end pb-1">
+    <div className="absolute inset-0 pointer-events-none select-none touch-none z-20">
+      {/* ============================================================
+          LEFT — MOVEMENT: floating 360° thumb joystick, bottom-left
+      ============================================================ */}
+      <div className="absolute left-0 bottom-0 flex items-end p-3 sm:p-4">
         <div
           id="virtual-joystick"
           ref={joystickBaseRef}
@@ -110,7 +153,11 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
           onTouchMove={handleJoystickMove}
           onTouchEnd={handleJoystickEnd}
           onTouchCancel={handleJoystickEnd}
-          className="w-36 h-36 sm:w-44 sm:h-44 rounded-full border-2 border-white/20 bg-black/45 backdrop-blur-md flex items-center justify-center pointer-events-auto active:border-amber-400/40 transition-colors shadow-2xl relative"
+          className={
+            'w-32 h-32 sm:w-40 sm:h-40 landscape:w-36 landscape:h-36 portrait:w-28 portrait:h-28 ' +
+            'rounded-full border-2 border-white/20 bg-black/45 backdrop-blur-md flex items-center ' +
+            'justify-center pointer-events-auto active:border-amber-400/40 transition-colors shadow-2xl relative'
+          }
         >
           {/* Subtle directional indicators */}
           <div className="absolute top-2 w-1.5 h-3 bg-white/25 rounded-full" />
@@ -122,32 +169,133 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
           <div
             ref={joystickKnobRef}
             style={{ transform: `translate(${knobPos.x}px, ${knobPos.y}px)` }}
-            className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-gradient-to-br from-neutral-200 to-neutral-400 border border-white/60 shadow-lg flex items-center justify-center pointer-events-none"
+            className="w-14 h-14 sm:w-16 sm:h-16 landscape:w-16 landscape:h-16 rounded-full bg-gradient-to-br from-neutral-200 to-neutral-400 border border-white/60 shadow-lg flex items-center justify-center pointer-events-none"
           >
-            <div className="w-6 h-6 rounded-full bg-neutral-900/40 border border-white/40" />
+            <div className="w-5 h-5 rounded-full bg-neutral-900/40 border border-white/40" />
           </div>
         </div>
       </div>
 
-      {/* RIGHT: TOUCH COMBAT CLUSTER */}
-      <div className="flex flex-col items-end justify-end pb-1 pointer-events-auto">
-        {/* TOP ROW: Tactical Actions */}
-        <div className="flex items-center gap-2 sm:gap-2.5 mb-2.5">
-          {/* FOCUS / BULLET-TIME RAGE */}
+      {/* ============================================================
+          RIGHT — ACTIONS: stacked thumb rows, bottom-right
+          Row 1 (heroes): PUNCH + KICK — the biggest targets on screen
+          Row 2 (combat): BLOCK / DODGE / JUMP / SHOOT
+          Row 3 (utility): FOCUS / ACTION / RELOAD / GRAB
+      ============================================================ */}
+      <div className="absolute right-0 bottom-0 flex flex-col items-end gap-2 landscape:gap-2.5 p-3 sm:p-4 pointer-events-auto">
+        {/* HERO ROW — impossible to miss */}
+        <div className="flex items-end gap-3 sm:gap-4">
+          <button
+            id="btn-punch"
+            {...bindTouchButton('attack')}
+            aria-label="Punch"
+            className={
+              `${BTN} ${HERO} border-2 border-rose-200/70 text-white font-black ` +
+              'bg-gradient-to-br from-red-500 via-rose-600 to-rose-800 ' +
+              'shadow-[0_6px_24px_rgba(225,29,72,0.55)] active:from-red-600 active:to-rose-900'
+            }
+          >
+            <HandFist className={`${HERO_ICON} fill-current drop-shadow`} />
+            <span className={HERO_LABEL}>PUNCH</span>
+            <span className="absolute top-1.5 right-2 text-[8px] font-mono px-1 rounded bg-black/70 border border-white/40 text-white">
+              X
+            </span>
+          </button>
+
+          <button
+            id="btn-kick"
+            {...bindTouchButton('heavy')}
+            aria-label="Kick"
+            className={
+              `${BTN} ${HERO} border-2 border-amber-200/70 text-white font-black ` +
+              'bg-gradient-to-br from-amber-500 via-orange-600 to-orange-800 ' +
+              'shadow-[0_6px_24px_rgba(249,115,22,0.55)] active:from-amber-600 active:to-orange-900'
+            }
+          >
+            <Footprints className={`${HERO_ICON} fill-current drop-shadow`} />
+            <span className={HERO_LABEL}>KICK</span>
+            <span className="absolute top-1.5 right-2 text-[8px] font-mono px-1 rounded bg-black/70 border border-amber-200/60 text-amber-100">
+              Y
+            </span>
+          </button>
+        </div>
+
+        {/* COMBAT ROW — core defensive / mobility / gunplay actions */}
+        <div className="flex items-end gap-2 sm:gap-2.5">
+          <button
+            id="btn-block"
+            {...bindTouchButton('block')}
+            aria-label="Block"
+            className={`${BTN} ${COMBAT} rounded-2xl bg-neutral-900/85 border border-blue-500/50 text-blue-300 active:bg-blue-600/50`}
+          >
+            <Shield className={COMBAT_ICON} />
+            <span className={COMBAT_LABEL}>Block</span>
+            <span className="absolute top-1 right-1.5 text-[7px] font-mono px-1 rounded bg-black/80 border border-blue-400/40 text-blue-300">
+              LB
+            </span>
+          </button>
+
+          <button
+            id="btn-dodge"
+            {...bindTouchButton('dodge')}
+            aria-label="Dodge"
+            className={`${BTN} ${COMBAT} rounded-2xl bg-neutral-900/85 border border-emerald-500/50 text-emerald-300 active:bg-emerald-600/50`}
+          >
+            <Wind className={COMBAT_ICON} />
+            <span className={COMBAT_LABEL}>Dodge</span>
+            <span className="absolute top-1 right-1.5 text-[7px] font-mono px-1 rounded bg-black/80 border border-emerald-400/40 text-emerald-300">
+              B
+            </span>
+          </button>
+
+          <button
+            id="btn-jump"
+            {...bindTouchButton('jump')}
+            aria-label="Jump"
+            className={`${BTN} ${COMBAT} rounded-2xl bg-neutral-900/85 border border-sky-500/50 text-sky-300 active:bg-sky-600/50`}
+          >
+            <ArrowUp className={COMBAT_ICON} />
+            <span className={COMBAT_LABEL}>Jump</span>
+            <span className="absolute top-1 right-1.5 text-[7px] font-mono px-1 rounded bg-black/80 border border-sky-400/40 text-sky-300">
+              A
+            </span>
+          </button>
+
+          <button
+            id="btn-shoot"
+            {...bindTouchButton('shoot')}
+            aria-label="Shoot"
+            className={
+              `${BTN} ${COMBAT} rounded-2xl border-2 border-amber-300/80 text-amber-100 ` +
+              'bg-gradient-to-br from-amber-600 to-yellow-700 active:from-amber-700 active:to-yellow-800 ' +
+              'shadow-xl'
+            }
+          >
+            <Crosshair className={COMBAT_ICON} />
+            <span className={COMBAT_LABEL}>Shoot</span>
+            <span className="absolute top-1 right-1.5 text-[7px] font-mono px-1 rounded bg-black/80 border border-amber-300/80 text-amber-200">
+              RT
+            </span>
+          </button>
+        </div>
+
+        {/* UTILITY ROW — situational actions, compact but still ≥44px */}
+        <div className="flex items-end gap-2">
           <button
             id="btn-focus"
             {...bindTouchButton('focus')}
-            className="w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-amber-500/20 border border-amber-400/50 text-amber-300 active:scale-90 active:bg-amber-500/40 transition-transform flex flex-col items-center justify-center shadow-lg backdrop-blur-sm"
+            aria-label="Focus"
+            className={`${BTN} ${UTILITY} bg-amber-500/20 border border-amber-400/50 text-amber-300 active:bg-amber-500/40`}
           >
-            <Flame className="w-5 h-5 sm:w-6 sm:h-6 text-amber-400 animate-pulse" />
-            <span className="text-[8px] font-bold uppercase tracking-wider mt-0.5">Focus</span>
+            <Flame className={`${UTILITY_ICON} text-amber-400 animate-pulse`} />
+            <span className={UTILITY_LABEL}>Focus</span>
           </button>
 
-          {/* INTERACT / KNIFE THROW */}
           <button
             id="btn-interact"
             {...bindTouchButton('interact')}
-            className={`w-12 h-12 sm:w-14 sm:h-14 rounded-full border transition-all flex flex-col items-center justify-center shadow-lg backdrop-blur-sm active:scale-90 ${
+            aria-label="Action"
+            className={`${BTN} ${UTILITY} border ${
               equippedWeapon === 'KNIFE'
                 ? 'bg-amber-900/80 border-amber-400 text-amber-200 animate-pulse'
                 : nearDoor
@@ -156,106 +304,41 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
             }`}
           >
             {equippedWeapon === 'KNIFE' ? (
-              <Sword className="w-4 h-4 sm:w-5 sm:h-5 text-amber-300" />
+              <Sword className={`${UTILITY_ICON} text-amber-300`} />
             ) : nearDoor ? (
-              <LogIn className="w-4 h-4 sm:w-5 sm:h-5 text-emerald-300" />
+              <LogIn className={`${UTILITY_ICON} text-emerald-300`} />
             ) : (
-              <Sword className="w-4 h-4 sm:w-5 sm:h-5" />
+              <Sword className={UTILITY_ICON} />
             )}
-            <span className="text-[8px] font-semibold uppercase tracking-wider mt-0.5">
+            <span className={UTILITY_LABEL}>
               {equippedWeapon === 'KNIFE' ? 'Throw' : nearDoor ? 'Enter' : 'Action'}
             </span>
           </button>
 
-          {/* RELOAD */}
           <button
             id="btn-reload"
             {...bindTouchButton('reload')}
-            className="w-12 h-12 sm:w-14 sm:h-14 rounded-full bg-neutral-900/80 border border-neutral-600/40 text-neutral-300 active:scale-90 active:bg-neutral-700/50 transition-transform flex flex-col items-center justify-center shadow-lg backdrop-blur-sm relative"
+            aria-label="Reload"
+            className={`${BTN} ${UTILITY} bg-neutral-900/80 border border-neutral-600/40 text-neutral-300 active:bg-neutral-700/50`}
           >
-            <RotateCcw className="w-4 h-4 sm:w-5 sm:h-5" />
-            <span className="text-[8px] font-semibold uppercase tracking-wider mt-0.5">Reload</span>
-            <span className="absolute -top-1.5 -right-1 text-[8px] font-mono px-1 rounded bg-black/80 border border-white/20 text-neutral-400">LT</span>
+            <RotateCcw className={UTILITY_ICON} />
+            <span className={UTILITY_LABEL}>Reload</span>
+            <span className="absolute -top-1.5 -right-1 text-[7px] font-mono px-1 rounded bg-black/80 border border-white/20 text-neutral-400">
+              LT
+            </span>
           </button>
 
-          {/* GRAB / TAKEDOWN */}
           <button
             id="btn-grab"
             {...bindTouchButton('grab')}
-            className="w-13 h-13 sm:w-15 sm:h-15 rounded-full bg-neutral-900/80 border border-amber-500/40 text-amber-300 active:scale-90 active:bg-amber-600/40 transition-transform flex flex-col items-center justify-center shadow-lg backdrop-blur-sm relative"
+            aria-label="Grab"
+            className={`${BTN} ${UTILITY} bg-neutral-900/80 border border-amber-500/40 text-amber-300 active:bg-amber-600/40`}
           >
-            <Hand className="w-5 h-5 sm:w-6 sm:h-6" />
-            <span className="text-[9px] font-semibold uppercase tracking-wider mt-0.5">Grab</span>
-            <span className="absolute -top-1.5 -right-1 text-[8px] font-mono px-1 rounded bg-black/80 border border-amber-400/40 text-amber-300">RB</span>
-          </button>
-
-          {/* JUMP */}
-          <button
-            id="btn-jump"
-            {...bindTouchButton('jump')}
-            className="w-13 h-13 sm:w-15 sm:h-15 rounded-full bg-neutral-900/80 border border-sky-500/40 text-sky-300 active:scale-90 active:bg-sky-600/40 transition-transform flex flex-col items-center justify-center shadow-lg backdrop-blur-sm relative"
-          >
-            <ArrowUp className="w-5 h-5 sm:w-6 sm:h-6" />
-            <span className="text-[9px] font-semibold uppercase tracking-wider mt-0.5">Jump</span>
-            <span className="absolute -top-1.5 -right-1 text-[8px] font-mono px-1 rounded bg-black/80 border border-sky-400/40 text-sky-300">A</span>
-          </button>
-
-          {/* FIRE / SHOT */}
-          <button
-            id="btn-shoot"
-            {...bindTouchButton('shoot')}
-            className="w-14 h-14 sm:w-16 sm:h-16 rounded-full bg-gradient-to-br from-amber-600 to-yellow-700 border-2 border-amber-300/80 text-amber-100 active:scale-90 active:from-amber-700 active:to-yellow-800 transition-transform flex flex-col items-center justify-center shadow-xl backdrop-blur-sm relative"
-          >
-            <Crosshair className="w-6 h-6 sm:w-7 sm:h-7" />
-            <span className="text-[9px] font-bold uppercase tracking-wider mt-0.5">Shoot</span>
-            <span className="absolute -top-1.5 -right-1 text-[8px] font-mono px-1 rounded bg-black/80 border border-amber-300/80 text-amber-200">RT</span>
-          </button>
-        </div>
-
-        {/* BOTTOM CLUSTER: Core Combat Quadrant (Block, Dodge, Attack, Heavy) */}
-        <div className="grid grid-cols-2 gap-2.5 sm:gap-3.5">
-          {/* BLOCK */}
-          <button
-            id="btn-block"
-            {...bindTouchButton('block')}
-            className="w-16 h-16 sm:w-18 sm:h-18 rounded-2xl bg-neutral-900/85 border border-blue-500/50 text-blue-300 active:scale-90 active:bg-blue-600/50 transition-transform flex flex-col items-center justify-center shadow-xl backdrop-blur-sm relative"
-          >
-            <Shield className="w-6 h-6 sm:w-7 sm:h-7" />
-            <span className="text-[11px] font-semibold uppercase tracking-wider mt-1">Block</span>
-            <span className="absolute top-1.5 right-2 text-[8px] font-mono px-1 rounded bg-black/80 border border-blue-400/40 text-blue-300">LB</span>
-          </button>
-
-          {/* HEAVY ATTACK */}
-          <button
-            id="btn-heavy"
-            {...bindTouchButton('heavy')}
-            className="w-16 h-16 sm:w-18 sm:h-18 rounded-2xl bg-neutral-900/85 border border-rose-500/50 text-rose-300 active:scale-90 active:bg-rose-600/50 transition-transform flex flex-col items-center justify-center shadow-xl backdrop-blur-sm relative"
-          >
-            <Sparkles className="w-6 h-6 sm:w-7 sm:h-7" />
-            <span className="text-[11px] font-semibold uppercase tracking-wider mt-1">Heavy</span>
-            <span className="absolute top-1.5 right-2 text-[8px] font-mono px-1 rounded bg-black/80 border border-rose-400/40 text-rose-300">Y</span>
-          </button>
-
-          {/* DODGE / SLIDE */}
-          <button
-            id="btn-dodge"
-            {...bindTouchButton('dodge')}
-            className="w-16 h-16 sm:w-18 sm:h-18 rounded-2xl bg-neutral-900/85 border border-emerald-500/50 text-emerald-300 active:scale-90 active:bg-emerald-600/50 transition-transform flex flex-col items-center justify-center shadow-xl backdrop-blur-sm relative"
-          >
-            <Wind className="w-6 h-6 sm:w-7 sm:h-7" />
-            <span className="text-[11px] font-semibold uppercase tracking-wider mt-1">Dodge</span>
-            <span className="absolute top-1.5 right-2 text-[8px] font-mono px-1 rounded bg-black/80 border border-emerald-400/40 text-emerald-300">B</span>
-          </button>
-
-          {/* LIGHT ATTACK (Primary Big Strike Button) */}
-          <button
-            id="btn-attack"
-            {...bindTouchButton('attack')}
-            className="w-16 h-16 sm:w-18 sm:h-18 rounded-2xl bg-gradient-to-br from-red-600 to-rose-800 border-2 border-rose-300 text-white active:scale-90 active:from-red-700 active:to-rose-900 transition-transform flex flex-col items-center justify-center shadow-2xl font-bold relative"
-          >
-            <Zap className="w-7 h-7 sm:w-8 sm:h-8 fill-current" />
-            <span className="text-[11px] font-bold uppercase tracking-wider mt-1">Strike</span>
-            <span className="absolute top-1.5 right-2 text-[9px] font-mono px-1 rounded bg-black/80 border border-white/40 text-white">X</span>
+            <HandGrab className={UTILITY_ICON} />
+            <span className={UTILITY_LABEL}>Grab</span>
+            <span className="absolute -top-1.5 -right-1 text-[7px] font-mono px-1 rounded bg-black/80 border border-amber-400/40 text-amber-300">
+              RB
+            </span>
           </button>
         </div>
       </div>

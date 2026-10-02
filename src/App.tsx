@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useEffect } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { GameLoop } from './engine/GameLoop';
 import { GameCanvas } from './components/GameCanvas';
 import { VirtualControls } from './components/VirtualControls';
@@ -25,10 +25,30 @@ import {
   Pause,
   Play,
   Target,
-  Bot
+  Bot,
+  Trophy
 } from 'lucide-react';
 import { SoundFX } from './engine/SoundFX';
 import { AIAgentsModal } from './components/AIAgentsModal';
+import { HowToPlayModal } from './components/HowToPlayModal';
+import { RotateDeviceOverlay } from './components/RotateDeviceOverlay';
+import { useLandscapeLock, shouldShowRotateHint } from './hooks/useLandscapeLock';
+import { MainMenu } from './components/MainMenu';
+import { PauseMenu } from './components/PauseMenu';
+import { OptionsModal } from './components/OptionsModal';
+import { StageSelectModal, STAGES, getNextStage } from './components/StageSelectModal';
+import type { StageDef } from './components/StageSelectModal';
+import { GameOverScreen } from './components/GameOverScreen';
+import type { RunStats } from './components/GameOverScreen';
+import {
+  applyQuality,
+  applySfxVolume,
+  loadProgress,
+  loadSettings,
+  saveProgress,
+  saveSettings,
+} from './components/settings';
+import type { GameProgress, GameSettings } from './components/settings';
 
 export interface MilestoneItem {
   id: number;
@@ -173,14 +193,73 @@ export default function App() {
   const [, setTick] = useState(0);
   const [showDebug, setShowDebug] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [showHowToPlay, setShowHowToPlay] = useState(false);
   const [showPerks, setShowPerks] = useState(false);
   const [showMilestones, setShowMilestones] = useState(false);
   const [showAIAgents, setShowAIAgents] = useState(false);
+  const [showOptions, setShowOptions] = useState(false);
+  const [showStageSelect, setShowStageSelect] = useState(false);
+  const [showVictory, setShowVictory] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [hasStarted, setHasStarted] = useState(false);
+  const [rotateDismissed, setRotateDismissed] = useState(false);
+
+  // Persistent settings (audio / graphics / HUD) + career progression
+  const [settings, setSettings] = useState<GameSettings>(loadSettings);
+  const [progress, setProgress] = useState<GameProgress>(loadProgress);
+  const [activeStage, setActiveStage] = useState<StageDef>(STAGES[0]);
+  const [kills, setKills] = useState(0);
+  const [runTimeSec, setRunTimeSec] = useState(0);
+
+  // Run telemetry lives in refs so the 250ms tracker can update it cheaply
+  const killsRef = useRef(0);
+  const deadEnemiesRef = useRef<WeakSet<object>>(new WeakSet());
+  const runSecondsRef = useRef(0);
+  const trackerLastTickRef = useRef(0);
+  const displayedSecondsRef = useRef(0);
+  // 'latched' = this run already produced a victory; 'open' = overlay is up (clock frozen)
+  const victoryLatchedRef = useRef(false);
+  const victoryOpenRef = useRef(false);
+  const clearedWaveRef = useRef<number | null>(null);
+
+  // Landscape-first launch: fullscreen + Screen Orientation API lock
+  const { isPortrait, lockSupported, lockLandscape } = useLandscapeLock();
+
+  // Re-arm the rotate hint whenever the device goes back to landscape
+  useEffect(() => {
+    if (!isPortrait) setRotateDismissed(false);
+  }, [isPortrait]);
 
   const handleStateUpdate = useCallback(() => {
     setTick(t => (t + 1) % 1000);
   }, []);
+
+  // P6B-05: the perf chip is painted straight into the DOM by the engine
+  // loop (fps + update/render ms), so the 0.5 s telemetry tick never has to
+  // wake React just to refresh a number.
+  const perfSpanRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    gameLoop.perfSpanEl = perfSpanRef.current;
+    gameLoop.updatePerfSpan();
+  }, [gameLoop, settings.showFps]);
+
+  // P6-02: surface the FX/pool/pose counters while the Rig debug toggle is on
+  useEffect(() => {
+    gameLoop.debugStatsEnabled = showDebug;
+    gameLoop.updatePerfSpan();
+  }, [gameLoop, showDebug]);
+
+  /** Drops any held virtual inputs so a paused/frozen screen can't leave one latched. */
+  const clearVirtualInputs = useCallback(() => {
+    const input = gameLoop.inputManager;
+    input.setVirtualJoystick(0, 0);
+    input.setVirtualAim(0, 0, false);
+    const buttons = [
+      'jump', 'dodge', 'attack', 'heavy', 'block',
+      'grab', 'shoot', 'reload', 'interact', 'focus', 'special',
+    ] as const;
+    for (const button of buttons) input.setVirtualButton(button, false);
+  }, [gameLoop]);
 
   const toggleDebug = () => {
     const next = !showDebug;
@@ -191,6 +270,11 @@ export default function App() {
   const toggleSound = () => {
     const active = gameLoop.toggleSound();
     setIsMuted(!active);
+    // Keep the persisted volume in sync with the HUD mute button.
+    setSettings(s => ({
+      ...s,
+      sfxVolume: active ? (s.sfxVolume > 0 ? s.sfxVolume : 60) : 0,
+    }));
   };
 
   const handleReset = () => {
@@ -198,9 +282,15 @@ export default function App() {
   };
 
   const togglePause = useCallback(() => {
+    // Pause only exists mid-run: never from the title, game-over or victory.
+    if (!hasStarted || gameLoop.isGameOver || victoryOpenRef.current) return;
+    const willPause = !gameLoop.isPaused;
+    if (willPause) clearVirtualInputs();
     gameLoop.togglePause();
     setTick(t => (t + 1) % 1000);
-  }, [gameLoop]);
+  }, [gameLoop, hasStarted, clearVirtualInputs]);
+
+  const togglePauseRef = useRef(togglePause);
 
   const buyPerk = (perkId: typeof PERK_CATALOG[number]['id'], cost: number) => {
     if (physics.coins >= cost && !physics.perks[perkId]) {
@@ -211,19 +301,242 @@ export default function App() {
     }
   };
 
+  /** Resets the run clock, kill tally and victory latch for a fresh contract. */
+  const resetRunTelemetry = useCallback(() => {
+    killsRef.current = 0;
+    setKills(0);
+    runSecondsRef.current = 0;
+    displayedSecondsRef.current = 0;
+    setRunTimeSec(0);
+    trackerLastTickRef.current = performance.now();
+    victoryLatchedRef.current = false;
+    victoryOpenRef.current = false;
+    clearedWaveRef.current = null;
+    setShowVictory(false);
+  }, []);
+
+  /** Boots the game straight into a chosen stage with a fresh fighter. */
+  const startStage = useCallback(
+    (stage: StageDef) => {
+      void lockLandscape(true);
+      clearVirtualInputs();
+      resetRunTelemetry();
+
+      gameLoop.fullReset();
+      gameLoop.waveNumber = stage.wave;
+      if (stage.spawn === 'boss') gameLoop.spawnBossDuel();
+      else if (stage.spawn === 'elite') gameLoop.spawnEliteDuo();
+      else if (stage.spawn === 'marquis') gameLoop.spawnMarquisDuel();
+      else gameLoop.spawnSquad(stage.squad);
+      gameLoop.setPaused(false);
+
+      setActiveStage(stage);
+      setHasStarted(true);
+      setShowStageSelect(false);
+      setShowOptions(false);
+      setShowPerks(false);
+      setShowMilestones(false);
+      setShowAIAgents(false);
+      setShowHelp(false);
+      setShowHowToPlay(false);
+      SoundFX.playDoorOpen();
+    },
+    [gameLoop, lockLandscape, clearVirtualInputs, resetRunTelemetry]
+  );
+
+  const restartStage = useCallback(() => {
+    startStage(activeStage);
+  }, [startStage, activeStage]);
+
+  /** Quit to the title screen with a clean slate. */
+  const goToTitle = useCallback(() => {
+    clearVirtualInputs();
+    resetRunTelemetry();
+    gameLoop.fullReset();
+    gameLoop.setPaused(true);
+    setHasStarted(false);
+    setShowStageSelect(false);
+    setShowOptions(false);
+    setShowPerks(false);
+    setShowMilestones(false);
+    setShowAIAgents(false);
+    setShowHelp(false);
+    setShowHowToPlay(false);
+    setTick(t => (t + 1) % 1000);
+  }, [gameLoop, clearVirtualInputs, resetRunTelemetry]);
+
+  /** Stage cleared → record progression (unlocks the next contract). */
+  const recordWaveCleared = useCallback((wave: number) => {
+    setProgress(prev => {
+      const stage = STAGES.find(s => s.wave === wave && !s.endless);
+      const clearedStages =
+        stage && !prev.clearedStages.includes(stage.id) ? [...prev.clearedStages, stage.id] : prev.clearedStages;
+      return {
+        ...prev,
+        clearedStages,
+        highestWaveCleared: Math.max(prev.highestWaveCleared, wave),
+      };
+    });
+  }, []);
+
+  /** Wave 6 Marquis falls → the High Table is toppled. */
+  const triggerVictory = useCallback(() => {
+    victoryLatchedRef.current = true;
+    victoryOpenRef.current = true;
+    clearVirtualInputs();
+    gameLoop.setPaused(true);
+    const stats = gameLoop.combatDirector.stats;
+    const timeSec = Math.floor(runSecondsRef.current);
+    setProgress(prev => ({
+      ...prev,
+      victories: prev.victories + 1,
+      bestScore: Math.max(prev.bestScore, stats.score),
+      bestMaxCombo: Math.max(prev.bestMaxCombo, stats.maxCombo),
+      bestKills: Math.max(prev.bestKills, killsRef.current),
+      bestTimeSec: prev.bestTimeSec > 0 ? Math.min(prev.bestTimeSec, timeSec) : timeSec,
+    }));
+    setShowVictory(true);
+    setTick(t => (t + 1) % 1000);
+  }, [gameLoop, clearVirtualInputs]);
+
+  const continueEndless = useCallback(() => {
+    clearVirtualInputs();
+    victoryOpenRef.current = false;
+    setShowVictory(false);
+    gameLoop.setPaused(false);
+    gameLoop.nextWave();
+    SoundFX.playDoorOpen();
+    setTick(t => (t + 1) % 1000);
+  }, [gameLoop, clearVirtualInputs]);
+
+  const updateSettings = useCallback((patch: Partial<GameSettings>) => {
+    setSettings(prev => ({ ...prev, ...patch }));
+  }, []);
+
+  // Settings → engine + document (quality tier drives the CSS effect budget)
   useEffect(() => {
+    applyQuality(settings.quality);
+    applySfxVolume(settings.sfxVolume);
+    gameLoop.soundMuted = settings.sfxVolume === 0;
+    // P5-01 + P5-02: one knob → canvas resolution, blur gates, FX budgets
+    gameLoop.quality = settings.quality;
+    setIsMuted(settings.sfxVolume === 0);
+    saveSettings(settings);
+  }, [settings, gameLoop]);
+
+  useEffect(() => {
+    saveProgress(progress);
+  }, [progress]);
+
+  // Keep the gamepad pause binding pointed at the latest handler
+  useEffect(() => {
+    togglePauseRef.current = togglePause;
+  });
+
+  useEffect(() => {
+    // Boot to the title screen with the simulation held
+    gameLoop.setPaused(true);
     gameLoop.inputManager.onPauseRequested = () => {
-      togglePause();
+      togglePauseRef.current();
     };
     gameLoop.inputManager.onGamepadChange = () => {
       setTick(t => (t + 1) % 1000);
     };
-  }, [gameLoop, togglePause]);
+  }, [gameLoop]);
 
   const isPaused = gameLoop.isPaused;
+  const isGameOver = gameLoop.isGameOver;
+
+  // Escape closes the topmost dialog, otherwise it toggles the pause menu
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (showOptions) setShowOptions(false);
+      else if (showStageSelect) setShowStageSelect(false);
+      else if (showHowToPlay) setShowHowToPlay(false);
+      else if (showHelp) setShowHelp(false);
+      else if (showPerks) setShowPerks(false);
+      else if (showMilestones) setShowMilestones(false);
+      else if (showAIAgents) setShowAIAgents(false);
+      else if (hasStarted && !isGameOver && !showVictory) togglePauseRef.current();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showOptions, showStageSelect, showHowToPlay, showHelp, showPerks, showMilestones, showAIAgents, hasStarted, isGameOver, showVictory]);
+
+  // Run tracker: clock, kill tally, wave-clear progression and victory detection
+  useEffect(() => {
+    if (!hasStarted) return;
+    trackerLastTickRef.current = performance.now();
+
+    const id = window.setInterval(() => {
+      const now = performance.now();
+      const delta = (now - trackerLastTickRef.current) / 1000;
+      trackerLastTickRef.current = now;
+
+      const frozen = gameLoop.isPaused || gameLoop.isGameOver || victoryOpenRef.current;
+
+      if (!frozen) {
+        runSecondsRef.current += delta;
+        const whole = Math.floor(runSecondsRef.current);
+        if (whole !== displayedSecondsRef.current) {
+          displayedSecondsRef.current = whole;
+          setRunTimeSec(whole);
+        }
+      }
+
+      // Kills: dead bodies stay in the wave array until the next respawn
+      let nextKills = killsRef.current;
+      for (const enemy of gameLoop.enemies) {
+        if (enemy.health <= 0 && enemy.state === 'DOWNED' && !deadEnemiesRef.current.has(enemy)) {
+          deadEnemiesRef.current.add(enemy);
+          nextKills += 1;
+        }
+      }
+      if (nextKills !== killsRef.current) {
+        killsRef.current = nextKills;
+        setKills(nextKills);
+      }
+
+      const allDowned =
+        gameLoop.enemies.length > 0 &&
+        gameLoop.enemies.every(e => e.health <= 0 && e.state === 'DOWNED');
+
+      // Progression: first time this wave is fully cleared
+      if (allDowned && clearedWaveRef.current !== gameLoop.waveNumber) {
+        clearedWaveRef.current = gameLoop.waveNumber;
+        recordWaveCleared(gameLoop.waveNumber);
+      }
+
+      // Story victory: Marquis de Gramont falls on wave 6
+      if (
+        !victoryLatchedRef.current &&
+        !gameLoop.isGameOver &&
+        gameLoop.waveNumber >= 6 &&
+        allDowned &&
+        gameLoop.enemies.some(e => e.type === 'MARQUIS' && e.health <= 0)
+      ) {
+        triggerVictory();
+      }
+    }, 250);
+
+    return () => window.clearInterval(id);
+  }, [hasStarted, gameLoop, recordWaveCleared, triggerVictory]);
+
+  // Defeat: freeze inputs and bank the personal bests for this run
+  useEffect(() => {
+    if (!isGameOver) return;
+    clearVirtualInputs();
+    const stats = gameLoop.combatDirector.stats;
+    setProgress(prev => ({
+      ...prev,
+      bestScore: Math.max(prev.bestScore, stats.score),
+      bestMaxCombo: Math.max(prev.bestMaxCombo, stats.maxCombo),
+      bestKills: Math.max(prev.bestKills, killsRef.current),
+    }));
+  }, [isGameOver, gameLoop, clearVirtualInputs]);
 
   const physics = gameLoop.player.physics;
-  const fps = gameLoop.fps;
   const enemies = gameLoop.enemies;
   const combat = gameLoop.combatDirector;
   const roomConfig = gameLoop.environmentManager.config;
@@ -234,19 +547,41 @@ export default function App() {
   const allEnemiesDowned = enemies.length > 0 && enemies.every(e => e.health <= 0 && e.state === 'DOWNED');
   const unlockedPerksCount = Object.keys(physics.perks).filter(k => physics.perks[k as keyof typeof physics.perks]).length;
 
+  const nextStage = getNextStage(progress);
+  const showEndScreen = hasStarted && (isGameOver || showVictory);
+  const currentStats: RunStats = {
+    kills,
+    maxCombo: combat.stats.maxCombo,
+    timeSec: runTimeSec,
+    score: combat.stats.score,
+    wave: gameLoop.waveNumber,
+    takedowns: combat.stats.takedownCount,
+    parries: combat.stats.parryCount,
+    damage: combat.stats.totalDamageDealt,
+    coins: physics.coins,
+    style: combat.stats.styleRating,
+  };
+  const isNewRecord = currentStats.score > 0 && currentStats.score >= progress.bestScore;
+
   return (
-    <div className="relative w-full h-screen bg-[#07080b] text-neutral-200 overflow-hidden font-sans select-none touch-none">
+    <div
+      className="relative w-full h-screen bg-[#07080b] text-neutral-200 overflow-hidden font-sans select-none touch-none"
+      style={{ height: '100dvh' }}
+    >
       {/* 1. CORE ENGINE CANVAS */}
-      <GameCanvas gameLoop={gameLoop} onStateUpdate={handleStateUpdate} />
+      <GameCanvas gameLoop={gameLoop} onStateUpdate={handleStateUpdate} quality={settings.quality} />
+
+      {/* 1b. CINEMATIC VIGNETTE — only mounted at the Cinematic graphics tier */}
+      <div className="menu-vignette" aria-hidden="true" />
 
       {/* 2. TOP HUD LAYER */}
-      <header className="absolute top-0 left-0 right-0 p-3 sm:p-5 pointer-events-none z-30 flex items-start justify-between">
+      <header className="absolute top-0 left-0 right-0 p-3 sm:p-5 pointer-events-none z-30 grid grid-cols-[1fr_auto] gap-x-2 gap-y-2 sm:flex sm:items-start sm:justify-between sm:gap-0">
         {/* PLAYER STATUS (Health, Stamina, Tactical Ammo) */}
-        <div className="flex flex-col gap-1.5 pointer-events-auto bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-xl border border-white/10 shadow-2xl">
+        <div className="flex flex-col gap-1.5 pointer-events-auto bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-xl border border-white/10 shadow-2xl sm:order-1">
           <div className="flex items-center justify-between gap-4">
             <span className="font-extrabold tracking-wider text-xs uppercase text-neutral-100 flex items-center gap-1.5">
               <span className="inline-block w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-              WICK
+              JOHN
             </span>
             <span className="text-[11px] font-mono font-medium text-neutral-400">
               {Math.round(physics.health)} / {physics.maxHealth}
@@ -254,7 +589,7 @@ export default function App() {
           </div>
 
           {/* Health Bar */}
-          <div className="w-36 sm:w-48 h-2.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10">
+          <div className="w-32 sm:w-48 h-2.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10">
             <div
               className="h-full bg-gradient-to-r from-red-600 via-rose-500 to-amber-400 transition-all duration-100"
               style={{ width: `${(physics.health / physics.maxHealth) * 100}%` }}
@@ -262,7 +597,7 @@ export default function App() {
           </div>
 
           {/* Stamina Bar */}
-          <div className="w-36 sm:w-48 h-1.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10">
+          <div className="w-32 sm:w-48 h-1.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10">
             <div
               className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-75"
               style={{ width: `${(physics.stamina / physics.maxStamina) * 100}%` }}
@@ -333,7 +668,7 @@ export default function App() {
         </div>
 
         {/* CENTER: CURRENT ACTION & TAKEDOWN CUE & WAVE COUNTER */}
-        <div className="flex flex-col items-center gap-1.5 pointer-events-none">
+        <div className="flex flex-col items-center gap-1.5 pointer-events-none col-span-2 sm:order-2">
           <div className="flex items-center gap-2">
             <div className="px-3 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-[11px] font-mono tracking-widest text-neutral-300 shadow-lg flex items-center gap-2">
               <Activity className="w-3.5 h-3.5 text-amber-400" />
@@ -345,6 +680,51 @@ export default function App() {
 
             <div className="px-2.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-white/10 text-[11px] font-mono font-bold text-neutral-300 shadow-lg">
               WAVE {gameLoop.waveNumber}
+            </div>
+          </div>
+
+          {/* Live Combo & Score Readouts (polled via the same tick re-render as the rest of the HUD) */}
+          <div className="flex items-center gap-1.5 flex-wrap justify-center">
+            {combat.stats.comboCount >= 1 && (
+              <div
+                className={`px-3 py-1 rounded-full bg-black/70 backdrop-blur-md border text-[11px] font-mono font-bold shadow-lg flex items-center gap-1.5 transition-all ${
+                  combat.stats.finisherArmed
+                    ? 'border-amber-400 text-amber-200 shadow-[0_0_16px_rgba(251,191,36,0.55)] animate-pulse'
+                    : combat.stats.comboCount >= 5
+                    ? 'border-orange-400/70 text-orange-200'
+                    : 'border-orange-400/40 text-orange-300'
+                }`}
+              >
+                <Zap className={`w-4 h-4 ${combat.stats.finisherArmed ? 'text-amber-300' : 'text-orange-400'}`} />
+                <span className="text-base font-black leading-none">{combat.stats.comboCount}x</span>
+                <span className="tracking-widest">COMBO</span>
+                <span className="text-[10px] text-rose-300/90 font-semibold">
+                  ×{combat.comboDamageMultiplier().toFixed(2)} DMG
+                </span>
+              </div>
+            )}
+
+            {combat.stats.finisherArmed && (
+              <div className="px-3 py-1 rounded-full bg-amber-500/25 border border-amber-300 text-[11px] font-mono font-black tracking-widest text-amber-200 shadow-[0_0_18px_rgba(251,191,36,0.6)] animate-bounce">
+                FINISHER READY
+              </div>
+            )}
+
+            {/* Signature-move callout (FLYING KICK / LEG SWEEP / GUN-FU ...) */}
+            {combat.moveBannerTimer > 0 && combat.moveBanner && (
+              <div className="px-3 py-1 rounded-full bg-sky-500/25 border border-sky-300 text-[11px] font-mono font-black tracking-widest text-sky-100 shadow-[0_0_18px_rgba(56,189,248,0.55)] animate-bounce">
+                {combat.moveBanner}
+              </div>
+            )}
+            <div
+              className={`px-3 py-1 rounded-full bg-black/60 backdrop-blur-md border text-[11px] font-mono font-bold shadow-lg flex items-center gap-1.5 ${
+                combat.stats.score > 0
+                  ? 'border-amber-400/40 text-amber-300'
+                  : 'border-white/10 text-neutral-500 opacity-60'
+              }`}
+            >
+              <Trophy className={`w-3.5 h-3.5 ${combat.stats.score > 0 ? 'text-amber-400' : 'text-neutral-600'}`} />
+              SCORE {combat.stats.score.toLocaleString()}
             </div>
           </div>
 
@@ -365,7 +745,7 @@ export default function App() {
           {isDoorOpen && (
             <div className="px-3.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-400 text-emerald-300 text-xs font-bold tracking-wider animate-pulse flex items-center gap-1.5 shadow-xl">
               <DoorOpen className="w-4 h-4 text-emerald-400" />
-              {isNearDoor ? 'TAP ENTER / ACTION TO ADVANCE!' : 'CHAMBER CLEARED • ADVANCE TO EXIT DOOR'}
+              {isNearDoor ? 'TAP GRAB TO ADVANCE!' : 'CHAMBER CLEARED • ADVANCE TO EXIT DOOR'}
             </div>
           )}
 
@@ -382,14 +762,14 @@ export default function App() {
         </div>
 
         {/* RIGHT: SQUAD TOGGLES & CONTROLS */}
-        <div className="flex items-center gap-2 pointer-events-auto">
+        <div className="flex items-center gap-1.5 sm:gap-2 pointer-events-auto col-start-2 row-start-1 justify-self-end sm:order-3">
           {/* Squad Encounter Size & Boss Toggle */}
-          <div className="hidden sm:flex items-center gap-1 bg-black/60 backdrop-blur-md p-1 rounded-xl border border-white/10 text-[11px] font-mono shadow-lg">
+          <div className="hidden 2xl:flex items-center gap-1 bg-black/60 backdrop-blur-md p-1 rounded-xl border border-white/10 text-[11px] font-mono shadow-lg">
             {[1, 2, 3].map((count) => (
               <button
                 key={count}
                 onClick={() => gameLoop.spawnSquad(count)}
-                className={`px-2 py-0.5 rounded-lg font-bold transition-all ${
+                className={`px-2.5 py-2 rounded-lg font-bold transition-all ${
                   gameLoop.squadSize === count && !enemies.some((e) => e.type === 'BOSS')
                     ? 'bg-amber-500 text-black shadow-md'
                     : 'text-neutral-400 hover:text-white bg-white/5'
@@ -401,7 +781,7 @@ export default function App() {
             ))}
             <button
               onClick={() => gameLoop.spawnBossDuel()}
-              className={`px-2 py-0.5 rounded-lg font-bold transition-all flex items-center gap-1 ${
+              className={`px-2.5 py-2 rounded-lg font-bold transition-all flex items-center gap-1 ${
                 enemies.some((e) => e.type === 'BOSS')
                   ? 'bg-gradient-to-r from-red-600 to-amber-500 text-white shadow-[0_0_8px_rgba(245,158,11,0.5)]'
                   : 'text-amber-400 hover:text-amber-200 bg-amber-500/10 border border-amber-500/30'
@@ -412,7 +792,7 @@ export default function App() {
             </button>
             <button
               onClick={() => gameLoop.spawnEliteDuo()}
-              className={`px-2 py-0.5 rounded-lg font-bold transition-all flex items-center gap-1 ${
+              className={`px-2.5 py-2 rounded-lg font-bold transition-all flex items-center gap-1 ${
                 gameLoop.squadSize === 5 && !enemies.some((e) => e.type === 'BOSS')
                   ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-[0_0_8px_rgba(147,51,234,0.5)]'
                   : 'text-purple-400 hover:text-purple-200 bg-purple-500/10 border border-purple-500/30'
@@ -427,7 +807,7 @@ export default function App() {
           <button
             id="toggle-ai-agents-btn"
             onClick={() => setShowAIAgents(!showAIAgents)}
-            className={`p-2 rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
+            className={`p-2 min-h-[44px] rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg hidden xl:flex items-center gap-1.5 ${
               showAIAgents
                 ? 'bg-gradient-to-r from-amber-500 to-purple-600 border-amber-300 text-white shadow-[0_0_15px_rgba(245,158,11,0.5)] font-black'
                 : 'bg-black/60 border-amber-500/30 text-amber-300 hover:text-white'
@@ -444,7 +824,7 @@ export default function App() {
           <button
             id="toggle-pause-btn"
             onClick={togglePause}
-            className={`p-2 rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
+            className={`p-2 min-h-[44px] min-w-[44px] justify-center rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
               isPaused
                 ? 'bg-amber-500 border-amber-300 text-black shadow-[0_0_15px_rgba(245,158,11,0.6)] animate-pulse font-black'
                 : 'bg-black/60 border-white/10 text-neutral-300 hover:text-white'
@@ -452,7 +832,7 @@ export default function App() {
             title="Pause Mission (Start / Menu)"
           >
             {isPaused ? <Play className="w-4 h-4 fill-current" /> : <Pause className="w-4 h-4" />}
-            <span className="hidden sm:inline font-mono text-[11px] font-bold">
+            <span className="hidden lg:inline font-mono text-[11px] font-bold">
               {isPaused ? 'RESUME' : 'PAUSE'}
             </span>
           </button>
@@ -461,7 +841,7 @@ export default function App() {
           <button
             id="toggle-perks-btn"
             onClick={() => setShowPerks(!showPerks)}
-            className={`p-2 rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
+            className={`p-2 min-h-[44px] min-w-[44px] justify-center rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
               showPerks || unlockedPerksCount > 0
                 ? 'bg-amber-500/20 border-amber-400 text-amber-300'
                 : 'bg-black/60 border-white/10 text-neutral-400 hover:text-neutral-200'
@@ -469,7 +849,7 @@ export default function App() {
             title="High Table Armory Perks"
           >
             <Award className="w-4 h-4 text-amber-400" />
-            <span className="font-mono text-[11px] font-bold">
+            <span className="hidden lg:inline font-mono text-[11px] font-bold">
               {unlockedPerksCount > 0 ? `${unlockedPerksCount}/5` : 'Perks'}
             </span>
           </button>
@@ -478,7 +858,7 @@ export default function App() {
           <button
             id="toggle-milestones-btn"
             onClick={() => setShowMilestones(!showMilestones)}
-            className={`p-2 rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
+            className={`p-2 min-h-[44px] rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg hidden xl:flex items-center gap-1.5 ${
               showMilestones
                 ? 'bg-sky-500/20 border-sky-400 text-sky-300'
                 : 'bg-black/60 border-white/10 text-neutral-400 hover:text-neutral-200'
@@ -495,7 +875,7 @@ export default function App() {
           <button
             id="toggle-sound-btn"
             onClick={toggleSound}
-            className={`p-2 rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
+            className={`p-2 min-h-[44px] min-w-[44px] justify-center rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
               !isMuted
                 ? 'bg-black/60 border-white/10 text-neutral-300 hover:text-white'
                 : 'bg-red-500/20 border-red-500 text-red-400'
@@ -509,7 +889,7 @@ export default function App() {
           <button
             id="reset-fight-btn"
             onClick={handleReset}
-            className="p-2 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-neutral-400 hover:text-neutral-200 text-xs shadow-lg transition-all"
+            className="p-2 min-h-[44px] min-w-[44px] justify-center rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-neutral-400 hover:text-neutral-200 text-xs shadow-lg transition-all hidden xl:flex items-center"
             title="Reset Encounter"
           >
             <RotateCcw className="w-4 h-4" />
@@ -519,7 +899,7 @@ export default function App() {
           <button
             id="toggle-debug-btn"
             onClick={toggleDebug}
-            className={`p-2 rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg flex items-center gap-1.5 ${
+            className={`p-2 min-h-[44px] rounded-xl backdrop-blur-md border text-xs transition-all shadow-lg hidden sm:flex items-center gap-1.5 ${
               showDebug
                 ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
                 : 'bg-black/60 border-white/10 text-neutral-400 hover:text-neutral-200'
@@ -527,32 +907,32 @@ export default function App() {
             title="Toggle Skeletal Rig Overlay"
           >
             <Eye className="w-4 h-4" />
-            <span className="hidden md:inline font-mono text-[11px]">Rig</span>
+            <span className="hidden lg:inline font-mono text-[11px]">Rig</span>
           </button>
 
           {/* Controls / Info Modal Toggle */}
           <button
             id="toggle-help-btn"
             onClick={() => setShowHelp(!showHelp)}
-            className="p-2 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-neutral-400 hover:text-neutral-200 text-xs shadow-lg transition-all"
+            className="p-2 min-h-[44px] min-w-[44px] justify-center rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-neutral-400 hover:text-neutral-200 text-xs shadow-lg transition-all flex items-center"
             title="Combat Guide"
           >
             <HelpCircle className="w-4 h-4" />
           </button>
 
-          {/* FPS Counter */}
-          <div className="px-2.5 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-neutral-400 font-mono text-[11px] flex items-center gap-1 shadow-lg">
-            <Cpu className="w-3.5 h-3.5 text-neutral-500" />
-            <span className={fps >= 55 ? 'text-emerald-400 font-semibold' : 'text-amber-400 font-semibold'}>
-              {fps}
-            </span>
-          </div>
+          {/* FPS Counter (Options → HUD) — engine writes fps/update/render ms */}
+          {settings.showFps && (
+            <div className="px-2.5 py-1.5 rounded-xl bg-black/60 backdrop-blur-md border border-white/10 text-neutral-400 font-mono text-[11px] hidden xl:flex items-center gap-1 shadow-lg">
+              <Cpu className="w-3.5 h-3.5 text-neutral-500" />
+              <span ref={perfSpanRef} />
+            </div>
+          )}
         </div>
       </header>
 
       {/* 3. HELP & COMBAT GUIDE MODAL */}
       {showHelp && (
-        <div className="absolute inset-0 z-40 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+        <div className="absolute inset-0 z-[54] bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
           <div className="max-w-xl w-full bg-neutral-900 border border-neutral-700 rounded-2xl p-5 shadow-2xl space-y-4">
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
               <h2 className="text-base font-bold text-white flex items-center gap-2">
@@ -561,7 +941,7 @@ export default function App() {
               </h2>
               <button
                 onClick={() => setShowHelp(false)}
-                className="text-neutral-400 hover:text-white px-2 py-1 text-sm font-semibold rounded-lg hover:bg-white/10 cursor-pointer"
+                className="text-neutral-400 hover:text-white min-h-[44px] min-w-[44px] flex items-center justify-center text-sm font-semibold rounded-lg hover:bg-white/10 cursor-pointer"
               >
                 ✕
               </button>
@@ -597,8 +977,8 @@ export default function App() {
                 <div className="text-neutral-300"><span className="text-white font-semibold">Left Stick / D-Pad:</span> Locomotion & Slide Aim</div>
                 <div className="text-neutral-300"><span className="text-sky-300 font-semibold">A / Cross:</span> Jump Ascent</div>
                 <div className="text-neutral-300"><span className="text-emerald-300 font-semibold">B / Circle:</span> Combat Dodge Roll / Slide</div>
-                <div className="text-neutral-300"><span className="text-rose-300 font-semibold">X / Square:</span> Light Strike (1-2-3 Combo)</div>
-                <div className="text-neutral-300"><span className="text-amber-300 font-semibold">Y / Triangle:</span> Heavy Guard Break Crush</div>
+                <div className="text-neutral-300"><span className="text-rose-300 font-semibold">X / Square:</span> PUNCH — jab / cross / spin string</div>
+                <div className="text-neutral-300"><span className="text-amber-300 font-semibold">Y / Triangle:</span> KICK — long-reach power kick (guard break)</div>
                 <div className="text-neutral-300"><span className="text-blue-300 font-semibold">LB / L1:</span> Guard Block / Perfect Parry</div>
                 <div className="text-neutral-300"><span className="text-yellow-300 font-semibold">RB / R1:</span> Grab / Close-Quarters Takedown</div>
                 <div className="text-neutral-300"><span className="text-neutral-400 font-semibold">LT / L2:</span> Tactical Pistol Reload</div>
@@ -614,18 +994,24 @@ export default function App() {
                   Touch Screen Gestures & Tactics
                 </div>
                 <div className="text-neutral-400">• <span className="text-white font-semibold">Left Thumb:</span> 360° dynamic virtual joystick for running and sliding.</div>
-                <div className="text-neutral-400">• <span className="text-white font-semibold">Right Thumb:</span> Instant-response strike, dodge, block, and firearm cluster.</div>
+                <div className="text-neutral-400">• <span className="text-white font-semibold">Right Thumb:</span> Big PUNCH + KICK hero buttons, plus block, dodge, jump and gun cluster.</div>
+                <div className="text-neutral-400">• <span className="text-rose-300 font-semibold">Combos:</span> Chain hits inside the timing window — damage scales up and every 5 hits loads a FINISHER.</div>
                 <div className="text-neutral-400">• <span className="text-yellow-300 font-semibold">Gun-Fu Double Tap:</span> Tap Shoot at point-blank range (&lt;95px) for critical slow-mo executions.</div>
-                <div className="text-neutral-400">• <span className="text-sky-300 font-semibold">Guard Break:</span> Tap Heavy button when enemies guard (🛡️ GUARD) to shatter stance!</div>
+                <div className="text-neutral-400">• <span className="text-sky-300 font-semibold">Guard Break:</span> Tap KICK when enemies guard (🛡️ GUARD) to shatter stance!</div>
                 <div className="text-neutral-400">• <span className="text-emerald-300 font-semibold">Slide Trip:</span> Slide into blocking enemies to sweep their legs out.</div>
                 <div className="text-neutral-400">• <span className="text-purple-300 font-semibold">Perfect Parry:</span> Tap Block just before hit connects for slow-motion stun.</div>
+                <div className="text-neutral-400">• <span className="text-sky-300 font-semibold">Parry Riposte:</span> Land any strike right after a perfect parry for 2.5× counter damage.</div>
+                <div className="text-neutral-400">• <span className="text-amber-300 font-semibold">Flying Kick:</span> Hold a full sprint for a beat, then tap KICK to launch down the line.</div>
+                <div className="text-neutral-400">• <span className="text-rose-300 font-semibold">Leg Sweep:</span> PUNCH → PUNCH → KICK chains into a low knockdown sweep.</div>
+                <div className="text-neutral-400">• <span className="text-yellow-300 font-semibold">Grip Execution:</span> Hold SHOOT + tap GRAB for a pistol-grip headshot — GRAB alone judo-slams and bowls the body through the squad.</div>
+                <div className="text-neutral-400">• <span className="text-orange-300 font-semibold">Pistol Whip:</span> Tap Shoot with an enemy on the muzzle — free heavy hit, no round spent.</div>
                 <div className="text-neutral-400">• <span className="text-amber-400 font-semibold">Haptic Feedback:</span> Native vibration on mobile devices & Type-C controller rumble motors.</div>
               </div>
             </div>
 
             <button
               onClick={() => setShowHelp(false)}
-              className="w-full py-2.5 bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white rounded-xl text-xs font-bold uppercase tracking-wider transition-colors shadow-lg cursor-pointer"
+              className="w-full min-h-[44px] py-2.5 bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white rounded-xl text-xs font-bold uppercase tracking-wider transition-colors shadow-lg cursor-pointer"
             >
               Resume Fight
             </button>
@@ -636,7 +1022,7 @@ export default function App() {
       {/* 4. HIGH TABLE CONTINENTAL ARMORY & PERKS MODAL */}
       {showPerks && (
         <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
+          className="fixed inset-0 z-[55] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
           onClick={(e) => {
             if (e.target === e.currentTarget) setShowPerks(false);
           }}
@@ -662,7 +1048,7 @@ export default function App() {
               </div>
               <button
                 onClick={() => setShowPerks(false)}
-                className="p-1.5 rounded-xl text-neutral-400 hover:text-white hover:bg-white/10 transition-colors"
+                className="p-1.5 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-neutral-400 hover:text-white hover:bg-white/10 transition-colors"
                 title="Close (Esc)"
               >
                 <X className="w-5 h-5" />
@@ -764,7 +1150,7 @@ export default function App() {
                         <button
                           disabled={!canAfford}
                           onClick={() => buyPerk(perk.id, perk.cost)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-bold font-mono transition-all flex items-center gap-1.5 ${
+                          className={`px-4 py-1.5 min-h-[44px] rounded-lg text-xs font-bold font-mono transition-all flex items-center gap-1.5 ${
                             canAfford
                               ? 'bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black shadow-lg cursor-pointer active:scale-95'
                               : 'bg-white/5 text-neutral-500 cursor-not-allowed border border-white/5'
@@ -787,7 +1173,7 @@ export default function App() {
               </span>
               <button
                 onClick={() => setShowPerks(false)}
-                className="w-full sm:w-auto px-4 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-white font-bold transition-colors text-center cursor-pointer"
+                className="w-full sm:w-auto min-h-[44px] px-6 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-white font-bold transition-colors text-center cursor-pointer"
               >
                 Close
               </button>
@@ -799,7 +1185,7 @@ export default function App() {
       {/* 5. MILESTONES & CONTRACTS MODAL */}
       {showMilestones && (
         <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
+          className="fixed inset-0 z-[55] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
           onClick={(e) => {
             if (e.target === e.currentTarget) setShowMilestones(false);
           }}
@@ -825,7 +1211,7 @@ export default function App() {
               </div>
               <button
                 onClick={() => setShowMilestones(false)}
-                className="p-1.5 rounded-xl text-neutral-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                className="p-1.5 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-neutral-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
                 title="Close (Esc)"
               >
                 <X className="w-5 h-5" />
@@ -911,7 +1297,7 @@ export default function App() {
                             setShowMilestones(false);
                             if (isPaused) togglePause();
                           }}
-                          className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-mono text-xs font-bold transition-all shadow-md active:scale-95 cursor-pointer"
+                          className="px-4 py-1.5 min-h-[44px] rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-mono text-xs font-bold transition-all shadow-md active:scale-95 cursor-pointer"
                         >
                           ⚡ Battle Elite Duo
                         </button>
@@ -938,7 +1324,7 @@ export default function App() {
               <span>Advance waves and eliminate threats to achieve all milestones.</span>
               <button
                 onClick={() => setShowMilestones(false)}
-                className="px-4 py-1.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-white font-bold transition-colors cursor-pointer"
+                className="px-6 py-1.5 min-h-[44px] rounded-xl bg-neutral-800 hover:bg-neutral-700 text-white font-bold transition-colors cursor-pointer"
               >
                 Close
               </button>
@@ -948,147 +1334,41 @@ export default function App() {
       )}
 
       {/* 6. TACTICAL PAUSE MENU OVERLAY */}
-      {isPaused && (
-        <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto animate-in fade-in duration-150"
-          onClick={(e) => {
-            if (e.target === e.currentTarget) togglePause();
-          }}
-        >
-          <div className="max-w-md w-full bg-[#0d0f15] border border-amber-500/40 rounded-2xl p-6 shadow-[0_0_60px_rgba(245,158,11,0.25)] flex flex-col gap-5 text-neutral-200 relative">
-            {/* Header */}
-            <div className="flex items-center justify-between border-b border-amber-500/20 pb-3">
-              <div className="flex items-center gap-2.5">
-                <div className="w-3 h-3 rounded-full bg-amber-400 animate-ping" />
-                <div>
-                  <h2 className="text-lg font-black tracking-widest text-amber-300 uppercase font-mono">
-                    Mission Suspended
-                  </h2>
-                  <span className="text-[10px] font-mono uppercase tracking-wider text-neutral-400">
-                    Tactical Combat Pause
-                  </span>
-                </div>
-              </div>
-              <button
-                onClick={togglePause}
-                className="p-1.5 rounded-lg text-neutral-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
-                title="Resume (P or Esc)"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Chamber Status Info */}
-            <div className="bg-black/50 border border-white/10 rounded-xl p-3.5 space-y-2 text-xs font-mono">
-              <div className="flex items-center justify-between text-neutral-400">
-                <span>CHAMBER:</span>
-                <span className="text-white font-bold">{roomConfig.title} (WAVE {gameLoop.waveNumber})</span>
-              </div>
-              <div className="flex items-center justify-between text-neutral-400">
-                <span>STYLE RATING:</span>
-                <span className="text-amber-400 font-bold">{combat.stats.styleRating}</span>
-              </div>
-              <div className="flex items-center justify-between text-neutral-400">
-                <span>CURRENT COMBO:</span>
-                <span className="text-white font-bold">{combat.stats.comboCount}x (Max {combat.stats.maxCombo}x)</span>
-              </div>
-              <div className="flex items-center justify-between text-neutral-400">
-                <span>SPECIE COLLECTED:</span>
-                <span className="text-yellow-400 font-bold flex items-center gap-1">
-                  <Coins className="w-3.5 h-3.5 text-yellow-400" />
-                  {physics.coins} Gold Coins
-                </span>
-              </div>
-              <div className="flex items-center justify-between text-neutral-400">
-                <span>EXECUTIONS / PARRIES:</span>
-                <span className="text-emerald-400 font-bold">{combat.stats.takedownCount} Takedowns • {combat.stats.parryCount} Parries</span>
-              </div>
-            </div>
-
-            {/* Menu Actions */}
-            <div className="flex flex-col gap-2 pt-1">
-              <button
-                onClick={togglePause}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black font-black uppercase tracking-wider text-xs flex items-center justify-center gap-2 shadow-lg transition-transform active:scale-95 cursor-pointer"
-              >
-                <Play className="w-4 h-4 fill-current" />
-                Resume Mission
-              </button>
-
-              <button
-                onClick={() => {
-                  setShowPerks(true);
-                }}
-                className="w-full py-2.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-amber-500/30 text-amber-300 font-bold uppercase tracking-wider text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer"
-              >
-                <Award className="w-4 h-4 text-amber-400" />
-                Continental Armory & Perks
-              </button>
-
-              <button
-                onClick={() => {
-                  setShowMilestones(true);
-                }}
-                className="w-full py-2.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-sky-500/30 text-sky-300 font-bold uppercase tracking-wider text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer"
-              >
-                <Target className="w-4 h-4 text-sky-400" />
-                Milestone 7 & Contracts
-              </button>
-
-              <button
-                onClick={() => {
-                  setShowAIAgents(true);
-                }}
-                className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-950/60 to-purple-950/60 hover:from-amber-900/70 hover:to-purple-900/70 border border-amber-500/40 text-amber-300 font-bold uppercase tracking-wider text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-md"
-              >
-                <Bot className="w-4 h-4 text-amber-400" />
-                AI Syndicate Bureau (Multi-Agent Studio)
-              </button>
-
-              <button
-                onClick={() => {
-                  setShowHelp(true);
-                }}
-                className="w-full py-2.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-300 font-bold uppercase tracking-wider text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer"
-              >
-                <HelpCircle className="w-4 h-4 text-neutral-400" />
-                Combat Operations Manual
-              </button>
-
-              <div className="grid grid-cols-2 gap-2 pt-1">
-                <button
-                  onClick={() => {
-                    handleReset();
-                    togglePause();
-                  }}
-                  className="py-2 rounded-xl bg-red-950/40 hover:bg-red-900/50 border border-red-500/30 text-red-300 font-bold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                >
-                  <RotateCcw className="w-3.5 h-3.5" />
-                  Restart Chamber
-                </button>
-
-                <button
-                  onClick={toggleSound}
-                  className="py-2 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-300 font-bold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
-                >
-                  {isMuted ? <VolumeX className="w-3.5 h-3.5 text-red-400" /> : <Volume2 className="w-3.5 h-3.5 text-emerald-400" />}
-                  {isMuted ? 'Muted' : 'Sound On'}
-                </button>
-              </div>
-            </div>
-
-            <div className="text-[10px] text-center text-neutral-400 font-mono">
-              Tap Resume Mission or press Start on your Type-C gamepad to continue combat.
-            </div>
-          </div>
-        </div>
+      {hasStarted && isPaused && !isGameOver && !showVictory && (
+        <PauseMenu
+          gameLoop={gameLoop}
+          runTimeSec={runTimeSec}
+          isMuted={isMuted}
+          showDebug={showDebug}
+          onResume={togglePause}
+          onRestart={restartStage}
+          onOptions={() => setShowOptions(true)}
+          onMainMenu={goToTitle}
+          onHelp={() => setShowHelp(true)}
+          onHowToPlay={() => setShowHowToPlay(true)}
+          onPerks={() => setShowPerks(true)}
+          onMilestones={() => setShowMilestones(true)}
+          onAIStudio={() => setShowAIAgents(true)}
+          onToggleSound={toggleSound}
+          onToggleDebug={toggleDebug}
+        />
       )}
 
-      {/* 7. MOBILE ON-SCREEN VIRTUAL CONTROLS */}
-      <VirtualControls
-        inputManager={gameLoop.inputManager}
-        equippedWeapon={physics.equippedWeapon}
-        nearDoor={isNearDoor}
+      {/* 7. MOBILE ON-SCREEN VIRTUAL CONTROLS (gameplay only — never over title/end screens) */}
+      {hasStarted && !isGameOver && !showVictory && (
+        <VirtualControls
+          inputManager={gameLoop.inputManager}
+          equippedWeapon={physics.equippedWeapon}
+          nearDoor={isNearDoor}
+        />
+      )}
+
+      {/* 7b. LANDSCAPE HINT — portrait handhelds get a rotate-your-device prompt */}
+      <RotateDeviceOverlay
+        visible={!rotateDismissed && shouldShowRotateHint(isPortrait)}
+        lockSupported={lockSupported}
+        onRotateTap={() => void lockLandscape(true)}
+        onDismiss={() => setRotateDismissed(true)}
       />
 
       {/* 8. HIGH TABLE MULTI-AI-AGENTS STUDIO */}
@@ -1097,6 +1377,51 @@ export default function App() {
         onClose={() => setShowAIAgents(false)}
         gameLoop={gameLoop}
         onApplied={() => setTick(t => (t + 1) % 1000)}
+      />
+
+      {/* 8b. HOW TO PLAY — compact real-bindings legend (title screen + pause menu) */}
+      <HowToPlayModal isOpen={showHowToPlay} onClose={() => setShowHowToPlay(false)} />
+
+      {/* 9. MAIN MENU — Play / Stages / Options / How to Play */}
+      {!hasStarted && (
+        <MainMenu
+          progress={progress}
+          nextStage={nextStage}
+          onPlay={() => startStage(nextStage)}
+          onStageSelect={() => setShowStageSelect(true)}
+          onOptions={() => setShowOptions(true)}
+          onHowToPlay={() => setShowHowToPlay(true)}
+        />
+      )}
+
+      {/* 10. END SCREENS — contract defeat & High Table victory with run stats */}
+      {showEndScreen && (
+        <GameOverScreen
+          variant={isGameOver ? 'defeat' : 'victory'}
+          stats={currentStats}
+          stageName={activeStage.name}
+          isNewRecord={isNewRecord}
+          onRetry={restartStage}
+          onStages={() => setShowStageSelect(true)}
+          onMainMenu={goToTitle}
+          onContinue={continueEndless}
+        />
+      )}
+
+      {/* 11. OPTIONS — sound volume, graphics quality & HUD */}
+      <OptionsModal
+        isOpen={showOptions}
+        settings={settings}
+        onChange={updateSettings}
+        onClose={() => setShowOptions(false)}
+      />
+
+      {/* 12. STAGE SELECT — progression contract board */}
+      <StageSelectModal
+        isOpen={showStageSelect}
+        progress={progress}
+        onSelect={startStage}
+        onClose={() => setShowStageSelect(false)}
       />
     </div>
   );

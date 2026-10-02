@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+/* Landscape-first "rotate your device" phone rock */
+@keyframes rotateHint {
+  0%, 100% { transform: rotate(0deg); }
+  30% { transform: rotate(-24deg); }
+  70% { transform: rotate(24deg); }
+}
+
 html, body, #root {
   width: 100%;
   height: 100%;
@@ -12,4 +19,171 @@ html, body, #root {
   -webkit-user-select: none;
   -webkit-touch-callout: none;
   touch-action: none;
+}
+
+/* ============================================================
+   MENU SHELL — shared look for main menu, pause, options, end screens
+   ============================================================ */
+
+@keyframes menuIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.985); }
+  to { opacity: 1; transform: none; }
+}
+
+.menu-in {
+  animation: menuIn 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Title-screen action buttons (thumb-sized, landscape-first) */
+.menu-btn {
+  width: 100%;
+  background-color: rgba(0, 0, 0, 0.55);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: #e5e7eb;
+}
+
+.menu-btn:hover {
+  background-color: rgba(0, 0, 0, 0.72);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.menu-btn-primary {
+  background-image: linear-gradient(to right, #f59e0b, #facc15);
+  border-color: #fde68a;
+  color: #000;
+}
+
+.menu-btn-primary:hover {
+  background-image: linear-gradient(to right, #fbbf24, #fde047);
+  background-color: transparent;
+}
+
+.menu-btn-ghost {
+  flex-direction: column;
+  gap: 0.35rem;
+  padding-top: 0.65rem;
+  padding-bottom: 0.65rem;
+}
+
+/* Cinematic vignette — mounted over the canvas at the Cinematic tier only */
+.menu-vignette {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  pointer-events: none;
+  display: none;
+  background: radial-gradient(ellipse at center, rgba(0, 0, 0, 0) 52%, rgba(0, 0, 0, 0.4) 100%);
+}
+
+html[data-quality='high'] .menu-vignette {
+  display: block;
+}
+
+/* ============================================================
+   GRAPHICS QUALITY TIERS (Options menu → document[data-quality])
+   Unlayered rules outrank Tailwind's utility layer, so these win
+   without !important on class-based utilities.
+   ============================================================ */
+
+html[data-quality='low'] [class*='backdrop-blur'] {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+html[data-quality='low'] [class*='shadow-'] {
+  box-shadow: none !important;
+}
+
+html[data-quality='low'] .animate-pulse,
+html[data-quality='low'] .animate-bounce {
+  animation: none !important;
+}
+
+html[data-quality='low'] .menu-in {
+  animation-duration: 1ms;
+}
+
+/* Balanced: keep the frosted HUD for readability, trim the expensive glows */
+html[data-quality='medium'] [class*='shadow-[0_0'],
+html[data-quality='medium'] .shadow-2xl {
+  box-shadow: none !important;
+}
+
+/* ============================================================
+   OPTIONS CONTROLS — big, drag-friendly volume slider
+   ============================================================ */
+
+input[type='range'].menu-range {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 44px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+  touch-action: none;
+}
+
+input[type='range'].menu-range::-webkit-slider-runnable-track {
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: linear-gradient(
+    to right,
+    #f59e0b 0 var(--vol, 100%),
+    #1c1917 var(--vol, 100%) 100%
+  );
+}
+
+input[type='range'].menu-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  margin-top: -9px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #fde68a, #f59e0b);
+  border: 2px solid #111827;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.65);
+}
+
+input[type='range'].menu-range::-moz-range-track {
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #1c1917;
+}
+
+input[type='range'].menu-range::-moz-range-progress {
+  height: 10px;
+  border-radius: 999px;
+  background: #f59e0b;
+}
+
+input[type='range'].menu-range::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #fde68a, #f59e0b);
+  border: 2px solid #111827;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.65);
+}
+
+input[type='range'].menu-range:focus-visible {
+  outline: 2px solid #f59e0b;
+  outline-offset: 4px;
+}
+
+/* ============================================================
+   ACCESSIBILITY — respect reduced-motion preferences
+   ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

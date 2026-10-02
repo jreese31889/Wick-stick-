@@ -3,6 +3,7 @@ import {
   DroppedWeapon,
   GlassShard,
   GoldCoin,
+  HealthPack,
   Hitbox,
   RoomTheme,
   ThrownProjectile,
@@ -11,6 +12,7 @@ import {
 } from '../types/game';
 import { SoundFX } from './SoundFX';
 import { EnemyController } from './EnemyController';
+import { ObjectPool } from './ObjectPool';
 
 export interface RoomConfig {
   theme: RoomTheme;
@@ -20,6 +22,8 @@ export interface RoomConfig {
   floorColor: string;
   accentColor: string;
   hasRain: boolean;
+  /** Optional AI key-art backdrop (path relative to Vite base), drawn with parallax behind the procedural set */
+  backdropImage?: string;
 }
 
 export const ROOM_CONFIGS: Record<RoomTheme, RoomConfig> = {
@@ -31,6 +35,7 @@ export const ROOM_CONFIGS: Record<RoomTheme, RoomConfig> = {
     floorColor: '#1c1917',
     accentColor: '#d97706',
     hasRain: false,
+    backdropImage: 'assets/ai/level-dojo.jpg',
   },
   NEON_GALLERY: {
     theme: 'NEON_GALLERY',
@@ -40,6 +45,7 @@ export const ROOM_CONFIGS: Record<RoomTheme, RoomConfig> = {
     floorColor: '#0a1124',
     accentColor: '#06b6d4',
     hasRain: false,
+    backdropImage: 'assets/ai/level-nightclub.jpg',
   },
   RAINY_ALLEY: {
     theme: 'RAINY_ALLEY',
@@ -49,6 +55,7 @@ export const ROOM_CONFIGS: Record<RoomTheme, RoomConfig> = {
     floorColor: '#0f172a',
     accentColor: '#38bdf8',
     hasRain: true,
+    backdropImage: 'assets/ai/level-rooftop.jpg',
   },
   PENTHOUSE_SUITE: {
     theme: 'PENTHOUSE_SUITE',
@@ -69,6 +76,7 @@ export class EnvironmentManager {
   public droppedWeapons: DroppedWeapon[] = [];
   public coins: GoldCoin[] = [];
   public projectiles: ThrownProjectile[] = [];
+  public healthPacks: HealthPack[] = [];
   public doorOpen: boolean = false;
   public doorX: number = 740;
   public doorWidth: number = 70;
@@ -76,28 +84,64 @@ export class EnvironmentManager {
   public roomBannerTimer: number = 0;
   public transitionAlpha: number = 0;
 
-  // Rain particles for Rainy Alley theme
-  private rainDrops: { x: number; y: number; speed: number; len: number }[] = [];
+  /**
+   * M14 hard caps for the high-churn props. All sit far above what a real
+   * fight produces, so normal play never notices them; they only stop a
+   * pathological burst from growing the arrays without bound.
+   */
+  public static readonly MAX_GLASS_SHARDS = 160;
+  public static readonly MAX_COINS = 192;
+  public static readonly MAX_KNIVES = 32;
+  /** P3-03: loot caps — bounded worst case in loot-heavy runs. */
+  public static readonly MAX_HEALTH_PACKS = 8;
+  public static readonly MAX_DROPPED_WEAPONS = 12;
+
+  // M14: free lists so shattered glass, coins and thrown knives are recycled
+  // instead of allocated fresh on every spawn (GC churn on mid-range Android).
+  private shardPool = new ObjectPool<GlassShard>(
+    () => ({
+      x: 0, y: 0, vx: 0, vy: 0, size: 1, rot: 0, vRot: 0,
+      life: 0, maxLife: 1, color: '#ffffff',
+    }),
+    EnvironmentManager.MAX_GLASS_SHARDS + 64
+  );
+  private coinPool = new ObjectPool<GoldCoin>(
+    () => ({ id: 0, x: 0, y: 0, vx: 0, vy: 0, rot: 0, vRot: 0, life: 0, value: 1 }),
+    EnvironmentManager.MAX_COINS + 32
+  );
+  private knifePool = new ObjectPool<ThrownProjectile>(
+    () => ({ id: 0, type: 'KNIFE', x: 0, y: 0, vx: 0, vy: 0, rot: 0, life: 0, damage: 0 }),
+    EnvironmentManager.MAX_KNIVES + 8
+  );
+  // P3-03: loot pools — med kits and dropped blades recycle like the rest
+  private healthPackPool = new ObjectPool<HealthPack>(
+    () => ({ id: 0, x: 0, y: 0, vx: 0, vy: 0, rot: 0, vRot: 0, life: 0, healAmount: 35 }),
+    EnvironmentManager.MAX_HEALTH_PACKS + 8
+  );
+  private weaponPool = new ObjectPool<DroppedWeapon>(
+    () => ({
+      id: 0, type: 'KNIFE', x: 0, y: 0, vx: 0, vy: 0,
+      rot: 0, vRot: 0, durability: 0, grounded: false,
+    }),
+    EnvironmentManager.MAX_DROPPED_WEAPONS + 8
+  );
 
   constructor() {
-    this.initRain();
     this.initRoom(0);
-  }
-
-  private initRain() {
-    this.rainDrops = [];
-    for (let i = 0; i < 90; i++) {
-      this.rainDrops.push({
-        x: (Math.random() - 0.5) * 1600,
-        y: -400 + Math.random() * 500,
-        speed: 650 + Math.random() * 400,
-        len: 12 + Math.random() * 16,
-      });
-    }
   }
 
   public get config(): RoomConfig {
     return ROOM_CONFIGS[this.currentTheme] || ROOM_CONFIGS.CONTINENTAL_LOUNGE;
+  }
+
+  /** Recycles the oldest `count` entries of a capped array back to its pool. */
+  private trimOldest<T>(arr: T[], count: number, pool: ObjectPool<T>): void {
+    const n = Math.max(0, Math.min(count, arr.length));
+    for (let i = 0; i < n; i++) {
+      const old = arr.shift();
+      if (old === undefined) break;
+      pool.release(old);
+    }
   }
 
   public initRoom(roomIndex: number) {
@@ -108,8 +152,10 @@ export class EnvironmentManager {
     this.roomBannerTimer = 3.5;
     this.transitionAlpha = 1.0;
 
-    // Clear transient projectiles and shards
+    // Clear transient projectiles and shards (shells go back to their pools)
+    this.knifePool.releaseAll(this.projectiles);
     this.projectiles = [];
+    this.shardPool.releaseAll(this.glassShards);
     this.glassShards = [];
 
     // Setup Room Destructibles and tactical weapon caches
@@ -266,10 +312,16 @@ export class EnvironmentManager {
 
   public reset() {
     this.initRoom(0);
+    this.coinPool.releaseAll(this.coins);
     this.coins = [];
+    this.weaponPool.releaseAll(this.droppedWeapons);
     this.droppedWeapons = [];
+    this.knifePool.releaseAll(this.projectiles);
     this.projectiles = [];
+    this.shardPool.releaseAll(this.glassShards);
     this.glassShards = [];
+    this.healthPackPool.releaseAll(this.healthPacks);
+    this.healthPacks = [];
   }
 
   public shatterObject(obj: DestructibleObject, impactForceX: number = 0, impactForceY: number = -120) {
@@ -286,18 +338,23 @@ export class EnvironmentManager {
     for (let i = 0; i < 28; i++) {
       const angle = Math.random() * Math.PI * 2;
       const speed = 120 + Math.random() * 320;
-      this.glassShards.push({
-        x: obj.x + (Math.random() - 0.5) * obj.width,
-        y: obj.y - Math.random() * obj.height,
-        vx: Math.cos(angle) * speed + impactForceX * 0.4,
-        vy: Math.sin(angle) * speed + impactForceY * 0.6,
-        size: 3 + Math.random() * 7,
-        rot: Math.random() * Math.PI * 2,
-        vRot: (Math.random() - 0.5) * 14,
-        life: 0,
-        maxLife: 2.2 + Math.random() * 1.5,
-        color: colors[Math.floor(Math.random() * colors.length)],
-      });
+      this.trimOldest(
+        this.glassShards,
+        this.glassShards.length + 1 - EnvironmentManager.MAX_GLASS_SHARDS,
+        this.shardPool
+      );
+      const shard = this.shardPool.acquire();
+      shard.x = obj.x + (Math.random() - 0.5) * obj.width;
+      shard.y = obj.y - Math.random() * obj.height;
+      shard.vx = Math.cos(angle) * speed + impactForceX * 0.4;
+      shard.vy = Math.sin(angle) * speed + impactForceY * 0.6;
+      shard.size = 3 + Math.random() * 7;
+      shard.rot = Math.random() * Math.PI * 2;
+      shard.vRot = (Math.random() - 0.5) * 14;
+      shard.life = 0;
+      shard.maxLife = 2.2 + Math.random() * 1.5;
+      shard.color = colors[Math.floor(Math.random() * colors.length)];
+      this.glassShards.push(shard);
     }
 
     // Drop contained weapon if present
@@ -313,52 +370,84 @@ export class EnvironmentManager {
   }
 
   public dropWeapon(type: WeaponType, x: number, y: number, vx: number = 0, vy: number = -160) {
-    this.droppedWeapons.push({
-      id: Date.now() + Math.random(),
-      type,
-      x,
-      y,
-      vx,
-      vy,
-      rot: Math.random() * Math.PI,
-      vRot: (Math.random() - 0.5) * 10,
-      durability: type === 'KATANA' ? 14 : 5,
-      grounded: false,
-    });
+    // P3-03: capped + recycled instead of an unbounded literal push
+    this.trimOldest(
+      this.droppedWeapons,
+      this.droppedWeapons.length + 1 - EnvironmentManager.MAX_DROPPED_WEAPONS,
+      this.weaponPool
+    );
+    const w = this.weaponPool.acquire();
+    w.id = Date.now() + Math.random();
+    w.type = type;
+    w.x = x;
+    w.y = y;
+    w.vx = vx;
+    w.vy = vy;
+    w.rot = Math.random() * Math.PI;
+    w.vRot = (Math.random() - 0.5) * 10;
+    w.durability = type === 'KATANA' ? 14 : 5;
+    w.grounded = false;
+    this.droppedWeapons.push(w);
   }
 
   public dropCoin(x: number, y: number, value: number = 1) {
-    this.coins.push({
-      id: Date.now() + Math.random(),
-      x,
-      y,
-      vx: (Math.random() - 0.5) * 160,
-      vy: -220 - Math.random() * 120,
-      rot: Math.random() * Math.PI * 2,
-      vRot: (Math.random() - 0.5) * 12,
-      life: 0,
-      value,
-    });
+    this.trimOldest(this.coins, this.coins.length + 1 - EnvironmentManager.MAX_COINS, this.coinPool);
+    const coin = this.coinPool.acquire();
+    coin.id = Date.now() + Math.random();
+    coin.x = x;
+    coin.y = y;
+    coin.vx = (Math.random() - 0.5) * 160;
+    coin.vy = -220 - Math.random() * 120;
+    coin.rot = Math.random() * Math.PI * 2;
+    coin.vRot = (Math.random() - 0.5) * 12;
+    coin.life = 0;
+    coin.value = value;
+    this.coins.push(coin);
+  }
+
+  public dropHealthPack(x: number, y: number, healAmount: number = 35) {
+    // P3-03: capped + recycled instead of an unbounded literal push
+    this.trimOldest(
+      this.healthPacks,
+      this.healthPacks.length + 1 - EnvironmentManager.MAX_HEALTH_PACKS,
+      this.healthPackPool
+    );
+    const pack = this.healthPackPool.acquire();
+    pack.id = Date.now() + Math.random();
+    pack.x = x;
+    pack.y = y - 30;
+    pack.vx = (Math.random() - 0.5) * 140;
+    pack.vy = -200 - Math.random() * 100;
+    pack.rot = 0;
+    pack.vRot = (Math.random() - 0.5) * 6;
+    pack.life = 0;
+    pack.healAmount = healAmount;
+    this.healthPacks.push(pack);
   }
 
   public throwKnife(x: number, y: number, dir: number) {
     SoundFX.playKnifeThrow();
-    this.projectiles.push({
-      id: Date.now() + Math.random(),
-      type: 'KNIFE',
-      x,
-      y: y - 55,
-      vx: dir * 980,
-      vy: -25,
-      rot: dir > 0 ? 0 : Math.PI,
-      life: 0,
-      damage: 48,
-    });
+    this.trimOldest(
+      this.projectiles,
+      this.projectiles.length + 1 - EnvironmentManager.MAX_KNIVES,
+      this.knifePool
+    );
+    const knife = this.knifePool.acquire();
+    knife.id = Date.now() + Math.random();
+    knife.type = 'KNIFE';
+    knife.x = x;
+    knife.y = y - 55;
+    knife.vx = dir * 980;
+    knife.vy = -25;
+    knife.rot = dir > 0 ? 0 : Math.PI;
+    knife.life = 0;
+    knife.damage = 48;
+    this.projectiles.push(knife);
   }
 
   public update(
     dt: number,
-    player: { position: Vector2; coins?: number; equippedWeapon?: WeaponType; weaponDurability?: number; perks?: Record<string, boolean> },
+    player: { position: Vector2; coins?: number; equippedWeapon?: WeaponType; weaponDurability?: number; perks?: Record<string, boolean>; health?: number; maxHealth?: number },
     onPickupCoin?: (val: number) => void,
     onPickupWeapon?: (weapon: WeaponType) => void
   ) {
@@ -372,19 +461,7 @@ export class EnvironmentManager {
       this.transitionAlpha = Math.max(0, this.transitionAlpha - dt * 2.0);
     }
 
-    // 1. Rain simulation
-    if (this.config.hasRain) {
-      for (const drop of this.rainDrops) {
-        drop.y += drop.speed * dt;
-        drop.x -= 80 * dt; // Wind slant
-        if (drop.y > 50) {
-          drop.y = -350 - Math.random() * 100;
-          drop.x = (Math.random() - 0.5) * 1600;
-        }
-      }
-    }
-
-    // 2. Glass Shards physics
+    // 1. Glass Shards physics
     const GRAVITY = 1100;
     for (let i = this.glassShards.length - 1; i >= 0; i--) {
       const shard = this.glassShards[i];
@@ -404,6 +481,7 @@ export class EnvironmentManager {
 
       if (shard.life >= shard.maxLife) {
         this.glassShards.splice(i, 1);
+        this.shardPool.release(shard);
       }
     }
 
@@ -439,6 +517,7 @@ export class EnvironmentManager {
         if (onPickupWeapon) onPickupWeapon(w.type);
         SoundFX.playBladeSlash();
         this.droppedWeapons.splice(i, 1);
+        this.weaponPool.release(w);
       }
     }
 
@@ -478,10 +557,51 @@ export class EnvironmentManager {
         }
         if (onPickupCoin) onPickupCoin(coin.value);
         this.coins.splice(i, 1);
+        this.coinPool.release(coin);
       }
     }
 
-    // 5. Thrown Projectiles update
+    // 5. Health Packs physics & pickup (Continental field medic kits)
+    for (let i = this.healthPacks.length - 1; i >= 0; i--) {
+      const pack = this.healthPacks[i];
+      pack.life += dt;
+      pack.vy += GRAVITY * dt;
+      pack.x += pack.vx * dt;
+      pack.y += pack.vy * dt;
+      pack.rot += pack.vRot * dt;
+
+      if (pack.y >= 0) {
+        pack.y = 0;
+        pack.vy = -pack.vy * 0.4;
+        pack.vx *= 0.75;
+        pack.vRot *= 0.6;
+      }
+
+      // Despawn after 25s so the arena doesn't fill up
+      if (pack.life > 25) {
+        this.healthPacks.splice(i, 1);
+        this.healthPackPool.release(pack);
+        continue;
+      }
+
+      // Pickup radius — only consumed when the player is actually hurt
+      const pdx = playerPos.x - pack.x;
+      const pdy = (playerPos.y - 45) - pack.y;
+      const pdist = Math.sqrt(pdx * pdx + pdy * pdy);
+      if (
+        pdist < 48 &&
+        player.health !== undefined &&
+        player.maxHealth !== undefined &&
+        player.health < player.maxHealth
+      ) {
+        player.health = Math.min(player.maxHealth, player.health + pack.healAmount);
+        SoundFX.playHeal();
+        this.healthPacks.splice(i, 1);
+        this.healthPackPool.release(pack);
+      }
+    }
+
+    // 6. Thrown Projectiles update
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const p = this.projectiles[i];
       p.life += dt;
@@ -491,6 +611,7 @@ export class EnvironmentManager {
       // Screen boundary check
       if (p.life > 1.4 || Math.abs(p.x) > 850) {
         this.projectiles.splice(i, 1);
+        this.knifePool.release(p);
       }
     }
   }
@@ -534,6 +655,7 @@ export class EnvironmentManager {
         if (dist < 40) {
           onHit(enemy, p.damage, p.x, p.y);
           this.projectiles.splice(i, 1);
+          this.knifePool.release(p);
           break;
         }
       }

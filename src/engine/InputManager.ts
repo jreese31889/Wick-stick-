@@ -31,6 +31,8 @@ export class InputManager {
     interactJustPressed: false,
     focus: false,
     focusJustPressed: false,
+    special: false,
+    specialJustPressed: false,
   };
 
   // Mobile virtual control inputs (pure touch)
@@ -49,6 +51,7 @@ export class InputManager {
   private virtualReload = false;
   private virtualInteract = false;
   private virtualFocus = false;
+  private virtualSpecial = false;
 
   private prevVirtualJump = false;
   private prevVirtualDodge = false;
@@ -60,10 +63,41 @@ export class InputManager {
   private prevVirtualReload = false;
   private prevVirtualInteract = false;
   private prevVirtualFocus = false;
+  private prevVirtualSpecial = false;
+
+  // Keyboard bindings (desktop fallback — mobile stays touch-first)
+  private kbJump = false;
+  private kbDodge = false;
+  private kbAttack = false;
+  private kbHeavy = false;
+  private kbBlock = false;
+  private kbGrab = false;
+  private kbShoot = false;
+  private kbReload = false;
+  private kbInteract = false;
+  private kbFocus = false;
+  private kbSpecial = false;
+  private kbMoveX = 0;
+  private kbMoveY = 0;
+
+  private prevKbJump = false;
+  private prevKbDodge = false;
+  private prevKbAttack = false;
+  private prevKbHeavy = false;
+  private prevKbGrab = false;
+  private prevKbShoot = false;
+  private prevKbReload = false;
+  private prevKbInteract = false;
+  private prevKbFocus = false;
+  private prevKbSpecial = false;
+  private prevKbBlock = false;
 
   // Type-C / USB-C Gamepad state
   public gamepadStatus: GamepadStatus = { connected: false, name: '' };
-  private prevGamepadButtons: boolean[] = [];
+  // P2-02: fixed-length history (was rebuilt as a new array every frame)
+  private prevGamepadButtons: boolean[] = [
+    false, false, false, false, false, false, false, false, false, false,
+  ];
   private prevGamepadStart = false;
 
   // Callbacks
@@ -74,6 +108,9 @@ export class InputManager {
     if (typeof window !== 'undefined') {
       window.addEventListener('gamepadconnected', this.handleGamepadConnected);
       window.addEventListener('gamepaddisconnected', this.handleGamepadDisconnected);
+      window.addEventListener('keydown', this.handleKeyDown);
+      window.addEventListener('keyup', this.handleKeyUp);
+      window.addEventListener('blur', this.releaseKeyboard);
     }
   }
 
@@ -81,6 +118,9 @@ export class InputManager {
     if (typeof window !== 'undefined') {
       window.removeEventListener('gamepadconnected', this.handleGamepadConnected);
       window.removeEventListener('gamepaddisconnected', this.handleGamepadDisconnected);
+      window.removeEventListener('keydown', this.handleKeyDown);
+      window.removeEventListener('keyup', this.handleKeyUp);
+      window.removeEventListener('blur', this.releaseKeyboard);
     }
   }
 
@@ -92,6 +132,65 @@ export class InputManager {
 
   private handleGamepadDisconnected = (): void => {
     this.checkConnectedGamepad();
+  };
+
+  /**
+   * Desktop keyboard fallback. Mobile remains touch-first; gamepads keep their
+   * existing Type-C bindings. Q (or PUNCH+KICK together) fires the combo special.
+   */
+  private handleKeyDown = (e: KeyboardEvent): void => {
+    if (e.repeat) return;
+    switch (e.code) {
+      case 'Space': this.kbJump = true; break;
+      case 'KeyW': case 'ArrowUp': this.kbMoveY = -1; break;
+      case 'KeyS': case 'ArrowDown': this.kbMoveY = 1; break;
+      case 'KeyA': case 'ArrowLeft': this.kbMoveX = -1; break;
+      case 'KeyD': case 'ArrowRight': this.kbMoveX = 1; break;
+      case 'ShiftLeft': case 'ShiftRight': this.kbDodge = true; break;
+      case 'KeyJ': this.kbAttack = true; break;
+      case 'KeyK': this.kbHeavy = true; break;
+      case 'KeyL': this.kbBlock = true; break;
+      case 'KeyE': this.kbGrab = true; this.kbInteract = true; break;
+      case 'KeyF': this.kbShoot = true; break;
+      case 'KeyR': this.kbReload = true; break;
+      case 'KeyC': this.kbFocus = true; break;
+      case 'KeyQ': this.kbSpecial = true; break;
+    }
+  };
+
+  private handleKeyUp = (e: KeyboardEvent): void => {
+    switch (e.code) {
+      case 'Space': this.kbJump = false; break;
+      case 'KeyW': case 'ArrowUp': if (this.kbMoveY < 0) this.kbMoveY = 0; break;
+      case 'KeyS': case 'ArrowDown': if (this.kbMoveY > 0) this.kbMoveY = 0; break;
+      case 'KeyA': case 'ArrowLeft': if (this.kbMoveX < 0) this.kbMoveX = 0; break;
+      case 'KeyD': case 'ArrowRight': if (this.kbMoveX > 0) this.kbMoveX = 0; break;
+      case 'ShiftLeft': case 'ShiftRight': this.kbDodge = false; break;
+      case 'KeyJ': this.kbAttack = false; break;
+      case 'KeyK': this.kbHeavy = false; break;
+      case 'KeyL': this.kbBlock = false; break;
+      case 'KeyE': this.kbGrab = false; this.kbInteract = false; break;
+      case 'KeyF': this.kbShoot = false; break;
+      case 'KeyR': this.kbReload = false; break;
+      case 'KeyC': this.kbFocus = false; break;
+      case 'KeyQ': this.kbSpecial = false; break;
+    }
+  };
+
+  private releaseKeyboard = (): void => {
+    this.kbJump = false;
+    this.kbDodge = false;
+    this.kbAttack = false;
+    this.kbHeavy = false;
+    this.kbBlock = false;
+    this.kbGrab = false;
+    this.kbShoot = false;
+    this.kbReload = false;
+    this.kbInteract = false;
+    this.kbFocus = false;
+    this.kbSpecial = false;
+    this.kbMoveX = 0;
+    this.kbMoveY = 0;
   };
 
   private formatGamepadName(rawId: string): string {
@@ -176,7 +275,7 @@ export class InputManager {
   }
 
   public setVirtualButton(
-    button: 'jump' | 'dodge' | 'attack' | 'heavy' | 'block' | 'grab' | 'shoot' | 'reload' | 'interact' | 'focus',
+    button: 'jump' | 'dodge' | 'attack' | 'heavy' | 'block' | 'grab' | 'shoot' | 'reload' | 'interact' | 'focus' | 'special',
     pressed: boolean
   ): void {
     switch (button) {
@@ -190,6 +289,7 @@ export class InputManager {
       case 'reload': this.virtualReload = pressed; break;
       case 'interact': this.virtualInteract = pressed; break;
       case 'focus': this.virtualFocus = pressed; break;
+      case 'special': this.virtualSpecial = pressed; break;
     }
   }
 
@@ -283,6 +383,10 @@ export class InputManager {
     }
     this.prevGamepadStart = padStart;
 
+    // Keyboard fallback (only when touch stick / gamepad are idle)
+    if (Math.abs(moveX) < 0.01 && this.kbMoveX !== 0) moveX = this.kbMoveX;
+    if (Math.abs(moveY) < 0.01 && this.kbMoveY !== 0) moveY = this.kbMoveY;
+
     // Clamp stick vector
     const len = Math.sqrt(moveX * moveX + moveY * moveY);
     if (len > 1) {
@@ -290,56 +394,62 @@ export class InputManager {
       moveY /= len;
     }
 
-    // Combine Touch Controls + Type-C Gamepad
-    const jump = this.virtualJump || padJump;
-    const dodge = this.virtualDodge || padDodge;
-    const attack = this.virtualAttack || padAttack;
-    const heavy = this.virtualHeavy || padHeavy;
-    const block = this.virtualBlock || padBlock;
-    const grab = this.virtualGrab || padGrab;
-    const shoot = this.virtualShoot || padShoot;
-    const reload = this.virtualReload || padReload;
-    const interact = this.virtualInteract || padInteract;
-    const focus = this.virtualFocus || padFocus;
+    // Combine Touch Controls + Type-C Gamepad + Keyboard
+    const jump = this.virtualJump || padJump || this.kbJump;
+    const dodge = this.virtualDodge || padDodge || this.kbDodge;
+    const attack = this.virtualAttack || padAttack || this.kbAttack;
+    const heavy = this.virtualHeavy || padHeavy || this.kbHeavy;
+    const block = this.virtualBlock || padBlock || this.kbBlock;
+    const grab = this.virtualGrab || padGrab || this.kbGrab;
+    const shoot = this.virtualShoot || padShoot || this.kbShoot;
+    const reload = this.virtualReload || padReload || this.kbReload;
+    const interact = this.virtualInteract || padInteract || this.kbInteract;
+    const focus = this.virtualFocus || padFocus || this.kbFocus;
+    // Combo special: dedicated binding OR holding PUNCH + KICK together
+    const special = this.virtualSpecial || this.kbSpecial || (attack && heavy);
 
     // Detect "just pressed" edges
-    const prevJump = this.prevVirtualJump || Boolean(this.prevGamepadButtons[0]);
-    const prevDodge = this.prevVirtualDodge || Boolean(this.prevGamepadButtons[1]);
-    const prevAttack = this.prevVirtualAttack || Boolean(this.prevGamepadButtons[2]);
-    const prevHeavy = this.prevVirtualHeavy || Boolean(this.prevGamepadButtons[3]);
-    const prevBlock = this.prevVirtualBlock || Boolean(this.prevGamepadButtons[4]);
-    const prevGrab = this.prevVirtualGrab || Boolean(this.prevGamepadButtons[5]);
-    const prevReload = this.prevVirtualReload || Boolean(this.prevGamepadButtons[6]);
-    const prevShoot = this.prevVirtualShoot || Boolean(this.prevGamepadButtons[7]);
-    const prevFocus = this.prevVirtualFocus || Boolean(this.prevGamepadButtons[8]);
-    const prevInteract = this.prevVirtualInteract || Boolean(this.prevGamepadButtons[7] || this.prevGamepadButtons[0]);
+    const prevJump = this.prevVirtualJump || Boolean(this.prevGamepadButtons[0]) || this.prevKbJump;
+    const prevDodge = this.prevVirtualDodge || Boolean(this.prevGamepadButtons[1]) || this.prevKbDodge;
+    const prevAttack = this.prevVirtualAttack || Boolean(this.prevGamepadButtons[2]) || this.prevKbAttack;
+    const prevHeavy = this.prevVirtualHeavy || Boolean(this.prevGamepadButtons[3]) || this.prevKbHeavy;
+    const prevBlock = this.prevVirtualBlock || Boolean(this.prevGamepadButtons[4]) || this.prevKbBlock;
+    const prevGrab = this.prevVirtualGrab || Boolean(this.prevGamepadButtons[5]) || this.prevKbGrab;
+    const prevReload = this.prevVirtualReload || Boolean(this.prevGamepadButtons[6]) || this.prevKbReload;
+    const prevShoot = this.prevVirtualShoot || Boolean(this.prevGamepadButtons[7]) || this.prevKbShoot;
+    const prevFocus = this.prevVirtualFocus || Boolean(this.prevGamepadButtons[8]) || this.prevKbFocus;
+    const prevInteract = this.prevVirtualInteract || Boolean(this.prevGamepadButtons[7] || this.prevGamepadButtons[0]) || this.prevKbInteract;
+    const prevSpecial = this.prevVirtualSpecial || this.prevKbSpecial || (prevAttack && prevHeavy);
 
-    this.state = {
-      moveX,
-      moveY,
-      aimX,
-      aimY,
-      aimActive,
-      jump,
-      jumpJustPressed: jump && !prevJump,
-      dodge,
-      dodgeJustPressed: dodge && !prevDodge,
-      attack,
-      attackJustPressed: attack && !prevAttack,
-      heavyAttack: heavy,
-      heavyAttackJustPressed: heavy && !prevHeavy,
-      block,
-      grab,
-      grabJustPressed: grab && !prevGrab,
-      shoot,
-      shootJustPressed: shoot && !prevShoot,
-      reload,
-      reloadJustPressed: reload && !prevReload,
-      interact,
-      interactJustPressed: interact && !prevInteract,
-      focus,
-      focusJustPressed: focus && !prevFocus,
-    };
+    // P2-02: mutated in place — poll() no longer allocates a fresh state
+    // object every frame (PlayerController keeps a live reference to it).
+    const s = this.state;
+    s.moveX = moveX;
+    s.moveY = moveY;
+    s.aimX = aimX;
+    s.aimY = aimY;
+    s.aimActive = aimActive;
+    s.jump = jump;
+    s.jumpJustPressed = jump && !prevJump;
+    s.dodge = dodge;
+    s.dodgeJustPressed = dodge && !prevDodge;
+    s.attack = attack;
+    s.attackJustPressed = attack && !prevAttack;
+    s.heavyAttack = heavy;
+    s.heavyAttackJustPressed = heavy && !prevHeavy;
+    s.block = block;
+    s.grab = grab;
+    s.grabJustPressed = grab && !prevGrab;
+    s.shoot = shoot;
+    s.shootJustPressed = shoot && !prevShoot;
+    s.reload = reload;
+    s.reloadJustPressed = reload && !prevReload;
+    s.interact = interact;
+    s.interactJustPressed = interact && !prevInteract;
+    s.focus = focus;
+    s.focusJustPressed = focus && !prevFocus;
+    s.special = special;
+    s.specialJustPressed = special && !prevSpecial;
 
     // Update history for next frame
     this.prevVirtualJump = this.virtualJump;
@@ -352,19 +462,30 @@ export class InputManager {
     this.prevVirtualReload = this.virtualReload;
     this.prevVirtualInteract = this.virtualInteract;
     this.prevVirtualFocus = this.virtualFocus;
+    this.prevVirtualSpecial = this.virtualSpecial;
 
-    this.prevGamepadButtons = [
-      padJump,
-      padDodge,
-      padAttack,
-      padHeavy,
-      padBlock,
-      padGrab,
-      padReload,
-      padShoot,
-      padFocus,
-      padStart,
-    ];
+    this.prevKbJump = this.kbJump;
+    this.prevKbDodge = this.kbDodge;
+    this.prevKbAttack = this.kbAttack;
+    this.prevKbHeavy = this.kbHeavy;
+    this.prevKbBlock = this.kbBlock;
+    this.prevKbGrab = this.kbGrab;
+    this.prevKbShoot = this.kbShoot;
+    this.prevKbReload = this.kbReload;
+    this.prevKbInteract = this.kbInteract;
+    this.prevKbFocus = this.kbFocus;
+    this.prevKbSpecial = this.kbSpecial;
+
+    this.prevGamepadButtons[0] = padJump;
+    this.prevGamepadButtons[1] = padDodge;
+    this.prevGamepadButtons[2] = padAttack;
+    this.prevGamepadButtons[3] = padHeavy;
+    this.prevGamepadButtons[4] = padBlock;
+    this.prevGamepadButtons[5] = padGrab;
+    this.prevGamepadButtons[6] = padReload;
+    this.prevGamepadButtons[7] = padShoot;
+    this.prevGamepadButtons[8] = padFocus;
+    this.prevGamepadButtons[9] = padStart;
 
     return this.state;
   }

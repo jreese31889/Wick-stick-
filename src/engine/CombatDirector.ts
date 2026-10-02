@@ -1,18 +1,36 @@
 import { PlayerController } from './PlayerController';
-import { EnemyController } from './EnemyController';
+import { EnemyController, resolveDamage, enemyBulletPool } from './EnemyController';
 import { Camera } from './Camera';
 import { SoundFX } from './SoundFX';
-import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc } from '../types/game';
+import { ragdollPool } from './Ragdoll';
+import { ObjectPool } from './ObjectPool';
+import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc, EnemyBullet } from '../types/game';
 import { EnvironmentManager } from './EnvironmentManager';
+
+/**
+ * Recycles the oldest `count` entries of a capped FX array back into its pool
+ * (M14: keeps the live arrays bounded without allocating or dropping shells).
+ */
+function trimOldest<T>(arr: T[], count: number, pool: ObjectPool<T>): void {
+  const n = Math.max(0, Math.min(count, arr.length));
+  for (let i = 0; i < n; i++) {
+    const old = arr.shift();
+    if (old === undefined) break;
+    pool.release(old);
+  }
+}
 
 export interface CombatStats {
   comboCount: number;
   comboTimer: number;
   maxCombo: number;
+  /** True while the chain finisher is loaded — the next landed strike detonates it. */
+  finisherArmed: boolean;
   totalDamageDealt: number;
   parryCount: number;
   takedownCount: number;
   styleRating: string;
+  score: number;
 }
 
 export class CombatDirector {
@@ -23,19 +41,57 @@ export class CombatDirector {
   public casings: CasingParticle[] = [];
   public bloodDecals: BloodDecal[] = [];
   public bladeArcs: BladeSlashArc[] = [];
+  public enemyBullets: EnemyBullet[] = [];
+
+  // M14: free lists for the high-churn FX families. Acquire on spawn, release
+  // on removal, so a busy fight allocates nothing after the pools warm up.
+  private sparkPool = new ObjectPool<ImpactSpark>(
+    () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, maxLife: 0, color: '#ffffff', size: 1 }),
+    CombatDirector.MAX_SPARKS + 64
+  );
+  private popupPool = new ObjectPool<DamagePopup>(
+    () => ({ id: 0, x: 0, y: 0, text: '', color: '#ffffff', size: 16, life: 0, maxLife: 0, vy: 0 }),
+    CombatDirector.MAX_POPUPS + 16
+  );
+  private bloodPool = new ObjectPool<BloodDecal>(
+    () => ({
+      x: 0, y: 0, vx: 0, vy: 0, radius: 1, alpha: 1,
+      life: 0, maxLife: 1, isStuck: false,
+    }),
+    CombatDirector.MAX_BLOOD + 64
+  );
+  private casingPool = new ObjectPool<CasingParticle>(
+    () => ({ x: 0, y: 0, vx: 0, vy: 0, rot: 0, vRot: 0, life: 0 }),
+    CombatDirector.MAX_CASINGS + 32
+  );
+  private shockwavePool = new ObjectPool<ShockwaveRing>(
+    () => ({ x: 0, y: 0, radius: 0, maxRadius: 0, life: 0, maxLife: 0, color: '#ffffff', lineWidth: 0 }),
+    CombatDirector.MAX_SHOCKWAVES + 8
+  );
+  private tracerPool = new ObjectPool<BulletTracer>(
+    () => ({ id: 0, x1: 0, y1: 0, x2: 0, y2: 0, life: 0, maxLife: 0, color: '#fef08a', width: 3 }),
+    CombatDirector.MAX_TRACERS + 16
+  );
+  private bladeArcPool = new ObjectPool<BladeSlashArc>(
+    () => ({ id: 0, x: 0, y: 0, angle: 0, radius: 0, arcLength: 0, color: '#f59e0b', life: 0, maxLife: 0 }),
+    CombatDirector.MAX_BLADE_ARCS + 8
+  );
   
   public hitStopFrames: number = 0;
   public slowMoFactor: number = 1.0;
   public slowMoTimer: number = 0;
+  public speedLinesTimer: number = 0; // Cinematic radial speed lines on heavy impacts
 
   public stats: CombatStats = {
     comboCount: 0,
     comboTimer: 0,
     maxCombo: 0,
+    finisherArmed: false,
     totalDamageDealt: 0,
     parryCount: 0,
     takedownCount: 0,
-    styleRating: 'NOIR'
+    styleRating: 'NOIR',
+    score: 0
   };
 
   private popupIdCounter = 0;
@@ -43,10 +99,135 @@ export class CombatDirector {
   private playerAttackRegistered = false;
   private lastPlayerState = '';
 
+  // Awarded once per wave when the last enemy dies; cleared on the next spawn
+  private waveClearAwarded = false;
+
+  // ============================================================
+  // COMBO SYSTEM
+  //   Landed hits inside COMBO_WINDOW extend the chain.
+  //   Damage scales +5% per chained hit (max 2.0x at 20 hits).
+  //   Every FINISHER_EVERY hits arms the chain finisher — the next
+  //   strike plays the heavy finisher animation at 2.5x damage.
+  // ============================================================
+  public static readonly COMBO_WINDOW = 2.8;
+  public static readonly FINISHER_EVERY = 5;
+  /**
+   * M14 hard caps on live FX arrays (blood, sparks, popups, casings, tracers,
+   * shockwaves, blade arcs). Overflow recycles the oldest entry, so a particle
+   * storm can never blow up frame time or the heap. All limits sit well above
+   * anything a real fight produces, so normal play never hits them.
+   */
+  public static readonly MAX_BLOOD = 160;
+  public static readonly MAX_SPARKS = 320;
+  public static readonly MAX_POPUPS = 48;
+  public static readonly MAX_CASINGS = 96;
+  public static readonly MAX_TRACERS = 64;
+  public static readonly MAX_SHOCKWAVES = 32;
+  public static readonly MAX_BLADE_ARCS = 24;
+  /** P3-01: live enemy rounds (drained from EnemyController.pendingShots). */
+  public static readonly MAX_ENEMY_BULLETS = 64;
+
+  // P5-02: FX budgets per quality tier (high == the static defaults above;
+  // pools stay sized for high so a mid-run tier switch never overflows).
+  public quality: 'low' | 'medium' | 'high' = 'high';
+  public get sparkCap(): number {
+    return this.quality === 'high' ? CombatDirector.MAX_SPARKS : this.quality === 'medium' ? 180 : 100;
+  }
+  public get bloodCap(): number {
+    return this.quality === 'high' ? CombatDirector.MAX_BLOOD : this.quality === 'medium' ? 100 : 60;
+  }
+
+  /** Escalating chain damage multiplier for the currently running combo. */
+  public comboDamageMultiplier(): number {
+    return 1 + Math.min(this.stats.comboCount, 20) * 0.05;
+  }
+
+  /** Registers n landed hits inside the timing window. */
+  private addCombo(n: number = 1, timer: number = CombatDirector.COMBO_WINDOW): void {
+    const from = this.stats.comboCount;
+    this.stats.comboCount = from + n;
+    this.stats.comboTimer = timer;
+    this.stats.maxCombo = Math.max(this.stats.maxCombo, this.stats.comboCount);
+    // Arm the chain finisher on every threshold crossed (5x, 10x, 15x...)
+    for (let c = from + 1; c <= this.stats.comboCount; c++) {
+      if (c % CombatDirector.FINISHER_EVERY === 0) this.stats.finisherArmed = true;
+    }
+    this.updateStyleRating();
+  }
+
+  /** Drops the chain: the player got hit or the timing window expired. */
+  private breakCombo(): void {
+    this.stats.comboCount = 0;
+    this.stats.comboTimer = 0;
+    this.stats.finisherArmed = false;
+    this.updateStyleRating();
+  }
+
+  // ============================================================
+  // SCORING FORMULA (single source of truth):
+  //   kill        +100 x (1 + comboCount x 0.1), rounded
+  //   parry       +25
+  //   takedown    +150
+  //   wave clear  +250
+  // ============================================================
+  private scoreForKill(): number {
+    return Math.round(100 * (1 + this.stats.comboCount * 0.1));
+  }
+
   // Grapple sequence state
   public isGrappling: boolean = false;
   public grappleTimer: number = 0;
   public grappledEnemy: EnemyController | null = null;
+  /**
+   * GRAB alone runs the judo slam; holding SHOOT while grabbing runs the
+   * pistol-grip EXECUTION (a chambered round, spent at the temple).
+   */
+  private grappleVariant: 'THROW' | 'EXECUTION' = 'THROW';
+  private grappleShotFired = false;
+
+  // Gun-fu bodies thrown out of a slam that keep bowling through the squad
+  private thrownEnemies: {
+    enemy: EnemyController;
+    hit: Set<EnemyController>;
+    pins: number;
+  }[] = [];
+
+  // FLYING KICK tracks its victims per launch so one flight can mow a line
+  private flyingKickHits = new Set<EnemyController>();
+
+  // Perfect-parry cash-in window: the next landed strike detonates as a RIPOSTE
+  private riposteWindow = 0;
+  private static readonly RIPOSTE_WINDOW = 0.15;
+
+  // Signature-move HUD banner (App re-renders the moment bannerChanged flips)
+  public moveBanner = '';
+  public moveBannerTimer = 0;
+  public bannerChanged = false;
+
+  /** Shows a signature-move name in the HUD for a beat (drives App re-render). */
+  public announceMove(text: string, duration = 1.7): void {
+    this.moveBanner = text;
+    this.moveBannerTimer = duration;
+    this.bannerChanged = true;
+  }
+
+  /**
+   * Clears everything transient — grapple, thrown bodies, riposte window and
+   * HUD banner — so a wave reset can never resume a half-finished sequence.
+   */
+  public resetTransientState(): void {
+    this.isGrappling = false;
+    this.grappledEnemy = null;
+    this.grappleTimer = 0;
+    this.grappleVariant = 'THROW';
+    this.grappleShotFired = false;
+    this.thrownEnemies.length = 0;
+    this.flyingKickHits.clear();
+    this.riposteWindow = 0;
+    this.moveBanner = '';
+    this.moveBannerTimer = 0;
+    this.bannerChanged = true;
+  }
 
   public update(
     dt: number,
@@ -63,33 +244,54 @@ export class CombatDirector {
       }
     }
 
+    // 1b. Speed lines decay
+    if (this.speedLinesTimer > 0) {
+      this.speedLinesTimer = Math.max(0, this.speedLinesTimer - dt);
+    }
+
+    // 1c. Signature-move banner + parry-riposte window decay (both run on the
+    // effective dt, so hit-stop freezes them and slow-mo stretches them)
+    if (this.moveBannerTimer > 0) {
+      this.moveBannerTimer -= dt;
+      if (this.moveBannerTimer <= 0) {
+        this.moveBanner = '';
+        this.bannerChanged = true;
+      }
+    }
+    if (this.riposteWindow > 0) {
+      this.riposteWindow = Math.max(0, this.riposteWindow - dt);
+    }
+
     // 2. Hit-stop frame countdown
     if (this.hitStopFrames > 0) {
       this.hitStopFrames--;
       return; // Skip combat logic during freeze frames
     }
 
-    // 3. Combo timer decay
+    // 3. Combo timer decay (chain dies when the timing window lapses)
     if (this.stats.comboTimer > 0) {
       this.stats.comboTimer -= dt;
       if (this.stats.comboTimer <= 0) {
-        this.stats.comboCount = 0;
-        this.updateStyleRating();
+        this.breakCombo();
       }
     }
 
     // 4. Update visual FX particles
     this.updateParticles(dt);
 
+    // 4b. Gun-fu bodies still skidding down the floor bowl into the squad
+    this.updateThrownEnemies(dt, enemies, camera);
+
     // 5. Handle active Grapple / Takedown
     if (this.isGrappling && this.grappledEnemy) {
-      this.updateGrapple(dt, player, this.grappledEnemy, camera);
+      this.updateGrapple(dt, player, this.grappledEnemy, camera, enemies);
       return;
     }
 
     // 6. Reset attack register on player state change
     if (player.physics.state !== this.lastPlayerState) {
       this.playerAttackRegistered = false;
+      if (this.lastPlayerState === 'ATTACK_FLYING_KICK') this.flyingKickHits.clear();
       this.lastPlayerState = player.physics.state;
     }
 
@@ -103,16 +305,21 @@ export class CombatDirector {
     if (environmentManager) {
       environmentManager.checkProjectilesAgainstEnemies(enemies, (enemy, damage, px, py) => {
         const dir = player.physics.facingRight ? 1 : -1;
-        enemy.takeDamage(damage, dir * 340, -140, false);
+        const rawDamage = Math.max(1, Math.round(damage * this.comboDamageMultiplier()));
+        const knifeDamage = enemy.takeDamage(rawDamage, dir * 340, -140, false);
+        // Phased through on a dodge roll — the knife buries itself in the floor
+        if (knifeDamage <= 0) {
+          this.spawnSparks(px, py, dir, 5, '#94a3b8');
+          return;
+        }
         this.hitStopFrames = 7;
         camera.addTrauma(0.35);
-        SoundFX.playPunch('heavy');
+        SoundFX.playKnifeStab(); // blade bites into flesh
         this.spawnShockwave(px, py, 45, '#fef08a');
         this.spawnSparks(px, py, dir, 14, '#ffffff');
-        this.addPopup(px, py - 25, `KNIFE IMPALE -${damage}!`, '#fef08a', 20);
-        this.stats.comboCount++;
-        this.stats.comboTimer = 3.2;
-        this.updateStyleRating();
+        this.spawnBlood(px, py, dir, 8);
+        this.addPopup(px, py - 25, `KNIFE IMPALE -${knifeDamage}!`, '#fef08a', 20);
+        this.addCombo(1, 3.2);
       });
     }
 
@@ -134,6 +341,7 @@ export class CombatDirector {
       // Check Enemy Defeat Loot Drop (Continental Gold Coins & Weapons)
       if (enemy.health <= 0 && !enemy.hasDroppedLoot && environmentManager) {
         enemy.hasDroppedLoot = true;
+        this.stats.score += this.scoreForKill();
         const coinCount = enemy.type === 'BOSS' ? 6 : enemy.type === 'HEAVY' ? 3 : 1;
         for (let c = 0; c < coinCount; c++) {
           environmentManager.dropCoin(enemy.position.x + (c - (coinCount - 1) / 2) * 16, enemy.position.y - 35, 1);
@@ -141,7 +349,58 @@ export class CombatDirector {
         if (enemy.type === 'BOSS' || (enemy.type === 'HEAVY' && Math.random() > 0.4)) {
           environmentManager.dropWeapon(enemy.type === 'BOSS' ? 'KATANA' : 'KNIFE', enemy.position.x, enemy.position.y - 40);
         }
+
+        // == ELIMINATION CINEMATICS ==
+        const isBigKill = enemy.type === 'HEAVY' || enemy.type === 'ELITE' || enemy.type === 'DEFENDER' || enemy.type === 'BOSS' || enemy.type === 'MARQUIS';
+        this.spawnShockwave(enemy.position.x, enemy.position.y - 50, isBigKill ? 90 : 55, '#f8fafc');
+        this.spawnSparks(enemy.position.x, enemy.position.y - 50, enemy.position.x >= 0 ? -1 : 1, isBigKill ? 16 : 8, '#e2e8f0');
+        this.addPopup(
+          enemy.position.x,
+          enemy.position.y - 110,
+          isBigKill ? 'ELIMINATED' : 'DOWN',
+          isBigKill ? '#f59e0b' : '#94a3b8',
+          isBigKill ? 22 : 14
+        );
+        if (isBigKill) {
+          // Brief dramatic slow-mo on significant kills
+          this.slowMoFactor = 0.35;
+          this.slowMoTimer = 0.32;
+          this.speedLinesTimer = 0.35;
+          camera.addTrauma(0.4);
+        }
+
+        // Continental field medic kits: heavies often carry them, others rarely
+        const medkitChance = enemy.type === 'BOSS' || enemy.type === 'MARQUIS' ? 1.0
+          : enemy.type === 'HEAVY' ? 0.5
+          : enemy.type === 'ELITE' ? 0.3
+          : 0.12;
+        if (Math.random() < medkitChance) {
+          environmentManager.dropHealthPack(enemy.position.x, enemy.position.y - 20, 35);
+        }
       }
+    }
+
+    // 6b. Wave-clear scoring: awarded once per wave when the last enemy dies
+    // P2-03: plain scan instead of `.some(closure)`
+    let anyAlive = false;
+    for (const e of enemies) {
+      if (e.health > 0) {
+        anyAlive = true;
+        break;
+      }
+    }
+    if (anyAlive) {
+      this.waveClearAwarded = false;
+    } else if (!this.waveClearAwarded && enemies.length > 0) {
+      this.waveClearAwarded = true;
+      this.stats.score += 250;
+      this.addPopup(
+        player.physics.position.x,
+        player.physics.position.y - 130,
+        'WAVE CLEAR +250',
+        '#fbbf24',
+        20
+      );
     }
 
     // 7. Check Player Attacks hitting Enemies & Destructibles
@@ -155,6 +414,11 @@ export class CombatDirector {
 
     // 10. Check Player Grab / Takedown trigger
     this.checkPlayerGrab(player, enemies, camera);
+
+    // 11. Enemy ranged fire: drain pending shots, simulate & collide bullets.
+    // Uses the effective dt passed in, so pause / hit-stop / slow-mo
+    // freeze or scale bullets exactly like everything else.
+    this.updateEnemyBullets(dt, player, enemies, camera);
   }
 
   private checkPlayerGunfire(
@@ -162,6 +426,33 @@ export class CombatDirector {
     enemies: EnemyController[],
     camera: Camera
   ) {
+    // Deferred SHOOT trigger: decide between a point-blank PISTOL WHIP and a
+    // real round *before* any ammo is spent (see PlayerController.pendingPistolShot).
+    if (player.pendingPistolShot) {
+      player.pendingPistolShot = false;
+
+      if (this.resolvePistolWhip(player, enemies, camera)) return; // whip, no round burned
+
+      if (player.physics.ammo <= 0) {
+        // Empty chamber click + auto reload (never fires a phantom round)
+        SoundFX.playGunCock();
+        if (!player.physics.isReloading) {
+          player.physics.isReloading = true;
+          player.physics.reloadTimer = 0.95;
+          SoundFX.playReload();
+        }
+        return;
+      }
+
+      // Chambered round: commit the shot exactly as the old inline path did
+      player.physics.ammo--;
+      player.physics.isReloading = false;
+      player.forceState('ATTACK_GUN_SHOT');
+      SoundFX.playGunshot();
+      player.physics.velocity.x = (player.physics.facingRight ? -1 : 1) * 110;
+      player.hasFiredBulletThisShot = true;
+    }
+
     if (!player.hasFiredBulletThisShot) return;
     player.hasFiredBulletThisShot = false;
 
@@ -171,15 +462,16 @@ export class CombatDirector {
     const originY = player.physics.position.y - 62; // Tactical pistol muzzle height
 
     // 1. Eject spent brass casing with realistic tumbling physics
-    this.casings.push({
-      x: originX - dir * 10,
-      y: originY + 2,
-      vx: -dir * (90 + Math.random() * 60),
-      vy: -(120 + Math.random() * 80),
-      rot: Math.random() * Math.PI * 2,
-      vRot: (Math.random() - 0.5) * 24,
-      life: 1.4,
-    });
+    trimOldest(this.casings, this.casings.length + 1 - CombatDirector.MAX_CASINGS, this.casingPool);
+    const casing = this.casingPool.acquire();
+    casing.x = originX - dir * 10;
+    casing.y = originY + 2;
+    casing.vx = -dir * (90 + Math.random() * 60);
+    casing.vy = -(120 + Math.random() * 80);
+    casing.rot = Math.random() * Math.PI * 2;
+    casing.vRot = (Math.random() - 0.5) * 24;
+    casing.life = 1.4;
+    this.casings.push(casing);
 
     // 2. Raycast against active enemies along bullet trajectory
     let closestEnemy: EnemyController | null = null;
@@ -205,22 +497,16 @@ export class CombatDirector {
       const impactY = originY;
 
       // Create glowing supersonic bullet tracer to impact point
-      this.tracers.push({
-        id: ++this.tracerIdCounter,
-        x1: originX,
-        y1: originY,
-        x2: impactX,
-        y2: impactY,
-        life: 0.12,
-        maxLife: 0.12,
-        color: '#fef08a',
-        width: 3.5,
-      });
+      this.pushTracer(originX, originY, impactX, impactY, 0.12, 3.5);
 
       // Close-Quarters Gun-Fu Double Tap execution check (< 95px)
       const isPointBlank = closestDist < 95;
 
-      if (closestEnemy.state === 'BLOCK' && !isPointBlank) {
+      if (closestEnemy.evading) {
+        // Roll phases straight through the round
+        this.spawnSparks(impactX, impactY, -dir, 6, '#94a3b8');
+        this.addPopup(impactX, impactY - 20, 'WHIFF', '#94a3b8', 15);
+      } else if (closestEnemy.state === 'BLOCK' && !isPointBlank) {
         // Guarded by enemy
         closestEnemy.takeDamage(10, dir * 160, -60, false);
         this.hitStopFrames = 4;
@@ -230,7 +516,7 @@ export class CombatDirector {
         this.addPopup(impactX, impactY - 20, 'BLOCKED', '#94a3b8', 14);
       } else if (isPointBlank) {
         // == POINT-BLANK GUN-FU EXECUTION ==
-        const damage = 42;
+        const damage = Math.max(1, Math.round(42 * this.comboDamageMultiplier()));
         closestEnemy.takeDamage(damage, dir * 520, -220, true);
         closestEnemy.state = 'KNOCKBACK';
         this.hitStopFrames = 10;
@@ -240,49 +526,113 @@ export class CombatDirector {
         SoundFX.playPunch('heavy');
         this.spawnShockwave(impactX, impactY, 55, '#f59e0b');
         this.spawnSparks(impactX, impactY, dir, 18, '#fbbf24');
-        this.spawnBlood(impactX, impactY, dir, 12); // Godot blood particle spray
+        this.spawnBlood(impactX, impactY, dir, 14);
         this.addPopup(impactX, impactY - 30, 'GUN-FU CRIT!', '#f59e0b', 22);
 
-        this.stats.comboCount += 2;
-        this.stats.comboTimer = 3.5;
+        this.addCombo(2, 3.5);
         this.stats.takedownCount++;
-        this.updateStyleRating();
+        this.stats.score += 150;
       } else {
         // Standard bullet impact
-        const damage = 28;
-        closestEnemy.takeDamage(damage, dir * 340, -140, false);
+        const rawDamage = Math.max(1, Math.round(28 * this.comboDamageMultiplier()));
+        const damage = closestEnemy.takeDamage(rawDamage, dir * 340, -140, false);
         this.hitStopFrames = 6;
         camera.addTrauma(0.28);
         SoundFX.playPunch('heavy');
         this.spawnShockwave(impactX, impactY, 32, '#fbbf24');
         this.spawnSparks(impactX, impactY, dir, 12, '#fbbf24');
-        this.spawnBlood(impactX, impactY, dir, 6);
+        this.spawnBlood(impactX, impactY, dir, 7);
         this.addPopup(impactX, impactY - 20, `-${damage}`, '#fde047', 17);
 
-        this.stats.comboCount++;
-        this.stats.comboTimer = 3.0;
-        this.updateStyleRating();
+        this.addCombo(1, 3.0);
       }
     } else {
       // No enemy hit: bullet travels to arena boundary wall and creates sparks
       const arenaBound = 840;
       const endX = dir > 0 ? arenaBound : -arenaBound;
-      this.tracers.push({
-        id: ++this.tracerIdCounter,
-        x1: originX,
-        y1: originY,
-        x2: endX,
-        y2: originY,
-        life: 0.10,
-        maxLife: 0.10,
-        color: '#fef08a',
-        width: 3,
-      });
+      this.pushTracer(originX, originY, endX, originY, 0.1, 3);
 
       // Wall ricochet sparks
       this.spawnSparks(endX, originY, -dir, 10, '#fef08a');
       camera.addTrauma(0.12);
     }
+  }
+
+  /**
+   * Close-quarters PISTOL WHIP: when the muzzle would be pressed into a body,
+   * driving the slide into their skull beats burning a round at zero range.
+   * Returns true when the whip resolved (so no ammo is spent).
+   */
+  private resolvePistolWhip(
+    player: PlayerController,
+    enemies: EnemyController[],
+    camera: Camera
+  ): boolean {
+    const f = player.physics.facingRight ? 1 : -1;
+    const px = player.physics.position.x;
+    const py = player.physics.position.y;
+
+    let target: EnemyController | null = null;
+    let best = 999;
+    for (const enemy of enemies) {
+      if (enemy.health <= 0 && enemy.state === 'DOWNED') continue;
+      if (enemy.state === 'GRAPPLED') continue;
+      const ahead = (enemy.position.x - px) * f; // signed distance in front of the muzzle
+      if (ahead < -14 || ahead > 68) continue;
+      if (Math.abs(enemy.position.y - py) > 40) continue;
+      const d = Math.abs(ahead - 24);
+      if (d < best) {
+        best = d;
+        target = enemy;
+      }
+    }
+    if (!target) return false;
+
+    const impactX = target.position.x - f * 12;
+    const impactY = py - 64;
+    // Gun-shot stance: arm driving the muzzle into them. It is deliberately
+    // outside the melee attack list, so the whip cannot chain into a free jab.
+    player.forceState('ATTACK_GUN_SHOT');
+
+    if (target.state === 'BLOCK') {
+      // The whip is a heavy strike — it simply shatters a raised guard
+      target.guardBreak();
+      this.hitStopFrames = 10;
+      camera.addTrauma(0.36);
+      this.speedLinesTimer = 0.25;
+      SoundFX.playPunch('heavy');
+      SoundFX.playGunCock();
+      this.spawnShockwave(impactX, impactY, 48, '#f59e0b');
+      this.spawnSparks(impactX, impactY, f, 14, '#fbbf24');
+      this.addPopup(impactX, impactY - 20, 'PISTOL WHIP!', '#f59e0b', 19);
+      this.addCombo(1, 3.0);
+      this.announceMove('PISTOL WHIP');
+      return true;
+    }
+
+    const damage = Math.max(1, Math.round(26 * this.comboDamageMultiplier()));
+    const landed = target.takeDamage(damage, f * 430, -180, true);
+    if (landed <= 0) {
+      // Rolled straight through the swing
+      this.spawnSparks(impactX, impactY, -f, 6, '#94a3b8');
+      this.addPopup(impactX, impactY - 14, 'WHIFF', '#94a3b8', 15);
+      return true;
+    }
+
+    this.hitStopFrames = 8;
+    this.slowMoFactor = 0.45;
+    this.slowMoTimer = 0.22;
+    camera.addTrauma(0.34);
+    SoundFX.playPunch('heavy');
+    SoundFX.playGunCock();
+    this.spawnShockwave(impactX, impactY, 42, '#fbbf24');
+    this.spawnSparks(impactX, impactY, f, 14, '#fbbf24');
+    this.spawnBlood(impactX, impactY, f, 8);
+    this.addPopup(impactX, impactY - 26, `PISTOL WHIP -${landed}`, '#f59e0b', 19);
+    this.stats.totalDamageDealt += landed;
+    this.addCombo(1, 3.0);
+    this.announceMove('PISTOL WHIP');
+    return true;
   }
 
   private checkPlayerAttacks(
@@ -298,9 +648,16 @@ export class CombatDirector {
       pState === 'ATTACK_LIGHT_2' ||
       pState === 'ATTACK_LIGHT_3' ||
       pState === 'ATTACK_HEAVY' ||
+      pState === 'ATTACK_KICK' ||
+      pState === 'ATTACK_SWEEP' ||
+      pState === 'ATTACK_FLYING_KICK' ||
       player.physics.isSliding;
 
-    if (!isAttacking || this.playerAttackRegistered) return;
+    if (!isAttacking) return;
+    // A FLYING KICK is a line-clearing launch: it may tag each enemy once per
+    // flight instead of spending itself on the first body it touches.
+    const isFlyingKick = pState === 'ATTACK_FLYING_KICK';
+    if (!isFlyingKick && this.playerAttackRegistered) return;
 
     // Active attack strike windows (normalized timing)
     let attackWindowStart = 0.08;
@@ -311,12 +668,17 @@ export class CombatDirector {
     let hitStop = 5;
     let soundType: 'light' | 'heavy' | 'kick' = 'light';
     let isHeavy = false;
+    let reachBonus = 0;
+    // LEG SWEEP strikes the ankles: same low hitbox the slide uses
+    const lowStrike = player.physics.isSliding || pState === 'ATTACK_SWEEP';
 
     if (pState === 'ATTACK_LIGHT_1') {
+      // PUNCH (jab) — fastest, shortest reach
       damage = 14;
       hitStop = 4;
       soundType = 'light';
     } else if (pState === 'ATTACK_LIGHT_2') {
+      // PUNCH (cross)
       damage = 18;
       knockbackX = player.physics.facingRight ? 240 : -240;
       hitStop = 6;
@@ -328,13 +690,48 @@ export class CombatDirector {
       hitStop = 9;
       soundType = 'kick';
       isHeavy = true;
+    } else if (pState === 'ATTACK_KICK') {
+      // KICK button — longest reach, heaviest base damage, knock-down arc
+      damage = 32;
+      knockbackX = player.physics.facingRight ? 470 : -470;
+      knockbackY = -240;
+      hitStop = 10;
+      soundType = 'kick';
+      isHeavy = true;
+      reachBonus = 18;
+      attackWindowStart = 0.10;
+      attackWindowEnd = 0.32;
+    } else if (pState === 'ATTACK_SWEEP') {
+      // LEG SWEEP ender (PUNCH, PUNCH, KICK) — scythes the ankles, always drops
+      damage = 18;
+      knockbackX = player.physics.facingRight ? 340 : -340;
+      knockbackY = -90;
+      hitStop = 7;
+      soundType = 'kick';
+      isHeavy = true;
+      reachBonus = 14;
+      attackWindowStart = 0.10;
+      attackWindowEnd = 0.30;
+    } else if (pState === 'ATTACK_FLYING_KICK') {
+      // XIAO XIAO FLYING KICK — launches out of a sustained full sprint
+      damage = 36;
+      knockbackX = player.physics.facingRight ? 560 : -560;
+      knockbackY = -260;
+      hitStop = 11;
+      soundType = 'kick';
+      isHeavy = true;
+      reachBonus = 24;
+      attackWindowStart = 0.12;
+      attackWindowEnd = 0.42;
     } else if (pState === 'ATTACK_HEAVY') {
+      // Chain finisher animation (armed by the combo system)
       damage = 38;
       knockbackX = player.physics.facingRight ? 450 : -450;
       knockbackY = -220;
       hitStop = 11;
       soundType = 'heavy';
       isHeavy = true;
+      reachBonus = 8;
       attackWindowStart = 0.12;
       attackWindowEnd = 0.32;
     } else if (player.physics.isSliding) {
@@ -359,13 +756,24 @@ export class CombatDirector {
 
     if (pTimer < attackWindowStart || pTimer > attackWindowEnd) return;
 
+    // Chain escalation: every hit landed inside the combo window hits harder.
+    // A perfect parry opens a short RIPOSTE window — cash it in with the very
+    // next landed strike for a 2.5x counter.
+    const chainMultiplier = this.comboDamageMultiplier();
+    const isFinisherHit = this.stats.finisherArmed;
+    const isRiposte = this.riposteWindow > 0;
+    const baseDamage = Math.max(
+      1,
+      Math.round(
+        damage * chainMultiplier * (isFinisherHit ? 2.5 : 1) * (isRiposte ? 2.5 : 1)
+      )
+    );
+
     // Check collision against all alive enemies
     const f = player.physics.facingRight ? 1 : -1;
-    const strikeX = player.physics.position.x + f * (42 + strikeBonus);
-    const strikeY = player.physics.isSliding
-      ? player.physics.position.y - 18
-      : player.physics.position.y - 68;
-    const strikeRadius = (player.physics.isSliding ? 34 : 36) + strikeBonus;
+    const strikeX = player.physics.position.x + f * (42 + strikeBonus + reachBonus);
+    const strikeY = player.physics.position.y - (lowStrike ? 18 : 68);
+    const strikeRadius = (lowStrike ? 34 : 36) + strikeBonus + reachBonus;
 
     // Check hit against destructible environmental objects
     if (environmentManager) {
@@ -373,11 +781,10 @@ export class CombatDirector {
         x: strikeX,
         y: strikeY,
         radius: strikeRadius + 15,
-        damage,
+        damage: baseDamage,
         knockbackX,
         knockbackY,
         hitStopFrames: hitStop,
-        soundType: 'heavy'
       });
       if (shattered) {
         this.playerAttackRegistered = true;
@@ -387,7 +794,9 @@ export class CombatDirector {
     }
 
     for (const enemy of enemies) {
-      if (enemy.state === 'DOWNED' && !player.physics.isSliding) continue;
+      if (enemy.state === 'DOWNED' && !player.physics.isSliding && pState !== 'ATTACK_SWEEP') continue;
+      // One flight, one hit per body — the kick keeps going down the line
+      if (isFlyingKick && this.flyingKickHits.has(enemy)) continue;
 
       const ex = enemy.position.x;
       const ey = enemy.position.y - 50; // Center of enemy mass
@@ -397,7 +806,11 @@ export class CombatDirector {
 
       if (dist < strikeRadius + 30) {
         // HIT CONNECTED!
-        this.playerAttackRegistered = true;
+        if (isFlyingKick) {
+          this.flyingKickHits.add(enemy);
+        } else {
+          this.playerAttackRegistered = true;
+        }
 
         // Ensure knockback is ALWAYS directed away from player
         const dirAway = enemy.position.x >= player.physics.position.x ? 1 : -1;
@@ -405,86 +818,163 @@ export class CombatDirector {
         const impactX = (strikeX + ex) / 2;
         const impactY = (strikeY + ey) / 2;
 
+        // Dodge i-frames: the roll ghosts straight through the swing, and the
+        // swing is spent — no chip, no guard crush, no combo credit.
+        if (enemy.evading) {
+          this.spawnSparks(impactX, impactY, dirAway, 6, '#94a3b8');
+          this.addPopup(impactX, impactY - 12, 'WHIFF', '#94a3b8', 15);
+          break;
+        }
+
+        // == PARRY RIPOSTE CASH-IN: the strike opened by a perfect parry ==
+        if (isRiposte) {
+          this.riposteWindow = 0;
+          this.slowMoFactor = 0.3;
+          this.slowMoTimer = 0.3;
+          this.speedLinesTimer = 0.3;
+          this.announceMove('PARRY RIPOSTE');
+          this.addPopup(impactX, impactY - 46, 'RIPOSTE!', '#38bdf8', 22);
+          this.spawnShockwave(impactX, impactY, 55, '#38bdf8');
+        }
+
+        // Punish window (dodge recovery / heavy recovery) hits harder; the
+        // popup and the health bar are driven by the same resolved number.
+        const landDamage = resolveDamage(enemy, baseDamage);
+
         // Check if enemy is guarding (BLOCK state)
         if (enemy.state === 'BLOCK') {
-          if (pState === 'ATTACK_HEAVY') {
-            // == GUARD CRUSH! Heavy attack shatters defense ==
+          if (pState === 'ATTACK_HEAVY' || pState === 'ATTACK_KICK') {
+            // == GUARD CRUSH! Heavy strike / power kick shatters defense ==
             enemy.guardBreak();
             this.hitStopFrames = 12;
             camera.addTrauma(0.42);
+            this.speedLinesTimer = 0.3;
             SoundFX.playPunch('heavy');
             this.spawnShockwave(impactX, impactY, 55, '#f59e0b');
             this.spawnSparks(impactX, impactY, f, 18, '#fbbf24');
+            this.spawnBlood(impactX, impactY, f, 6);
             this.addPopup(impactX, impactY - 18, 'GUARD CRUSH!', '#fbbf24', 19);
 
-            this.stats.comboCount++;
-            this.stats.comboTimer = 3.0;
-            this.updateStyleRating();
+            this.addCombo(1, 3.0);
             break;
-          } else if (player.physics.isSliding) {
-            // == SLIDE SWEEP! Trips under blocking enemy ==
-            enemy.takeDamage(damage, finalKnockbackX, knockbackY, false);
+          } else if (player.physics.isSliding || pState === 'ATTACK_SWEEP') {
+            // == TRIP! Slide sweep / leg sweep scoops under a blocking enemy ==
+            enemy.takeDamage(baseDamage, finalKnockbackX, knockbackY, pState === 'ATTACK_SWEEP');
             enemy.state = 'KNOCKBACK';
+            enemy.stateTimer = 0;
             this.hitStopFrames = 6;
             camera.addTrauma(0.25);
             SoundFX.playPunch('kick');
             this.spawnShockwave(impactX, impactY, 35, '#38bdf8');
             this.spawnSparks(impactX, impactY, f, 10, '#38bdf8');
-            this.addPopup(impactX, impactY - 15, 'TRIP!', '#38bdf8', 16);
+            this.spawnBlood(impactX, impactY, f, 5);
+            this.addPopup(
+              impactX,
+              impactY - 15,
+              pState === 'ATTACK_SWEEP' ? 'LEG SWEEP!' : 'TRIP!',
+              '#38bdf8',
+              16
+            );
 
-            this.stats.comboCount++;
-            this.stats.comboTimer = 2.8;
-            this.updateStyleRating();
+            this.stats.totalDamageDealt += landDamage;
+            this.addCombo(1, 2.8);
             break;
           } else {
             // == BLOCKED! Light attacks absorbed with reduced damage ==
-            const chipDamage = Math.max(2, Math.round(damage * 0.2));
+            const chipDamage = Math.max(2, Math.round(landDamage * 0.2));
             enemy.health = Math.max(0, enemy.health - chipDamage);
+            // Lethal chip damage must still kill cleanly: ragdoll + DOWNED so
+            // defeat cinematics, loot and wave-clear detection see a real death
+            if (enemy.health <= 0 && !enemy.ragdoll) {
+              // P3-02: recycled shell — released when GameLoop drops the corpse
+              enemy.ragdoll = ragdollPool.acquire();
+              enemy.ragdoll.reset(enemy.pose, 140, -120);
+              enemy.state = 'DOWNED';
+              enemy.stateTimer = 0;
+            }
             enemy.hpVisibleTimer = 3.2;
             enemy.lastHitTime = performance.now();
+            // A clean parry can be cashed in as a riposte (archetype-driven odds)
+            enemy.counterQueued = Math.random() < enemy.counterChance;
             enemy.velocity.x = finalKnockbackX * 0.2;
             player.physics.velocity.x = -f * 90; // Minor recoil on player
             this.hitStopFrames = 4;
             camera.addTrauma(0.12);
             SoundFX.playPunch('light');
             this.spawnSparks(impactX, impactY, f, 7, '#94a3b8');
+            this.spawnBlood(impactX, impactY, f, 3);
             this.addPopup(impactX, impactY - 15, 'BLOCKED', '#94a3b8', 14);
             break;
           }
         }
 
-        // Standard clean unblocked hit
-        this.hitStopFrames = hitStop;
-        enemy.takeDamage(damage, finalKnockbackX, knockbackY, isHeavy);
+        // == FINISHER CONSUMPTION (chain crossed 5x / 10x / 15x...) ==
+        if (isFinisherHit) {
+          this.stats.finisherArmed = false;
+          this.slowMoFactor = 0.35;
+          this.slowMoTimer = 0.4;
+          this.speedLinesTimer = 0.4;
+          SoundFX.playPunch('slam');
+          this.spawnShockwave(impactX, impactY, 90, '#f59e0b');
+        }
+
+        // Standard clean unblocked hit (chain-escalated damage)
+        this.hitStopFrames = isFinisherHit ? Math.max(hitStop, 14) : hitStop;
+        enemy.takeDamage(baseDamage, finalKnockbackX, knockbackY, isHeavy || isFinisherHit);
+
+        // LEG SWEEP always converts the knockdown, super armor and all
+        if (pState === 'ATTACK_SWEEP') {
+          enemy.state = 'KNOCKBACK';
+          enemy.stateTimer = 0;
+          enemy.velocity.x = finalKnockbackX * 0.8;
+          enemy.velocity.y = -150;
+          enemy.grounded = false;
+        }
 
         // Sound FX
-        SoundFX.playPunch(soundType);
+        if (!isFinisherHit) {
+          SoundFX.playPunch(soundType);
+        }
 
         // Camera Shake Trauma
-        camera.addTrauma(isHeavy ? 0.42 : 0.22);
+        camera.addTrauma(isFinisherHit ? 0.6 : isHeavy ? 0.42 : 0.22);
+        if (isHeavy || isFinisherHit) {
+          this.speedLinesTimer = Math.max(this.speedLinesTimer, 0.28);
+        }
 
-        // Combo & Scoring
-        this.stats.comboCount++;
-        this.stats.comboTimer = 2.8;
-        this.stats.totalDamageDealt += damage;
-        this.stats.maxCombo = Math.max(this.stats.maxCombo, this.stats.comboCount);
-        this.updateStyleRating();
+        // Combo chain & scoring (arms the next finisher at 5x / 10x / 15x)
+        this.stats.totalDamageDealt += landDamage;
+        this.addCombo(1, CombatDirector.COMBO_WINDOW);
 
-        // Particles & Popups
+        // Particles & Popups — blood sprays from the impact point on every landed hit
         this.spawnSparks(impactX, impactY, f, isHeavy ? 14 : 8, isHeavy ? '#f59e0b' : '#ef4444');
-        this.spawnShockwave(impactX, impactY, isHeavy ? 45 : 30, isHeavy ? '#f59e0b' : '#ffffff');
-        this.spawnBlood(ex, ey, dirAway, isHeavy ? 9 : 5);
+        if (!isFinisherHit) {
+          this.spawnShockwave(impactX, impactY, isHeavy ? 45 : 30, isHeavy ? '#f59e0b' : '#ffffff');
+        }
+        this.spawnBlood(ex, ey, dirAway, isFinisherHit ? 20 : isHeavy ? 11 : 6);
+        if (isFinisherHit) {
+          this.spawnBlood(impactX, impactY, dirAway, 10);
+          this.spawnBlood(ex, ey - 30, dirAway, 6);
+        }
         if (player.physics.equippedWeapon === 'KATANA') {
           this.spawnBladeArc(player.physics.position.x + f * 25, player.physics.position.y - 50, f > 0 ? 0.3 : Math.PI - 0.3, 62, '#f59e0b');
         }
 
-        this.addPopup(
-          impactX,
-          impactY - 10,
-          isHeavy ? `CRIT ${damage}` : `${damage}`,
-          isHeavy ? '#fbbf24' : '#f87171',
-          isHeavy ? 20 : 15
-        );
+        if (isFinisherHit) {
+          this.addPopup(impactX, impactY - 46, `FINISHER! -${landDamage}`, '#fbbf24', 26);
+        } else if (isFlyingKick) {
+          this.addPopup(impactX, impactY - 34, `FLYING KICK -${landDamage}`, '#38bdf8', 21);
+        } else if (pState === 'ATTACK_SWEEP') {
+          this.addPopup(impactX, impactY - 24, `LEG SWEEP -${landDamage}`, '#38bdf8', 19);
+        } else {
+          this.addPopup(
+            impactX,
+            impactY - 10,
+            isHeavy ? `CRIT ${landDamage}` : `${landDamage}`,
+            isHeavy ? '#fbbf24' : '#f87171',
+            isHeavy ? 20 : 15
+          );
+        }
 
         break;
       }
@@ -497,6 +987,8 @@ export class CombatDirector {
     camera: Camera
   ) {
     if (player.physics.isDodging) return; // Invincible during dodge roll!
+    // Combo special / super i-frames (set by PlayerController.triggerSpecial)
+    if (player.specialInvulnTimer > 0) return;
 
     const px = player.physics.position.x;
     const py = player.physics.position.y - 50; // Player torso
@@ -532,9 +1024,13 @@ export class CombatDirector {
             enemy.stateTimer = 0;
 
             this.stats.parryCount++;
+            this.stats.score += 25;
             this.addPopup(hb.x, hb.y - 15, 'PERFECT PARRY!', '#38bdf8', 19);
             this.spawnShockwave(hb.x, hb.y, 50, '#38bdf8');
             this.spawnSparks(hb.x, hb.y, 1, 16, '#38bdf8');
+            // Opens the RIPOSTE window: the next landed strike hits at 2.5x
+            this.riposteWindow = CombatDirector.RIPOSTE_WINDOW;
+            this.announceMove('RIPOSTE READY');
             return;
           } else {
             // Standard Block Guard
@@ -553,11 +1049,11 @@ export class CombatDirector {
         SoundFX.playPunch('heavy');
         camera.addTrauma(0.35);
         this.hitStopFrames = hb.hitStopFrames;
-        this.stats.comboCount = 0; // Combo interrupted
-        this.updateStyleRating();
+        this.breakCombo(); // Chain interrupted
 
         this.addPopup(px, py - 20, `-${hb.damage}`, '#ef4444', 18);
         this.spawnSparks(hb.x, hb.y, Math.sign(hb.knockbackX), 10, '#ef4444');
+        this.spawnBlood(hb.x, hb.y, Math.sign(hb.knockbackX) || -1, 6);
       }
     }
   }
@@ -583,10 +1079,126 @@ export class CombatDirector {
         this.isGrappling = true;
         this.grappleTimer = 0;
         this.grappledEnemy = enemy;
+        // Variant select: GRAB alone is the judo slam; hold SHOOT while
+        // grabbing (with a live round) and the pistol goes to the temple.
+        this.grappleVariant =
+          player.input.shoot && player.physics.ammo > 0 && !player.physics.isReloading
+            ? 'EXECUTION'
+            : 'THROW';
+        this.grappleShotFired = false;
+        // A SHOOT press consumed by this grab must not fire a second round
+        player.pendingPistolShot = false;
         enemy.state = 'GRAPPLED';
+        enemy.stateTimer = 0;
+        enemy.velocity.x = 0;
+        enemy.velocity.y = 0;
         SoundFX.playWhoosh(1.2);
         camera.addTrauma(0.15);
         break;
+      }
+    }
+  }
+
+  /**
+   * Enemy-bullet simulation + collision (GUNNER rounds).
+   * Runs on the effective dt, so pause / hit-stop / slow-mo behave correctly.
+   * Dodge i-frames = complete miss; blocking = chip damage + block spark;
+   * otherwise the player takes the hit with knockback along the bullet path.
+   */
+  private updateEnemyBullets(
+    dt: number,
+    player: PlayerController,
+    enemies: EnemyController[],
+    camera: Camera
+  ) {
+    // Drain per-enemy pending ranged shots into the shared bullet pool
+    for (const e of enemies) {
+      if (e.pendingShots.length === 0) continue;
+      for (const b of e.pendingShots) {
+        this.enemyBullets.push(b);
+        // P3-01: cap the live set — oldest round recycles back to the pool
+        trimOldest(
+          this.enemyBullets,
+          this.enemyBullets.length - CombatDirector.MAX_ENEMY_BULLETS,
+          enemyBulletPool
+        );
+        // Muzzle flash tracer along the shot's line of travel
+        const sp = Math.hypot(b.vx, b.vy) || 1;
+        this.pushTracer(
+          b.x,
+          b.y,
+          b.x + (b.vx / sp) * 26,
+          b.y + (b.vy / sp) * 26,
+          0.09,
+          3
+        );
+        SoundFX.playGunshot();
+      }
+      e.pendingShots.length = 0;
+    }
+
+    const px = player.physics.position.x;
+    const py = player.physics.position.y - 60; // player torso
+    const isDodging = player.physics.isDodging;
+    const isBlocking = player.physics.isBlocking;
+    const playerDead = player.physics.health <= 0;
+    const hitRadiusSq = 26 * 26;
+
+    for (let i = this.enemyBullets.length - 1; i >= 0; i--) {
+      const b = this.enemyBullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.life -= dt;
+
+      // Cull spent or out-of-arena rounds
+      if (b.life <= 0 || Math.abs(b.x) > 900) {
+        this.enemyBullets.splice(i, 1);
+        enemyBulletPool.release(b);
+        continue;
+      }
+
+      if (playerDead) continue;
+
+      const dx = b.x - px;
+      const dy = b.y - py;
+      if (dx * dx + dy * dy < hitRadiusSq) {
+        this.enemyBullets.splice(i, 1);
+        if (isDodging) {
+          enemyBulletPool.release(b); // i-frames: complete miss
+          continue;
+        }
+
+        const dir = Math.sign(b.vx) || 1;
+
+        if (isBlocking && !b.pierceBlock) {
+          // Blocked round: chip damage + block spark (uses the same
+          // blocking flag the melee path in checkEnemyAttacks uses)
+          const chip = Math.max(2, Math.round(b.damage * 0.25));
+          player.physics.health = Math.max(0, player.physics.health - chip);
+          player.physics.stamina = Math.max(0, player.physics.stamina - 10);
+          player.physics.velocity.x = dir * 120;
+          camera.addTrauma(0.12);
+          SoundFX.playPunch('light');
+          this.addPopup(px, py - 20, `BLOCKED -${chip}`, '#94a3b8', 13);
+          this.spawnSparks(b.x, b.y, -dir, 7, '#94a3b8');
+        } else {
+          if (isBlocking && b.pierceBlock) {
+            // Guard-piercing round: the guard is simply walked through
+            this.addPopup(px, py - 34, 'PIERCED!', '#f87171', 17);
+          }
+          // Clean hit: knockback follows the bullet's line of travel
+          const sp = Math.hypot(b.vx, b.vy) || 1;
+          player.takeDamage(b.damage, (b.vx / sp) * 300, (b.vy / sp) * 120 - 60);
+          SoundFX.playPunch('heavy');
+          camera.addTrauma(0.3);
+          this.hitStopFrames = 5;
+          this.breakCombo(); // Chain interrupted
+          this.addPopup(px, py - 20, `-${b.damage}`, '#ef4444', 18);
+          this.spawnSparks(b.x, b.y, dir, 10, '#ef4444');
+          this.spawnBlood(b.x, b.y, dir, 5);
+        }
+        // P3-01: recycled only after every read of the shell is done
+        enemyBulletPool.release(b);
       }
     }
   }
@@ -595,7 +1207,8 @@ export class CombatDirector {
     dt: number,
     player: PlayerController,
     enemy: EnemyController,
-    camera: Camera
+    camera: Camera,
+    enemies: EnemyController[]
   ) {
     this.grappleTimer += dt;
     const f = player.physics.facingRight ? 1 : -1;
@@ -605,10 +1218,17 @@ export class CombatDirector {
     player.physics.velocity.x = 0;
     player.physics.velocity.y = 0;
 
+    if (this.grappleVariant === 'EXECUTION') {
+      this.updateExecutionGrapple(player, enemy, camera, f, px, py);
+      return;
+    }
+
     // 0.0s to 0.25s: Lock onto enemy collar and pull them in
     if (this.grappleTimer < 0.25) {
       enemy.position.x = px + f * 25;
       enemy.position.y = py;
+      enemy.velocity.x = 0;
+      enemy.velocity.y = 0;
     }
     // 0.25s to 0.45s: Pivot and hoist enemy overhead in judo shoulder throw
     else if (this.grappleTimer < 0.45) {
@@ -617,8 +1237,10 @@ export class CombatDirector {
       const throwRadius = 38;
       enemy.position.x = px + f * Math.cos(angle) * throwRadius;
       enemy.position.y = py - 40 - Math.sin(angle) * 35;
+      enemy.velocity.x = 0;
+      enemy.velocity.y = 0;
     }
-    // 0.45s: SLAM onto the floor!
+    // 0.45s: SLAM onto the floor, then the body keeps going — bowling!
     else if (this.grappleTimer < 0.7) {
       if (this.grappleTimer - dt < 0.45) {
         // SLAM IMPACT FRAME!
@@ -627,21 +1249,42 @@ export class CombatDirector {
         SoundFX.playPunch('slam');
         camera.addTrauma(0.55);
         this.hitStopFrames = 12;
+        this.speedLinesTimer = 0.32;
 
-        const damage = 42;
+        const damage = Math.max(1, Math.round(42 * this.comboDamageMultiplier()));
         enemy.takeDamage(damage, -f * 120, 0, true);
-        enemy.state = 'DOWNED';
+        enemy.state = 'KNOCKBACK';
         enemy.stateTimer = 0;
 
         this.stats.takedownCount++;
-        this.stats.comboCount += 2;
-        this.stats.comboTimer = 3.2;
+        this.stats.score += 150;
         this.stats.totalDamageDealt += damage;
-        this.updateStyleRating();
+        this.addCombo(2, 3.2);
 
         this.spawnShockwave(enemy.position.x, py - 5, 55, '#f59e0b');
         this.spawnSparks(enemy.position.x, py - 8, -f, 18, '#fbbf24');
-        this.addPopup(enemy.position.x, py - 35, 'TAKEDOWN 42', '#f59e0b', 20);
+        this.spawnBlood(enemy.position.x, py - 20, -f, 16);
+        this.spawnBlood(enemy.position.x, 0, -f, 6);
+        this.addPopup(enemy.position.x, py - 35, `TAKEDOWN ${damage}`, '#f59e0b', 20);
+        this.announceMove('JUDO SLAM');
+
+        // == GUN-FU RELEASE: the slammed body becomes the projectile ==
+        // Aim it at whoever is left standing so the throw bowls through the
+        // squad; with no one behind, it skids into the arena wall instead.
+        let throwDir = -f;
+        let nearestGap = Infinity;
+        for (const other of enemies) {
+          if (other === enemy || other.health <= 0) continue;
+          const gap = other.position.x - enemy.position.x;
+          if (Math.abs(gap) < 520 && Math.abs(gap) < nearestGap) {
+            nearestGap = Math.abs(gap);
+            throwDir = Math.sign(gap) || throwDir;
+          }
+        }
+        enemy.velocity.x = throwDir * 900;
+        enemy.velocity.y = -300;
+        enemy.grounded = false;
+        this.thrownEnemies.push({ enemy, hit: new Set<EnemyController>(), pins: 0 });
 
         if (player.physics.perks['VAMPIRIC_TAKEDOWN']) {
           player.physics.health = Math.min(player.physics.maxHealth, player.physics.health + 25);
@@ -649,11 +1292,158 @@ export class CombatDirector {
         }
       }
     }
-    // 0.7s: Takedown complete, resume free control
+    // 0.7s: Takedown complete, resume free control (the body flies on its own)
     else {
-      this.isGrappling = false;
-      this.grappledEnemy = null;
-      this.grappleTimer = 0;
+      this.endGrapple();
+    }
+  }
+
+  /**
+   * PISTOL-GRIP EXECUTION variant of the grab: haul them in, put the muzzle
+   * to the temple at 0.28s, spend one round, and let the body drop away.
+   */
+  private updateExecutionGrapple(
+    player: PlayerController,
+    enemy: EnemyController,
+    camera: Camera,
+    f: number,
+    px: number,
+    py: number
+  ) {
+    // 0.0s - 0.28s: pinned in the collar grip while the pistol comes up
+    if (this.grappleTimer < 0.28) {
+      enemy.position.x = px + f * 26;
+      enemy.position.y = py;
+      enemy.velocity.x = 0;
+      enemy.velocity.y = 0;
+      enemy.state = 'GRAPPLED';
+      player.forceState('ATTACK_LIGHT_2'); // arm extended into their collar
+      return;
+    }
+
+    // 0.28s: HEADSHOT — one round, temple, done
+    if (!this.grappleShotFired) {
+      this.grappleShotFired = true;
+      player.forceState('ATTACK_GUN_SHOT');
+      player.physics.ammo = Math.max(0, player.physics.ammo - 1);
+      player.physics.isReloading = false;
+      SoundFX.playGunshot();
+      SoundFX.playGunCock();
+
+      const headX = enemy.position.x + f * 6;
+      const headY = py - 76;
+      this.pushTracer(px + f * 34, py - 62, headX, headY, 0.13, 3.5);
+
+      const damage = Math.max(1, Math.round(100 * this.comboDamageMultiplier()));
+      const landed = enemy.takeDamage(damage, f * 520, -300, true);
+
+      if (landed > 0) {
+        this.hitStopFrames = 12;
+        this.slowMoFactor = 0.3;
+        this.slowMoTimer = 0.35;
+        this.speedLinesTimer = 0.4;
+        camera.addTrauma(0.6);
+        this.spawnBlood(headX, headY, f, 22);
+        this.spawnBlood(headX, headY - 8, -f, 8);
+        this.spawnShockwave(headX, headY, 65, '#f87171');
+        this.spawnSparks(headX, headY, f, 16, '#fbbf24');
+        this.addPopup(headX, headY - 26, `EXECUTION -${damage}`, '#ef4444', 22);
+        this.stats.totalDamageDealt += damage;
+        this.stats.takedownCount++;
+        this.stats.score += 150;
+        this.addCombo(2, 3.5);
+        this.announceMove('GRIP EXECUTION');
+      } else {
+        // Rolled through the muzzle — release them instead of leaving a
+        // GRAPPLED husk behind when the grapple ends
+        enemy.state = 'KNOCKBACK';
+        enemy.stateTimer = 0;
+        enemy.velocity.x = f * 320;
+        enemy.velocity.y = -140;
+        enemy.grounded = false;
+        this.spawnSparks(headX, headY, -f, 6, '#94a3b8');
+        this.addPopup(headX, headY - 14, 'WHIFF', '#94a3b8', 15);
+      }
+
+      // Lethal: land them face-down so loot, cinematics and wave-clear see it
+      if (enemy.health <= 0) {
+        enemy.state = 'DOWNED';
+        enemy.stateTimer = 0;
+      }
+      return;
+    }
+
+    // 0.28s - 0.75s: the body is already flying; hold the player's pose,
+    // then hand control back.
+    if (this.grappleTimer > 0.75) {
+      this.endGrapple();
+    }
+  }
+
+  /** Releases the grapple and rewinds every per-grab bit of state. */
+  private endGrapple(): void {
+    this.isGrappling = false;
+    this.grappledEnemy = null;
+    this.grappleTimer = 0;
+    this.grappleVariant = 'THROW';
+    this.grappleShotFired = false;
+  }
+
+  /**
+   * Bodies launched out of a slam keep bowling: each one plows into any live
+   * enemy it touches (pin damage + knockdown) until it skids to a stop or
+   * the floor catches it. Motion itself stays with EnemyController's own
+   * KNOCKBACK physics — this only resolves the pins.
+   */
+  private updateThrownEnemies(dt: number, enemies: EnemyController[], camera: Camera) {
+    if (this.thrownEnemies.length === 0) return;
+
+    for (let i = this.thrownEnemies.length - 1; i >= 0; i--) {
+      const thrown = this.thrownEnemies[i];
+      const body = thrown.enemy;
+
+      // Flight ends when the body lands out of knockback or is already down
+      if (body.state !== 'KNOCKBACK' || body.health <= 0) {
+        this.thrownEnemies.splice(i, 1);
+        continue;
+      }
+
+      const speed = Math.abs(body.velocity.x);
+      if (speed < 240) {
+        // Rolled most of its energy out — no more pins from a crawling body
+        this.thrownEnemies.splice(i, 1);
+        continue;
+      }
+
+      for (const other of enemies) {
+        if (other === body || other.health <= 0 || other.state === 'DOWNED') continue;
+        if (thrown.hit.has(other) || other.evading) continue;
+        if (thrown.pins >= 3) break;
+
+        const dx = other.position.x - body.position.x;
+        const dy = other.position.y - body.position.y;
+        if (Math.abs(dx) > 54 || Math.abs(dy) > 74) continue;
+
+        thrown.hit.add(other);
+        thrown.pins++;
+
+        const dir = Math.sign(body.velocity.x) || 1;
+        const pinDamage = Math.max(1, Math.round(18 * this.comboDamageMultiplier()));
+        const landed = other.takeDamage(pinDamage, dir * 470, -190, true);
+        if (landed <= 0) continue;
+
+        body.velocity.x *= 0.72; // energy transferred into the pin
+        this.hitStopFrames = Math.max(this.hitStopFrames, 5);
+        camera.addTrauma(0.3);
+        SoundFX.playPunch('heavy');
+        this.spawnShockwave(other.position.x, other.position.y - 50, 45, '#fbbf24');
+        this.spawnSparks(other.position.x, other.position.y - 50, dir, 14, '#fbbf24');
+        this.spawnBlood(other.position.x, other.position.y - 56, dir, 8);
+        this.addPopup(other.position.x, other.position.y - 96, `BOWLING -${pinDamage}`, '#f59e0b', 18);
+        this.stats.totalDamageDealt += landed;
+        this.addCombo(1, 3.2);
+        this.announceMove('GUN-FU BOWL');
+      }
     }
   }
 
@@ -667,79 +1457,135 @@ export class CombatDirector {
   }
 
   public addPopup(x: number, y: number, text: string, color: string, size = 16) {
-    this.popups.push({
-      id: ++this.popupIdCounter,
-      x,
-      y,
-      text,
-      color,
-      size,
-      life: 0.8,
-      maxLife: 0.8,
-      vy: -55
-    });
+    trimOldest(
+      this.popups,
+      this.popups.length + 1 - CombatDirector.MAX_POPUPS,
+      this.popupPool
+    );
+    const p = this.popupPool.acquire();
+    p.id = ++this.popupIdCounter;
+    p.x = x;
+    p.y = y;
+    p.text = text;
+    p.color = color;
+    p.size = size;
+    p.life = 0.8;
+    p.maxLife = 0.8;
+    p.vy = -55;
+    this.popups.push(p);
   }
 
   public spawnSparks(x: number, y: number, dir: number, count: number, color: string) {
+    trimOldest(
+      this.sparks,
+      this.sparks.length + count - this.sparkCap,
+      this.sparkPool
+    );
     for (let i = 0; i < count; i++) {
       const angle = (Math.random() - 0.5) * 1.6 + (dir > 0 ? 0 : Math.PI);
       const speed = 120 + Math.random() * 220;
-      this.sparks.push({
-        x,
-        y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed - 60,
-        life: 0.35 + Math.random() * 0.25,
-        maxLife: 0.6,
-        color,
-        size: 2 + Math.random() * 2.5
-      });
+      const s = this.sparkPool.acquire();
+      s.x = x;
+      s.y = y;
+      s.vx = Math.cos(angle) * speed;
+      s.vy = Math.sin(angle) * speed - 60;
+      s.life = 0.35 + Math.random() * 0.25;
+      s.maxLife = 0.6;
+      s.color = color;
+      s.size = 2 + Math.random() * 2.5;
+      this.sparks.push(s);
     }
   }
 
   public spawnShockwave(x: number, y: number, maxRadius: number, color: string) {
-    this.shockwaves.push({
-      x,
-      y,
-      radius: 6,
-      maxRadius,
-      life: 0.28,
-      maxLife: 0.28,
-      color,
-      lineWidth: 3
-    });
+    trimOldest(
+      this.shockwaves,
+      this.shockwaves.length + 1 - CombatDirector.MAX_SHOCKWAVES,
+      this.shockwavePool
+    );
+    const sw = this.shockwavePool.acquire();
+    sw.x = x;
+    sw.y = y;
+    sw.radius = 6;
+    sw.maxRadius = maxRadius;
+    sw.life = 0.28;
+    sw.maxLife = 0.28;
+    sw.color = color;
+    sw.lineWidth = 3;
+    this.shockwaves.push(sw);
   }
 
+  /** Pooled tracer push — ids stay monotonic so muzzle blooms stay correct. */
+  private pushTracer(
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    life: number,
+    width: number
+  ) {
+    trimOldest(this.tracers, this.tracers.length + 1 - CombatDirector.MAX_TRACERS, this.tracerPool);
+    const tr = this.tracerPool.acquire();
+    tr.id = ++this.tracerIdCounter;
+    tr.x1 = x1;
+    tr.y1 = y1;
+    tr.x2 = x2;
+    tr.y2 = y2;
+    tr.life = life;
+    tr.maxLife = life;
+    tr.color = '#fef08a';
+    tr.width = width;
+    this.tracers.push(tr);
+  }
+
+  /**
+   * Blood spray from an impact point: red particles fly out with gravity, then
+   * stick to the floor as short-lived splats that fade away.
+   * Hard-capped at MAX_BLOOD so mobile frames stay smooth — when the pool is
+   * full the oldest (already-fading) particles are recycled first.
+   */
   public spawnBlood(x: number, y: number, dir: number, count: number = 8) {
+    // Recycle oldest first when the pool is full (shells go back to the pool)
+    trimOldest(
+      this.bloodDecals,
+      this.bloodDecals.length + count - this.bloodCap,
+      this.bloodPool
+    );
+
     for (let i = 0; i < count; i++) {
       const angle = (dir > 0 ? 0 : Math.PI) + (Math.random() - 0.5) * 1.4;
       const speed = 100 + Math.random() * 240;
-      this.bloodDecals.push({
-        x: x + (Math.random() - 0.5) * 6,
-        y: y + (Math.random() - 0.5) * 10,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed - (50 + Math.random() * 70),
-        radius: 2.2 + Math.random() * 3.2,
-        alpha: 0.95,
-        life: 0,
-        maxLife: 6.5,
-        isStuck: false,
-      });
+      const b = this.bloodPool.acquire();
+      b.x = x + (Math.random() - 0.5) * 6;
+      b.y = y + (Math.random() - 0.5) * 10;
+      b.vx = Math.cos(angle) * speed;
+      b.vy = Math.sin(angle) * speed - (50 + Math.random() * 70);
+      b.radius = 2.2 + Math.random() * 3.2;
+      b.alpha = 0.95;
+      b.life = 0;
+      b.maxLife = 6.5;
+      b.isStuck = false;
+      this.bloodDecals.push(b);
     }
   }
 
   public spawnBladeArc(x: number, y: number, angle: number, radius = 55, color = '#f59e0b') {
-    this.bladeArcs.push({
-      id: Math.random(),
-      x,
-      y,
-      angle,
-      radius,
-      arcLength: Math.PI * 0.75,
-      color,
-      life: 0,
-      maxLife: 0.16,
-    });
+    trimOldest(
+      this.bladeArcs,
+      this.bladeArcs.length + 1 - CombatDirector.MAX_BLADE_ARCS,
+      this.bladeArcPool
+    );
+    const arc = this.bladeArcPool.acquire();
+    arc.id = Math.random();
+    arc.x = x;
+    arc.y = y;
+    arc.angle = angle;
+    arc.radius = radius;
+    arc.arcLength = Math.PI * 0.75;
+    arc.color = color;
+    arc.life = 0;
+    arc.maxLife = 0.16;
+    this.bladeArcs.push(arc);
   }
 
   private updateParticles(dt: number) {
@@ -749,7 +1595,10 @@ export class CombatDirector {
       p.life -= dt;
       p.y += p.vy * dt;
       p.vy *= 0.94;
-      if (p.life <= 0) this.popups.splice(i, 1);
+      if (p.life <= 0) {
+        this.popups.splice(i, 1);
+        this.popupPool.release(p);
+      }
     }
 
     // Sparks
@@ -760,7 +1609,10 @@ export class CombatDirector {
       s.y += s.vy * dt;
       s.vy += 650 * dt; // Gravity
       s.vx *= 0.96;
-      if (s.life <= 0) this.sparks.splice(i, 1);
+      if (s.life <= 0) {
+        this.sparks.splice(i, 1);
+        this.sparkPool.release(s);
+      }
     }
 
     // Shockwaves
@@ -769,21 +1621,30 @@ export class CombatDirector {
       sw.life -= dt;
       const progress = 1 - sw.life / sw.maxLife;
       sw.radius = 6 + progress * (sw.maxRadius - 6);
-      if (sw.life <= 0) this.shockwaves.splice(i, 1);
+      if (sw.life <= 0) {
+        this.shockwaves.splice(i, 1);
+        this.shockwavePool.release(sw);
+      }
     }
 
     // Bullet Tracers
     for (let i = this.tracers.length - 1; i >= 0; i--) {
       const tr = this.tracers[i];
       tr.life -= dt;
-      if (tr.life <= 0) this.tracers.splice(i, 1);
+      if (tr.life <= 0) {
+        this.tracers.splice(i, 1);
+        this.tracerPool.release(tr);
+      }
     }
 
     // Blade Slash Arc Meshes
     for (let i = this.bladeArcs.length - 1; i >= 0; i--) {
       const arc = this.bladeArcs[i];
       arc.life += dt;
-      if (arc.life >= arc.maxLife) this.bladeArcs.splice(i, 1);
+      if (arc.life >= arc.maxLife) {
+        this.bladeArcs.splice(i, 1);
+        this.bladeArcPool.release(arc);
+      }
     }
 
     // Blood Decals (Godot CPUParticles2D splat physics)
@@ -809,6 +1670,7 @@ export class CombatDirector {
       }
       if (b.life >= b.maxLife) {
         this.bloodDecals.splice(i, 1);
+        this.bloodPool.release(b);
       }
     }
 
@@ -829,7 +1691,10 @@ export class CombatDirector {
         c.vRot *= 0.6;
       }
 
-      if (c.life <= 0) this.casings.splice(i, 1);
+      if (c.life <= 0) {
+        this.casings.splice(i, 1);
+        this.casingPool.release(c);
+      }
     }
   }
 }
