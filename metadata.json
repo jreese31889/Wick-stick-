@@ -1,0 +1,6 @@
+{
+  "name": "WICK STICK",
+  "description": "A stylish stick-figure martial-arts action game featuring fluid combat, branching combos, cinematic takedowns, smooth physics, and procedural endless levels.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
