@@ -1387,8 +1387,9 @@ export class Renderer {
     const accent = env.config.accentColor;
 
     // P1-03: the door (frame, spill beam and exit sign) is static per room —
-    // skip the whole pass when it is outside the padded view.
-    if (!this.inView(x, y - h * 0.5)) return;
+    // skip the whole pass when it is outside the padded view. Pad covers the
+    // frame overhang and the open-door light spill (±90 px).
+    if (!this.inView(x, y - h * 0.5, Math.max(w, h) * 0.5 + 32)) return;
 
     ctx.save();
 
@@ -1470,7 +1471,8 @@ export class Renderer {
     for (const obj of env.destructibles) {
       if (obj.isBroken) continue;
       // P1-03: static furniture — skip anything outside the padded view
-      if (!this.inView(obj.x, obj.y - obj.height * 0.5, obj.width * 0.5)) continue;
+      // (pad covers half the larger side + the champagne-bucket overhang)
+      if (!this.inView(obj.x, obj.y - obj.height * 0.5, Math.max(obj.width, obj.height) * 0.5 + 32)) continue;
 
       const left = obj.x - obj.width / 2;
       const top = obj.y - obj.height;
