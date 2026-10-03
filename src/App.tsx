@@ -40,8 +40,10 @@ import { MainMenu } from './components/MainMenu';
 import { PauseMenu } from './components/PauseMenu';
 import { OptionsModal } from './components/OptionsModal';
 import { TouchLayoutEditor } from './components/TouchLayoutEditor';
-import { StageSelectModal, STAGES, getNextStage } from './components/StageSelectModal';
+import { StageSelectModal, STAGES, getNextStage, TRAINING_STAGE } from './components/StageSelectModal';
 import type { StageDef } from './components/StageSelectModal';
+import { TrainingPanel } from './components/TrainingPanel';
+import { setDifficulty } from './engine/Difficulty';
 import { GameOverScreen } from './components/GameOverScreen';
 import type { RunStats } from './components/GameOverScreen';
 import {
@@ -598,9 +600,50 @@ export default function App() {
     setShowVictory(false);
   }, []);
 
+  /**
+   * G7 — boots the Training Arena: three spawnable dummies, the mechanic
+   * checklist, no contract writes and a fighter that cannot die. Runs the
+   * same profile paint as a contract so ammo / loadout behave identically.
+   */
+  const startTraining = useCallback(() => {
+    void lockLandscape(true);
+    clearVirtualInputs();
+    resetRunTelemetry();
+
+    gameLoop.fullReset();
+    const p = profileRef.current;
+    if (p) gameLoop.applyRunProfile(computeRunProfile(p));
+    // fullReset drops the drill (every contract boot does) — enter AFTER it.
+    gameLoop.enterTraining();
+    gameLoop.setPaused(false);
+
+    setActiveStage(TRAINING_STAGE);
+    setHasStarted(true);
+    setShowStageSelect(false);
+    setShowOptions(false);
+    setShowPerks(false);
+    setShowMilestones(false);
+    setShowAIAgents(false);
+    setShowHelp(false);
+    setShowHowToPlay(false);
+    setShowUpgrades(false);
+    setShowAppearance(false);
+    setShowAchievements(false);
+    setShowProfile(false);
+    setLayoutEditorOpen(false);
+    SoundFX.playDoorOpen();
+    setTick(t => (t + 1) % 1000);
+  }, [gameLoop, lockLandscape, clearVirtualInputs, resetRunTelemetry]);
+
   /** Boots the game straight into a chosen stage with a fresh fighter. */
   const startStage = useCallback(
     (stage: StageDef) => {
+      // G7: the training card (and any restart on it) boots the drill —
+      // it must never fall through into spawnSquad and mint a contract.
+      if (stage.id === 0) {
+        startTraining();
+        return;
+      }
       void lockLandscape(true);
       clearVirtualInputs();
       resetRunTelemetry();
@@ -632,12 +675,24 @@ export default function App() {
       setLayoutEditorOpen(false);
       SoundFX.playDoorOpen();
     },
-    [gameLoop, lockLandscape, clearVirtualInputs, resetRunTelemetry]
+    [gameLoop, lockLandscape, clearVirtualInputs, resetRunTelemetry, startTraining]
   );
 
   const restartStage = useCallback(() => {
     startStage(activeStage);
   }, [startStage, activeStage]);
+
+  /** G7 — leaves the drill and lands back on the contract board. */
+  const exitTraining = useCallback(() => {
+    clearVirtualInputs();
+    resetRunTelemetry();
+    gameLoop.fullReset();
+    gameLoop.setPaused(true);
+    setHasStarted(false);
+    setShowStageSelect(true);
+    setShowOptions(false);
+    setTick(t => (t + 1) % 1000);
+  }, [gameLoop, clearVirtualInputs, resetRunTelemetry]);
 
   /** Quit to the title screen with a clean slate. */
   const goToTitle = useCallback(() => {
@@ -760,6 +815,8 @@ export default function App() {
     });
     // PHASE 3 4: aim magnetism level (mirrored through GameLoop so fullReset keeps it)
     gameLoop.aimAssist = settings.aimAssist;
+    // G5: the enemy-behaviour tier (module-level, read every frame by the AI)
+    setDifficulty(settings.difficulty);
     setIsMuted(settings.sfxVolume === 0);
     saveSettings(settings);
     // PHASE 2: settings ride along in the profile (audio/graphics survive a wipe)
@@ -937,6 +994,14 @@ export default function App() {
       if (nextKills !== killsRef.current) {
         killsRef.current = nextKills;
         setKills(nextKills);
+      }
+
+      // G7 — the Training Arena writes no progression: no stage clears, no
+      // victory, no lifetime bests. It does re-render on this same cadence so
+      // the checklist panel stays live without a timer of its own.
+      if (gameLoop.training) {
+        setTick(t => (t + 1) % 1000);
+        return;
       }
 
       // PHASE 2: lifetime bests commit the moment they improve (also powers
@@ -2007,9 +2072,16 @@ export default function App() {
       <StageSelectModal
         isOpen={showStageSelect}
         progress={progress}
+        difficulty={settings.difficulty}
         onSelect={startStage}
+        onTraining={startTraining}
         onClose={() => setShowStageSelect(false)}
       />
+
+      {/* 12b. G7 — Training Arena checklist (only while a drill is live) */}
+      {hasStarted && gameLoop.training && (
+        <TrainingPanel onReset={() => gameLoop.resetTraining()} onExit={exitTraining} />
+      )}
 
       {/* 13. PHASE 3 5 — back gesture at the root screen asks before leaving */}
       {showExitConfirm && (

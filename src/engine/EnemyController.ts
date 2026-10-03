@@ -4,6 +4,23 @@ import { SoundFX } from './SoundFX';
 import { mixPose, translatePose, smoothstep, strikeCurve } from './AnimationController';
 import { Ragdoll, ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
+import { getDifficulty, reactionDelay, aimSpreadPx } from './Difficulty';
+
+/**
+ * G5 — the three reactions a fighter can have to being shot at. Each one is
+ * ARMED first and only lands once `reactionDelay()` has run down, so the
+ * latency (and therefore the tier) is visible and testable.
+ */
+export type ReactionKind = 'ALERT' | 'COVER' | 'RETREAT';
+
+/** Seconds a fighter holds a seat behind a prop after the reaction lands. */
+const COVER_HOLD = 2.6;
+/** Cooldown before the same fighter will dive for cover again. */
+const COVER_COOLDOWN = 5.0;
+/** Guard-up window a gunshot reaction opens on a fighter in a neutral state. */
+const ALERT_GUARD_HOLD = 0.8;
+/** Arena X beyond which a poise-broken fighter is cornered and stops running. */
+const RETREAT_WALL = 760;
 
 export type AttackPattern =
   | 'JAB'
@@ -104,6 +121,32 @@ export class EnemyController {
   private aiAccumulator: number = Math.random() * AI_THROTTLE_INTERVAL;
   public attackCooldown: number = 1.0;
   public blockCooldown: number = 0;
+
+  // ---- G5 difficulty-tier reactions -----------------------------------------
+  /** Seconds left on an armed reaction; -1 = nothing in the pipe (smoke reads it). */
+  private reactionTimer: number = -1;
+  private reactionKind: ReactionKind | null = null;
+  private reactionCoverX: number | null = null;
+  private reactionCoverId: number | null = null;
+  /** Seconds left on the gunshot guard raise (applies once the fighter is free). */
+  public alertTimer: number = 0;
+  /** Seconds left in the poise-break retreat — creates distance, then re-engages. */
+  public retreatTimer: number = 0;
+  /** World X of the seat this fighter is holding, or null when moving free. */
+  public coverTargetX: number | null = null;
+  /** Destructible id behind `coverTargetX`, so a shattered prop drops the seat. */
+  public coverPropId: number | null = null;
+  /** Seconds left seated (and seconds left seeking, which eats the same clock). */
+  private coverHoldTimer: number = 0;
+  /** Cooldown before this fighter will dive for cover again. */
+  private coverCooldown: number = 0;
+
+  /**
+   * G7 — training dummy behaviour, null in every live contract.
+   * 'IDLE' = a sandbag that never strikes back, 'ATTACKER' = full combat AI
+   * for the close-range drill, 'SHOOTER' = holds a firing lane and shoots.
+   */
+  public dummyMode: 'IDLE' | 'ATTACKER' | 'SHOOTER' | null = null;
   /**
    * PHASE 1B 3: seconds this ranged archetype stays disarmed — its gun was
    * knocked loose by a heavy blow, so it closes to melee until the timer runs
@@ -463,10 +506,17 @@ export class EnemyController {
     if (this.disarmTimer > 0) this.disarmTimer = Math.max(0, this.disarmTimer - dt);
     // PHASE 1B 11: adaptive scalar scales cooldown *drain* only — the authored
     // cooldown values themselves never change, so 1.0 matches the shipped AI.
-    const coolScale = this.adaptive;
+    // G5: the difficulty tier rides the same drain lane. PRO sits at 1.0, so a
+    // PRO run drains exactly as it did before the tier existed.
+    const tier = getDifficulty();
+    const coolScale = this.adaptive * tier.decisionCooldownScale;
     if (this.attackCooldown > 0) this.attackCooldown -= dt * coolScale;
     if (this.blockCooldown > 0) this.blockCooldown -= dt;
     if (this.dodgeCooldown > 0) this.dodgeCooldown -= dt;
+
+    // G5 — armed reactions tick at full rate (the AI tree below may be
+    // throttled for distant fighters, but a reaction latency is not optional).
+    this.tickReactions(dt);
 
     // Health bar visibility countdown (only show when recently hit)
     if (this.hpVisibleTimer > 0) {
@@ -522,6 +572,111 @@ export class EnemyController {
     this.updatePose(dt);
   }
 
+  // ---- G5 reactions -----------------------------------------------------------
+  /**
+   * Arms a reaction for this fighter. Nothing observable happens now — the
+   * clock is drawn through `reactionDelay()` (tier floor + jitter) and the
+   * reaction lands when it expires, which is what makes the latency human-ish
+   * and the tier difference visible.
+   *
+   * A COVER request already in the pipe outranks an ALERT (a round through the
+   * ribs is news you act on now); a request that arrives while another is in
+   * flight is dropped rather than short-cutting the queue.
+   */
+  public armReaction(kind: ReactionKind, coverX: number | null = null, coverId: number | null = null): void {
+    if (this.health <= 0) return;
+    if (this.state === 'GRAPPLED' || this.state === 'DOWNED' || this.state === 'GETUP') return;
+    // A training sandbag takes hits, it does not process them.
+    if (this.dummyMode === 'IDLE') return;
+    if (this.reactionTimer >= 0) return;
+
+    let resolved: ReactionKind = kind;
+    if (kind === 'COVER') {
+      if (
+        coverX === null ||
+        this.coverCooldown > 0 ||
+        this.coverTargetX !== null ||
+        this.coverHoldTimer > 0
+      ) {
+        resolved = 'ALERT';
+        coverX = null;
+        coverId = null;
+      }
+    }
+
+    this.reactionKind = resolved;
+    this.reactionCoverX = coverX;
+    this.reactionCoverId = coverId;
+    this.reactionTimer = reactionDelay();
+  }
+
+  /** Seconds left on the armed reaction (-1 when idle) — smoke-suite probe. */
+  public get pendingReaction(): number {
+    return this.reactionTimer;
+  }
+
+  /** Drops the fighter's seat (called when the prop behind them shatters). */
+  public clearCover(): void {
+    this.coverTargetX = null;
+    this.coverPropId = null;
+    this.coverHoldTimer = 0;
+    this.coverCooldown = COVER_COOLDOWN;
+    if (this.state === 'BLOCK') {
+      this.stateTimer = 0.4; // rise off the prop on the next frame
+    }
+  }
+
+  private isNeutral(): boolean {
+    return this.state === 'IDLE' || this.state === 'APPROACH';
+  }
+
+  private raiseGuard(cooldown: number): void {
+    this.state = 'BLOCK';
+    this.stateTimer = 0;
+    this.counterQueued = false;
+    this.velocity.x = 0;
+    this.blockCooldown = cooldown;
+  }
+
+  /** Full-rate countdown for every armed reaction + the cover seat clock. */
+  private tickReactions(dt: number): void {
+    if (this.alertTimer > 0) this.alertTimer = Math.max(0, this.alertTimer - dt);
+    // The retreat clock only runs while the fighter is actually free to act —
+    // a stagger is not a retreat, so the tier duration is spent creating
+    // distance once they are back on their feet instead of being burned off
+    // inside the stun.
+    if (this.retreatTimer > 0 && this.isNeutral()) {
+      this.retreatTimer = Math.max(0, this.retreatTimer - dt);
+    }
+    if (this.coverCooldown > 0) this.coverCooldown = Math.max(0, this.coverCooldown - dt);
+
+    if (this.reactionTimer >= 0) {
+      this.reactionTimer -= dt;
+      if (this.reactionTimer <= 0) {
+        const kind = this.reactionKind;
+        this.reactionKind = null;
+        this.reactionTimer = -1;
+        if (kind === 'ALERT') {
+          this.alertTimer = ALERT_GUARD_HOLD;
+          if (this.isNeutral()) this.raiseGuard(1.0);
+        } else if (kind === 'RETREAT') {
+          this.retreatTimer = getDifficulty().retreatDuration;
+        } else if (kind === 'COVER' && this.reactionCoverX !== null) {
+          this.coverTargetX = this.reactionCoverX;
+          this.coverPropId = this.reactionCoverId;
+          this.coverHoldTimer = COVER_HOLD;
+        }
+        this.reactionCoverX = null;
+        this.reactionCoverId = null;
+      }
+    }
+
+    if (this.coverTargetX !== null && this.coverHoldTimer > 0) {
+      this.coverHoldTimer = Math.max(0, this.coverHoldTimer - dt);
+      if (this.coverHoldTimer <= 0) this.clearCover();
+    }
+  }
+
   private updateAI(
     dt: number,
     playerPos: Vector2,
@@ -530,9 +685,84 @@ export class EnemyController {
     distToPlayer: number,
     absDistToPlayer: number
   ) {
+    // G7 — a training sandbag runs no decision tree: it stands, it absorbs,
+    // it never blocks, dodges or strikes. Hurt / stagger / knockdown / grab
+    // fall through to the state cases below so hits still read exactly as
+    // they do on a live fighter.
+    if (this.dummyMode === 'IDLE') {
+      this.activeHitbox = null;
+      this.velocity.x = 0;
+      if (
+        this.state === 'IDLE' ||
+        this.state === 'APPROACH' ||
+        this.state === 'WINDUP' ||
+        this.state === 'ATTACK' ||
+        this.state === 'RECOVERY' ||
+        this.state === 'BLOCK' ||
+        this.state === 'COUNTER' ||
+        this.state === 'DODGE'
+      ) {
+        this.state = 'IDLE';
+        this.stateTimer = 0;
+        this.counterQueued = false;
+        return;
+      }
+    }
+
+    // G5 — seated behind a prop: hold the guard for the whole seat. The
+    // BLOCK exit cannot run (this returns before the switch), so the
+    // protection never lapses mid-clock and the fighter rises on release.
+    if (
+      this.coverTargetX !== null &&
+      Math.abs(this.coverTargetX - this.position.x) <= 10 &&
+      (this.state === 'IDLE' || this.state === 'APPROACH' || this.state === 'BLOCK')
+    ) {
+      this.state = 'BLOCK';
+      this.stateTimer = 0;
+      this.counterQueued = false;
+      this.velocity.x = 0;
+      this.activeHitbox = null;
+      return;
+    }
+
+    // G5 — the tier every roll and latency in this tree reads from.
+    const tier = getDifficulty();
+
     switch (this.state) {
       case 'IDLE':
       case 'APPROACH': {
+        // G5 — shot at: break for the prop between this fighter and the gun.
+        if (this.coverTargetX !== null) {
+          const seatGap = this.coverTargetX - this.position.x;
+          if (Math.abs(seatGap) > 10) {
+            this.state = 'APPROACH';
+            this.velocity.x = Math.sign(seatGap) * this.moveSpeed * 1.1;
+          } else {
+            this.state = 'IDLE';
+            this.velocity.x = 0;
+          }
+          break;
+        }
+
+        // G5 — poise broken: create distance before re-engaging. Cornered at
+        // the arena wall the run is abandoned and the fighter turns to fight.
+        if (this.retreatTimer > 0) {
+          if (Math.abs(this.position.x) > RETREAT_WALL) {
+            this.retreatTimer = 0;
+          } else {
+            this.state = 'APPROACH';
+            this.velocity.x = (distToPlayer > 0 ? -1 : 1) * this.moveSpeed * 1.15;
+            break;
+          }
+        }
+
+        // G5 — gunshot heard: the guard goes up once, after the reaction has
+        // landed, and only if this fighter is free to raise it.
+        if (this.alertTimer > 0 && this.blockCooldown <= 0 && this.health > 0) {
+          this.raiseGuard(1.0);
+          break;
+        }
+
         // Compute tactical target position based on assigned flanking offset
         const targetX = playerPos.x + this.targetOffset;
         const diffToTarget = targetX - this.position.x;
@@ -549,7 +779,7 @@ export class EnemyController {
           absDistToPlayer < guardReach &&
           this.blockCooldown <= 0 &&
           this.health > 0 &&
-          Math.random() < Math.min(0.9, this.blockChance * this.adaptive)
+          Math.random() < Math.min(0.9, this.blockChance * this.adaptive * tier.defenseChanceScale)
         ) {
           this.state = 'BLOCK';
           this.stateTimer = 0;
@@ -568,7 +798,7 @@ export class EnemyController {
           this.dodgeCooldown <= 0 &&
           this.grounded &&
           this.health > 0 &&
-          Math.random() < this.dodgeChance * this.adaptive * dt * 8
+          Math.random() < this.dodgeChance * this.adaptive * dt * 8 * tier.defenseChanceScale
         ) {
           this.startDodge(distToPlayer);
           break;
@@ -576,7 +806,7 @@ export class EnemyController {
 
         // SNIPER: hold a long firing lane and charge a block-piercing shot.
         // PHASE 1B 3: a disarmed sniper drops the scope and closes to melee.
-        if (this.type === 'SNIPER' && this.disarmTimer <= 0) {
+        if (this.type === 'SNIPER' && this.disarmTimer <= 0 && this.dummyMode === null) {
           this.activeHitbox = null;
 
           if (absDistToPlayer < 320) {
@@ -602,7 +832,12 @@ export class EnemyController {
         // GUNNER: hold a 280-380px firing lane, strafe laterally, shoot on cooldown.
         // Falls back to a weak melee jab if the player closes the gap.
         // PHASE 1B 3: a disarmed gunner abandons the firing lane for fists
-        if (this.type === 'GUNNER' && this.disarmTimer <= 0) {
+        // G7: a 'SHOOTER' training dummy enters the same lane code by flag
+        // instead of archetype, so the drill exercises the shipped gunner AI.
+        if (
+          (this.type === 'GUNNER' || this.dummyMode === 'SHOOTER') &&
+          this.disarmTimer <= 0
+        ) {
           this.activeHitbox = null;
 
           // Strafe direction flips on a timer or at the arena walls
@@ -1198,6 +1433,9 @@ export class EnemyController {
     // ACROBAT at 1.2x; everyone else sits at the 1.0 default)
     this.staggerMeter += (isHeavy ? 30 : 15) * this.staggerTakenScale;
     if (this.staggerMeter >= this.maxStagger) {
+      // G5 — poise break: the fighter commits to creating distance the
+      // moment it gets free, timed through the tier's reaction latency.
+      if (!this.isStaggered) this.armReaction('RETREAT');
       this.isStaggered = true;
     }
 
@@ -1239,7 +1477,8 @@ export class EnemyController {
     // AI LAW (G5): never a laser. The round is aimed at standing torso height
     // with a human-ish vertical error — enough that a crouching fighter makes
     // most rounds miss, without ever making the shot random nonsense.
-    const targetY = playerPos.y - 60 + (Math.random() * 2 - 1) * 22;
+    // G5 tiers scale the size of that error only; PRO ships the authored 22 px.
+    const targetY = playerPos.y - 60 + (Math.random() * 2 - 1) * aimSpreadPx();
     const dx = targetX - muzzleX;
     const dy = targetY - muzzleY;
     const dist = Math.hypot(dx, dy) || 1;
@@ -1265,6 +1504,8 @@ export class EnemyController {
     this.staggerMeter = this.maxStagger;
     this.hpVisibleTimer = 3.2;
     this.lastHitTime = performance.now();
+    // G5 — the guard went, so the retreat goes with it (tier-timed).
+    this.armReaction('RETREAT');
     this.state = 'STAGGER';
     this.stateTimer = 0;
     this.velocity.x = (this.facingRight ? -1 : 1) * 120;

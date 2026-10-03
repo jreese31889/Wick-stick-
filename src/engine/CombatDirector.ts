@@ -9,6 +9,7 @@ import { ObjectPool } from './ObjectPool';
 import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc, EnemyBullet, DestructibleObject, SpecialMoveId } from '../types/game';
 import { EnvironmentManager } from './EnvironmentManager';
 import { GUNS, falloffMultiplier } from './Weapons';
+import { trainingIsActive, trainingMark } from './TrainingRoom';
 
 /**
  * Distance along a ray to a vertical target segment (x = targetX, y within
@@ -232,6 +233,16 @@ export class CombatDirector {
   /** P3-01: live enemy rounds (drained from EnemyController.pendingShots). */
   public static readonly MAX_ENEMY_BULLETS = 64;
 
+  /**
+   * G5 — how far a committed player round is *heard* (px). Fighters inside
+   * arm the gunshot ALERT; beyond it the shot is somebody else's problem.
+   */
+  public static readonly GUNSHOT_HEARING = 700;
+  /** G5 — how close a round has to land before it reads as "shot at" (px). */
+  public static readonly COVER_RADIUS = 130;
+  /** G5 — how far a fighter will run for a seat behind a prop (px). */
+  public static readonly COVER_REACH = 300;
+
   // P5-02: FX budgets per quality tier (high == the static defaults above;
   // pools stay sized for high so a mid-run tier switch never overflows).
   public quality: 'low' | 'medium' | 'high' = 'high';
@@ -365,6 +376,85 @@ export class CombatDirector {
     this.playerDamageWindow = 0;
   }
 
+  /**
+   * G7 — progression writes are suppressed inside the Training Arena. A
+   * drill is not a contract, so it can never mint XP, coins, achievements or
+   * lifetime stats; every fan-out event funnels through here for that one
+   * reason.
+   */
+  private emitProgressIfLive(type: string, data?: Record<string, unknown>): void {
+    if (trainingIsActive()) return;
+    emitProgress(type, data);
+  }
+
+  /**
+   * G5 — one committed round tells the room. Everyone inside hearing range
+   * arms an ALERT; their guard comes up only after the tier's reaction
+   * latency has run down (see EnemyController.armReaction), so a PRO squad
+   * flinches faster than a ROOKIE one and nothing ever flinches frame-perfect.
+   */
+  private signalGunshot(originX: number, enemies: EnemyController[]): void {
+    for (const enemy of enemies) {
+      if (enemy.health <= 0) continue;
+      if (Math.abs(enemy.position.x - originX) > CombatDirector.GUNSHOT_HEARING) continue;
+      enemy.armReaction('ALERT');
+    }
+  }
+
+  /**
+   * G5 — a round landed HERE: everyone close enough to have felt it breaks
+   * for the nearest intact prop, preferring one that actually sits between
+   * them and the gun. No prop in reach → plain ALERT instead.
+   */
+  private armCoverNear(
+    impactX: number,
+    playerX: number,
+    enemies: EnemyController[],
+    environmentManager?: EnvironmentManager
+  ): void {
+    for (const enemy of enemies) {
+      if (enemy.health <= 0) continue;
+      if (Math.abs(enemy.position.x - impactX) > CombatDirector.COVER_RADIUS) continue;
+      this.armCoverFor(enemy, playerX, environmentManager);
+    }
+  }
+
+  /** Picks the seat for one fighter and arms the COVER reaction. */
+  private armCoverFor(
+    enemy: EnemyController,
+    playerX: number,
+    environmentManager?: EnvironmentManager
+  ): void {
+    if (!environmentManager) {
+      enemy.armReaction('ALERT');
+      return;
+    }
+    const ex = enemy.position.x;
+    const enemySide = Math.sign(ex - playerX) || 1;
+    let best: DestructibleObject | null = null;
+    let bestScore = Infinity;
+    for (const obj of environmentManager.destructibles) {
+      if (obj.isBroken) continue;
+      const gap = Math.abs(obj.x - ex);
+      if (gap > CombatDirector.COVER_REACH) continue;
+      const propSide = Math.sign(obj.x - playerX) || 1;
+      const blocksLine =
+        propSide === enemySide && Math.abs(obj.x - playerX) < Math.abs(ex - playerX);
+      const score = gap + (blocksLine ? 0 : 120);
+      if (score < bestScore) {
+        bestScore = score;
+        best = obj;
+      }
+    }
+    if (!best) {
+      enemy.armReaction('ALERT');
+      return;
+    }
+    const half = best.width * 0.5 + 16;
+    const seatX = Math.max(-820, Math.min(820, best.x + enemySide * half));
+    enemy.armReaction('COVER', seatX, best.id);
+  }
+
   public update(
     dt: number,
     player: PlayerController,
@@ -478,6 +568,24 @@ export class CombatDirector {
     if (player.physics.state !== this.lastPlayerState) {
       this.playerAttackRegistered = false;
       if (this.lastPlayerState === 'ATTACK_FLYING_KICK') this.flyingKickHits.clear();
+      // G7 — checklist marks fire on the frame the move actually starts, in
+      // CombatDirector, so a tick is proof the real state machine ran.
+      const s = player.physics.state;
+      if (s === 'ATTACK_FLYING_KICK') {
+        trainingMark('JUMP_ATTACK');
+      } else if (
+        s === 'ATTACK_CROUCH_POKE' ||
+        s === 'ATTACK_LAUNCHER' ||
+        (s === 'ATTACK_SWEEP' && player.physics.isCrouching)
+      ) {
+        trainingMark('CROUCH_ATTACK');
+      } else if (s === 'ATTACK_AIR_LIGHT' || s === 'ATTACK_AIR_HEAVY') {
+        trainingMark('AIR_MOVE');
+      } else if (s === 'ATTACK_SPECIAL') {
+        trainingMark('SPECIAL');
+      } else if (s === 'ATTACK_SUPER') {
+        trainingMark('SUPER');
+      }
       this.lastPlayerState = player.physics.state;
     }
 
@@ -556,6 +664,8 @@ export class CombatDirector {
         enemy.staggerMeter = Math.min(enemy.maxStagger, enemy.staggerMeter + 20);
         if (enemy.staggerMeter >= enemy.maxStagger) {
           enemy.isStaggered = true;
+          // G5 — poise broke on the wall: back off before re-engaging.
+          enemy.armReaction('RETREAT');
         }
       }
 
@@ -565,7 +675,7 @@ export class CombatDirector {
         // PHASE 2: one KILL event per death — XP / lifetime stats / achievements
         // fan out from App.tsx. `env` marks a barrel blast (counts toward
         // COLLATERAL DAMAGE), `boss` toward HIGH TABLE SLAYER.
-        emitProgress(PROGRESS_EVENTS.KILL, {
+        this.emitProgressIfLive(PROGRESS_EVENTS.KILL, {
           enemyType: enemy.type,
           env: enemy.killedByExplosion,
           boss: enemy.type === 'BOSS' || enemy.type === 'MARQUIS',
@@ -573,12 +683,16 @@ export class CombatDirector {
             enemy.type === 'HEAVY' || enemy.type === 'ELITE' || enemy.type === 'DEFENDER',
         });
         this.stats.score += this.scoreForKill();
-        const coinCount = enemy.type === 'BOSS' ? 6 : enemy.type === 'HEAVY' ? 3 : 1;
-        for (let c = 0; c < coinCount; c++) {
-          environmentManager.dropCoin(enemy.position.x + (c - (coinCount - 1) / 2) * 16, enemy.position.y - 35, 1);
-        }
-        if (enemy.type === 'BOSS' || (enemy.type === 'HEAVY' && Math.random() > 0.4)) {
-          environmentManager.dropWeapon(enemy.type === 'BOSS' ? 'KATANA' : 'KNIFE', enemy.position.x, enemy.position.y - 40);
+        // G7: a drill drops no purse — loose coins would ride into the next
+        // contract's bank sweep and turn practice into progression.
+        if (!trainingIsActive()) {
+          const coinCount = enemy.type === 'BOSS' ? 6 : enemy.type === 'HEAVY' ? 3 : 1;
+          for (let c = 0; c < coinCount; c++) {
+            environmentManager.dropCoin(enemy.position.x + (c - (coinCount - 1) / 2) * 16, enemy.position.y - 35, 1);
+          }
+          if (enemy.type === 'BOSS' || (enemy.type === 'HEAVY' && Math.random() > 0.4)) {
+            environmentManager.dropWeapon(enemy.type === 'BOSS' ? 'KATANA' : 'KNIFE', enemy.position.x, enemy.position.y - 40);
+          }
         }
 
         // == ELIMINATION CINEMATICS ==
@@ -703,10 +817,19 @@ export class CombatDirector {
       // Chambered round: commit the shot exactly as the old inline path did
       player.physics.ammo--;
       player.physics.isReloading = false;
-      player.forceState('ATTACK_GUN_SHOT');
+      // G7: a round committed mid-slide leaves from the SLIDE pose. Forcing
+      // the gun-shoot state would reset the slide clock and cancel the move,
+      // and the recoil push would kill its momentum — so neither happens
+      // here; the casing, tracer, report and hit all behave normally.
+      const sliding = player.physics.isSliding;
+      if (!sliding) player.forceState('ATTACK_GUN_SHOT');
       SoundFX.playGunshot();
-      player.physics.velocity.x = (player.physics.facingRight ? -1 : 1) * 110;
+      if (!sliding) {
+        player.physics.velocity.x = (player.physics.facingRight ? -1 : 1) * 110;
+      }
       player.hasFiredBulletThisShot = true;
+      // G7 checklist: SLIDE_FIRE is marked on the frame the round commits.
+      if (sliding) trainingMark('SLIDE_FIRE');
     }
 
     // Phase 1 arsenal: SMG / SHOTGUN / RIFLE salvo (its own stats, pellets,
@@ -731,6 +854,9 @@ export class CombatDirector {
 
     // 1. Eject spent brass casing with realistic tumbling physics
     this.ejectCasing(originX, originY, dir);
+
+    // G5 — the room hears the round before it sees where it landed.
+    this.signalGunshot(originX, enemies);
 
     // 2. Raycast against active enemies along bullet trajectory
     let closestEnemy: EnemyController | null = null;
@@ -771,6 +897,8 @@ export class CombatDirector {
         this.spawnSparks(impactX, impactY, -dir, 8, this.surfaceColor(propHit.type));
         camera.addTrauma(0.1);
         Haptics.cue('hit');
+        // G5: the round died on the prop — anyone it landed beside breaks.
+        this.armCoverNear(impactX, player.physics.position.x, enemies, environmentManager);
         return;
       }
     }
@@ -783,6 +911,8 @@ export class CombatDirector {
 
       // Create glowing supersonic bullet tracer to impact point
       this.pushTracer(originX, originY, impactX, impactY, 0.12, 3.5);
+      // G5: shot at — everyone the round touched or landed beside breaks.
+      this.armCoverNear(impactX, player.physics.position.x, enemies, environmentManager);
 
       // Close-Quarters Gun-Fu Double Tap execution check (< 95px)
       const isPointBlank = closestT < 95;
@@ -819,7 +949,7 @@ export class CombatDirector {
         this.stats.takedownCount++;
         this.stats.score += 150;
         this.registerStyle('GUNFU');
-        emitProgress(PROGRESS_EVENTS.EXECUTION, { move: 'GUN-FU' });
+        this.emitProgressIfLive(PROGRESS_EVENTS.EXECUTION, { move: 'GUN-FU' });
         Haptics.cue('heavy');
       } else {
         // Standard bullet impact. PHASE 1B hit zones: a round that lands in
@@ -1012,7 +1142,7 @@ export class CombatDirector {
         this.addCombo(1, 3.0);
         this.registerStyle('RICOCHET');
         Haptics.cue('hit');
-        if (enemy.health <= 0) emitProgress(PROGRESS_EVENTS.RICOCHET_KILL);
+        if (enemy.health <= 0) this.emitProgressIfLive(PROGRESS_EVENTS.RICOCHET_KILL);
       } else {
         this.spawnSparks(impactX, impactY, -dir, 5, '#94a3b8');
       }
@@ -1085,10 +1215,14 @@ export class CombatDirector {
 
     player.physics.ammo--;
     player.physics.isReloading = false;
-    player.forceState('ATTACK_GUN_SHOT');
+    // G7: mid-slide a salvo leaves from the SLIDE pose — no gun-shoot state,
+    // no recoil write (both would cancel the slide), everything else normal.
+    const sliding = player.physics.isSliding;
+    if (!sliding) player.forceState('ATTACK_GUN_SHOT');
     SoundFX.playGunReport(stats.id);
     const recoilDir = player.physics.facingRight ? -1 : 1;
-    player.physics.velocity.x = recoilDir * stats.recoil;
+    if (!sliding) player.physics.velocity.x = recoilDir * stats.recoil;
+    if (sliding) trainingMark('SLIDE_FIRE');
 
     const dir = player.physics.facingRight ? 1 : -1;
     // PHASE 1B aim model: precision aim flies along the stick (with head
@@ -1100,6 +1234,8 @@ export class CombatDirector {
     const originX = player.physics.position.x + dirShot * 34;
     const originY = player.physics.position.y - 62;
     this.ejectCasing(originX, originY, dirShot);
+    // G5 — the room hears the salvo too.
+    this.signalGunshot(originX, enemies);
     const spreadScale = player.precisionAim ? 0.35 : 1;
 
     const MAX_RANGE = 1500;
@@ -1156,6 +1292,8 @@ export class CombatDirector {
         const impactX = originX + dx * enemyT - dirShot * 8;
         const impactY = originY + dy * enemyT;
         this.pushTracer(originX, originY, impactX, impactY, stats.tracerLife, stats.tracerWidth);
+        // G5: shot at — everyone the round touched or landed beside breaks.
+        this.armCoverNear(impactX, player.physics.position.x, enemies, environmentManager);
 
         if (enemy.evading) {
           this.spawnSparks(impactX, impactY, -dir, 4, '#94a3b8');
@@ -1335,12 +1473,15 @@ export class CombatDirector {
       }
     }
     if (!target) return false;
+    // G7 checklist: the whip is marked the frame the target is found.
+    trainingMark('PISTOL_WHIP');
 
     const impactX = target.position.x - f * 12;
     const impactY = py - 64;
     // Gun-shot stance: arm driving the muzzle into them. It is deliberately
     // outside the melee attack list, so the whip cannot chain into a free jab.
-    player.forceState('ATTACK_GUN_SHOT');
+    // G7: the slide owns the pose mid-slide (see the pistol round commit).
+    if (!player.physics.isSliding) player.forceState('ATTACK_GUN_SHOT');
 
     if (target.state === 'BLOCK') {
       // The whip is a heavy strike — it simply shatters a raised guard
@@ -1775,7 +1916,7 @@ export class CombatDirector {
           this.announceMove('DISARM');
           this.registerStyle('DISARM');
           this.stats.score += 50;
-          emitProgress(PROGRESS_EVENTS.DISARM);
+          this.emitProgressIfLive(PROGRESS_EVENTS.DISARM);
           this.spawnSparks(impactX, impactY, dirAway, 14, '#38bdf8');
           SoundFX.playGunCock();
           Haptics.cue('takedown');
@@ -2073,6 +2214,8 @@ export class CombatDirector {
             // Stun enemy completely!
             enemy.isStaggered = true;
             enemy.staggerMeter = enemy.maxStagger;
+            // G5 — the guard is gone, so the retreat goes with it (tier-timed).
+            enemy.armReaction('RETREAT');
             enemy.takeDamage(10, -hb.knockbackX * 0.8, -120, false);
             enemy.state = 'STAGGER';
             enemy.stateTimer = 0;
@@ -2428,7 +2571,9 @@ export class CombatDirector {
         this.stats.score += 150;
         this.stats.totalDamageDealt += damage;
         this.addCombo(2, 3.2);
-        emitProgress(PROGRESS_EVENTS.EXECUTION, { move: 'JUDO SLAM' });
+        // G7 checklist: the grab takedown is marked on the slam frame.
+        trainingMark('TAKEDOWN');
+        this.emitProgressIfLive(PROGRESS_EVENTS.EXECUTION, { move: 'JUDO SLAM' });
 
         this.spawnShockwave(enemy.position.x, py - 5, 55, '#f59e0b');
         this.spawnSparks(enemy.position.x, py - 8, -f, 18, '#fbbf24');
@@ -2526,7 +2671,9 @@ export class CombatDirector {
         this.stats.score += 150;
         this.addCombo(2, 3.5);
         this.announceMove('GRIP EXECUTION');
-        emitProgress(PROGRESS_EVENTS.EXECUTION, { move: 'GRIP EXECUTION' });
+        // G7 checklist: the grip execution is marked on the shot frame.
+        trainingMark('TAKEDOWN');
+        this.emitProgressIfLive(PROGRESS_EVENTS.EXECUTION, { move: 'GRIP EXECUTION' });
         // PHASE 1B 9/8: temple shot gets its own push-in + style credit
         camera.pushIn(1.45, 1.0);
         this.registerStyle('EXECUTION');

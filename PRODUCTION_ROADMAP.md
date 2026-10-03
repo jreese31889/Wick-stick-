@@ -83,6 +83,29 @@ Summary: **41 features — 31 DONE · 4 PARTIAL · 6 NEW.**
 
 ---
 
+## G. J.I.N 2026-10-03 audit gaps G5–G8 (this change set)
+
+Numbering follows the audit's four open gaps. The source keeps each lane's own tag in its comments — `Difficulty.ts` header **G5**, `EnemyController.ts` reaction block **G5 reactions** (the audit calls that work *G5 enemy behaviours*), `TrainingRoom.ts` / `GameLoop.ts` / `CombatDirector.ts` **G7**.
+
+| # | Gap | Status | Implementing file / symbol |
+|---|-----|--------|----------------------------|
+| G5 | **Difficulty tiers ROOKIE / PRO / CONTINENTAL — behaviour-only scaling.** Scales reaction floor + jitter, aim error, decision drain, defensive-read chance, squad attack gap, flank-ring depth and poise-break retreat length. Never HP, damage, hit-stop or slow-mo. PRO = 1.0 on every scale, so the default/stored `'pro'` run is byte-identical to the build it came from | ✅ | `src/engine/Difficulty.ts` (`DIFFICULTY_TIERS`, `MIN_HUMAN_REACTION = 0.2`, `BASE_AIM_SPREAD = 22`, `reactionDelay`, `aimSpreadPx`, `setDifficulty`); reads: `EnemyController.update` (`coolScale = adaptive × decisionCooldownScale`, block/dodge rolls × `defenseChanceScale`, clamped ≤ 0.9), `EnemyController.fireBullet` (`aimSpreadPx()`), `GameLoop` coordination (`:736` `attackGap`, `:772` `flankRingScale`); persisted `settings.difficulty` (`settings.ts:66/:98`, load `:254`, `ProfileStore.ts:156`); picker `OptionsModal.tsx:246`; chip `StageSelectModal.tsx:177` |
+| G6 | **Enemy reaction behaviours — the reads G5 puts a clock on.** (i) gunshot heard within 700 px → ALERT, guard comes up only when the tier latency runs out; (ii) a round lands within 130 px → COVER, break for the nearest intact prop and hold the guard for the whole seat; (iii) poise break → RETREAT away from whoever broke it, abandoned at the arena wall | ✅ | `EnemyController.armReaction` (`:586`, COVER outranks an in-flight ALERT, dropped if one is already in the pipe, inert on a sandbag), `pendingReaction` (`:614`), `tickReactions` (`:642`, retreat clock only runs while neutral so a stun cannot burn it), `raiseGuard`/`clearCover`/`isNeutral` (`:617-631`), seat hold `updateAI:712-726`, retreat `:747-764`; `CombatDirector.signalGunshot` (`:396`, armed at `:859`), `armCoverNear`/`armCoverFor` (`:409/:423`, seat = prop edge ±800 clamp, falls back to ALERT with no prop), armed from `guardBreak` (`EnemyController:1508`), first poise-break (`:1438`), perfect parry and wall-slam stagger |
+| G7 | **Training Arena** — spawnable dummies, mechanic checklist, no player death, instant reset, zero progression writes | ✅ | Tracker `src/engine/TrainingRoom.ts` (8 ids, inert until `trainingSetActive(true)`); `GameLoop.enterTraining` (`:396`), `spawnTrainingDummies` (`:374` — sandbag / attacker / shooter), `resetTraining` (`:409`), death floor + `trainingTopUp` (`:815-830`), wave-clear/door/coin gates (`:603/:619/:639`), attack token released for every dummy (`:778-786`); marks + silent progression `CombatDirector.emitProgressIfLive` (`:385`, 7 sites) and `trainingMark` (`:575/:832/:1225/:1477/:2575`); `PlayerController.trainingTopUp` (`:384`), slide/standing SHOOT sites (`:741/:808`) → `tryFireWeapon` (`:1353`); UI `src/components/TrainingPanel.tsx`, `App.startTraining` (`:608`) / `exitTraining` (`:686`), `TRAINING_STAGE` card `StageSelectModal.tsx:95` |
+| G8 | **Headless coverage for G5–G7** — no UI-only proof; every claim below is asserted by driving the real engine | ✅ | `smoke_combat.ts` **A5** (27 checks: tier floors ≥ 0.20 and ordered, PRO baseline byte-equal, aim band 35.2/22.0/12.1, sub-human clamp, latency band, HP/damage invariance across tiers, decision-pace order rookie 42 / pro 60 / continental 81 frames, live ALERT + COVER + RETREAT) and **A6** (29 checks: board inert outside the drill, all 8 marks fired by the real state machine, slide-fire keeps the SLIDE pose, takedown writes no progression, damage tally silent, top-up rules, three dummy roles). Suite **127 PASS / 0 FAIL**, exit 0 |
+
+### G5 per-tier values — every entry is a behaviour read, never a stat
+
+| Profile | reactionMin | reactionJitter | aimSpreadScale (→ px) | decisionCooldownScale | defenseChanceScale | attackGap | flankRingScale | retreatDuration |
+|---------|------------:|---------------:|----------------------:|----------------------:|-------------------:|----------:|---------------:|----------------:|
+| ROOKIE | 0.45 s | 0.35 s | 1.60 → 35.2 px | 1.45 (lazy) | 0.70 | 0.40 s | 1.30 | 1.10 s |
+| PRO (shipped, default) | 0.30 s | 0.22 s | 1.00 → 22.0 px | 1.00 | 1.00 | 0.22 s | 1.00 | 0.90 s |
+| CONTINENTAL | 0.22 s | 0.14 s | 0.55 → 12.1 px | 0.75 (sharp) | 1.25 | 0.12 s | 0.85 | 0.70 s |
+
+One draw is `max(MIN_HUMAN_REACTION, reactionMin) + rand × jitter`, so **0.20 s is the floor under every tier** — no profile can schedule a frame-perfect reaction. Aim error is `max(4, 22 × aimSpreadScale)` px of vertical spread (never a laser). Defence rolls clamp at 0.9 in place. Unset or unknown `settings.difficulty` sanitises to `'pro'` (`settings.ts:254`, `ProfileStore.ts:156`), which is what makes the tier invisible to an existing save.
+
+---
+
 ## Phase 1 implementation targets (this change set)
 
 | Pillar | Features | Where |
@@ -141,6 +164,19 @@ Left alone on purpose (pre-existing, exit guaranteed, design choice): air-slide 
 ### Scope of this pass
 
 Only `CombatDirector.ts`, `EnemyController.ts` and `PlayerController.ts` changed, plus the new `smoke_combat.ts`. This closes `GAME_AUDIT.md` §8 items **#1** (`comboMeter` never written), **#2** (`SPIN_SLASH`/`EXECUTIONER` unreachable) and **#4** (`staggerTakenScale` read nowhere). Release packaging docs: `RELEASE_BUILD.md` · player-facing history: `CHANGELOG.md`. No git commit.
+
+## Phase 6 — G5–G8 (this change set)
+
+**Verification:** `npx tsc --noEmit` green · `npm run build` green · `npx tsx smoke_combat.ts` **127 PASS / 0 FAIL** (`ALL GREEN`, exit 0 — A1–A4 unchanged, A5 + A6 new).
+
+**Scope:** new `src/engine/Difficulty.ts` and `src/engine/TrainingRoom.ts`; `EnemyController`, `CombatDirector`, `PlayerController`, `GameLoop`; settings/profile persistence; `OptionsModal`, `StageSelectModal`, new `TrainingPanel`, `App`; `smoke_combat.ts`. Working code was added to, not replaced — every existing smoke check still passes untouched.
+
+**Guardrails held:** PRO reproduces the shipped build exactly (all scales 1.0, `attackGap` 0.22, aim 22 px, decision drain 60 frames/second); no HP, damage, hit-stop, slow-mo or authored cooldown was touched by a tier; the SLIDE pose is never stolen by a round, whip or salvo (slide guard at the three SHOOT commit sites); the checklist cannot tick outside the drill and the drill writes no progression (kills, executions, damage tally, coins, wave clear, door); no new physics loop — reactions ride `EnemyController.update`, cover and retreat ride the existing `IDLE`/`APPROACH` case. No git commit.
+
+**Honest caveats:**
+- `smoke_combat.ts` drives `CombatDirector`/`EnemyController`/`PlayerController` headlessly but **not** `GameLoop`/`App` — the death floor, dummy spawn list, door/wave gates and panel UI are covered by code review only.
+- This repo has no `@types/react` and `strict` is off, so **JSX props are not type-checked** (`StageSelectModal` `difficulty`/`onTraining`, `TrainingPanel` `onReset`/`onExit`, `OptionsModal` difficulty card). Those were hand-verified against each component's own prop declarations; `tsc` passing does not prove them.
+- Difficulty is stored in `settings` and applied through `App`'s settings effect; a profile written by an older build sanitises to `'pro'`, so the tier is invisible until the player picks one.
 
 ## Phase 2+ backlog (explicitly not in this change set)
 

@@ -151,6 +151,12 @@ function sanitizeSettings(raw: unknown): GameSettings {
     // PHASE 4 E5: score level rides along with the rest of the audio profile.
     musicVolume: clampInt(obj.musicVolume, fallback.musicVolume, 0, 100),
     quality,
+    // G5 — the behaviour tier rides along in the profile so it survives a
+    // reload exactly like the rest of the menu settings.
+    difficulty:
+      obj.difficulty === 'rookie' || obj.difficulty === 'pro' || obj.difficulty === 'continental'
+        ? obj.difficulty
+        : fallback.difficulty,
     showFps: bool(obj.showFps, fallback.showFps),
     haptics: bool(obj.haptics, fallback.haptics),
     // PHASE 3 — input & platform polish rides along in the profile so the

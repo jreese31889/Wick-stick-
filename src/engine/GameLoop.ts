@@ -12,6 +12,8 @@ import { ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
 import { emitProgress, PROGRESS_EVENTS } from '../profile/ProgressEvents';
 import type { RunProfile } from '../profile/Progression';
+import { getDifficulty } from './Difficulty';
+import { trainingSetActive, trainingIsActive, trainingResetChecks } from './TrainingRoom';
 
 export class GameLoop {
   public inputManager = new InputManager();
@@ -117,6 +119,11 @@ export class GameLoop {
     SoundFX.preload();
     this.environmentManager.setupRoomForWave(1);
     this.spawnSquad(1);
+  }
+
+  /** G7 — true while the Training Arena owns the run (no contract, no death). */
+  public get training(): boolean {
+    return trainingIsActive();
   }
 
   public togglePause(): boolean {
@@ -354,7 +361,56 @@ export class GameLoop {
 
     this.environmentManager.reset();
     this.environmentManager.setupRoomForWave(this.waveNumber);
-    this.spawnSquad(this.squadSize);
+    if (trainingIsActive()) this.spawnTrainingDummies();
+    else this.spawnSquad(this.squadSize);
+    if (this.onStateChange) this.onStateChange();
+  }
+
+  /**
+   * G7 — spawns the three-body drill: a sandbag that never strikes back, a
+   * close attacker that runs the full combat AI, and a lane shooter running
+   * the shipped gunner logic. Fixed layout so the checklist is repeatable.
+   */
+  public spawnTrainingDummies(): void {
+    for (const old of this.enemies) {
+      if (old.ragdoll) {
+        ragdollPool.release(old.ragdoll);
+        old.ragdoll = null;
+      }
+    }
+    this.squadSize = 3;
+    const px = this.player.physics.position.x;
+    this.environmentManager.setupRoomForWave(1);
+    const sandbag = new EnemyController('dummy-sandbag', px + 200, 0, 'BASIC', 75);
+    sandbag.dummyMode = 'IDLE';
+    const attacker = new EnemyController('dummy-attacker', px - 230, 0, 'RUSHER', -85);
+    attacker.dummyMode = 'ATTACKER';
+    const shooter = new EnemyController('dummy-shooter', px + 440, 0, 'GUNNER', 150);
+    shooter.dummyMode = 'SHOOTER';
+    this.enemies = [sandbag, attacker, shooter];
+    this.markWaveSpawn();
+    if (this.onStateChange) this.onStateChange();
+  }
+
+  /** G7 — boots the Training Arena over the fresh fighter fullReset built. */
+  public enterTraining(): void {
+    trainingSetActive(true);
+    trainingResetChecks();
+    this.waveNumber = 1;
+    this.isGameOver = false;
+    this.isDying = false;
+    this.dyingTimer = 0;
+    this.spawnTrainingDummies();
+    this.player.restockAmmo();
+    if (this.onStateChange) this.onStateChange();
+  }
+
+  /** G7 — instant reset: fresh dummies, topped-up fighter, clean checklist. */
+  public resetTraining(): void {
+    if (!trainingIsActive()) return;
+    trainingResetChecks();
+    this.resetFight();
+    this.player.restockAmmo();
     if (this.onStateChange) this.onStateChange();
   }
 
@@ -370,6 +426,9 @@ export class GameLoop {
    */
   public fullReset() {
     this.waveNumber = 1;
+    // G7: every contract boot drops the Training Arena, so a live drill can
+    // never leak into (or out of) a real run.
+    trainingSetActive(false);
     this.isGameOver = false;
     this.isDying = false;
     this.dyingTimer = 0;
@@ -539,7 +598,9 @@ export class GameLoop {
         }
       }
       // P6-03: close the wave measure the first frame the squad is wiped
-      if (allEnemiesDefeated && !this.waveClearMarked) {
+      // G7: the Training Arena never writes progression and never opens a
+      // door — a drill is not a contract, so the wipe is not a clear.
+      if (allEnemiesDefeated && !this.waveClearMarked && !trainingIsActive()) {
         this.waveClearMarked = true;
         this.markWaveClear();
         this.player.restockAmmo();
@@ -555,7 +616,7 @@ export class GameLoop {
           damageTaken,
         });
       }
-      this.environmentManager.setDoorOpen(allEnemiesDefeated);
+      this.environmentManager.setDoorOpen(allEnemiesDefeated && !trainingIsActive());
       this.environmentManager.update(effectiveDt, this.player.physics);
 
       // 3b. Phase-1 inventory pickups queued by the environment (guns + ammo)
@@ -573,10 +634,13 @@ export class GameLoop {
       }
 
       // Check door transition to next chamber
-      const enteredDoor = this.environmentManager.checkDoorInteraction(
-        this.player.physics.position.x,
-        input.grab || input.interact
-      );
+      // G7: the drill has no next chamber — the door stays shut and inert.
+      const enteredDoor =
+        !trainingIsActive() &&
+        this.environmentManager.checkDoorInteraction(
+          this.player.physics.position.x,
+          input.grab || input.interact
+        );
       if (enteredDoor) {
         this.player.physics.position.x = -200;
         this.nextWave();
@@ -664,8 +728,12 @@ export class GameLoop {
         if (e.state === 'WINDUP' || e.state === 'ATTACK') attacking++;
         if (e.health > 0 && e.state !== 'DOWNED') alive++;
       }
+      // G5 — the tier owns the breathing gap (authored 0.22 s = PRO) and the
+      // flank ring depth (authored 70/125 px = PRO). Bodies and damage never
+      // move with either.
+      const tier = getDifficulty();
       if (attacking > 0) {
-        this.attackGapTimer = 0.22; // hold the door while anyone is committed
+        this.attackGapTimer = tier.attackGap; // hold the door while anyone is committed
       } else if (this.attackGapTimer > 0) {
         this.attackGapTimer -= effectiveDt;
       }
@@ -701,17 +769,21 @@ export class GameLoop {
           if (e.type === 'SNIPER') continue; // holds its own long lane
           const side = flankSlot % 2 === 0 ? 1 : -1;
           const ring = Math.floor(flankSlot / 2) % 2;
-          e.targetOffset = side * (70 + ring * 55);
+          e.targetOffset = side * (70 + ring * 55) * tier.flankRingScale;
           flankSlot++;
         }
       }
 
+      // G7: in the arena every dummy may act (the drill is about the player's
+      // mechanics, not about queueing turns); live contracts keep the token.
+      const training = trainingIsActive();
       for (const enemy of this.enemies) {
-        const canAttack =
-          enemy.tokenPicked &&
-          enemy.health > 0 &&
-          enemy.state !== 'DOWNED' &&
-          enemy.state !== 'STAGGER';
+        const canAttack = training
+          ? enemy.health > 0 && enemy.state !== 'DOWNED'
+          : enemy.tokenPicked &&
+            enemy.health > 0 &&
+            enemy.state !== 'DOWNED' &&
+            enemy.state !== 'STAGGER';
         enemy.adaptive = this.adaptiveScale;
 
         enemy.update(
@@ -740,8 +812,22 @@ export class GameLoop {
         if (this.onStateChange) this.onStateChange();
       }
 
+      // G7 — the Training Arena has no death: the fighter is topped up the
+      // moment a hit would have finished them (the hit itself still lands,
+      // so the drill reads like a real fight). The magazine is kept fed so
+      // the checklist never stalls on logistics.
+      if (training) {
+        const p = this.player.physics;
+        if (p.health <= 0) {
+          p.health = 1;
+          p.isReloading = false;
+          p.reloadTimer = 0;
+        }
+        this.player.trainingTopUp();
+      }
+
       // 5b. PLAYER DEATH -> cinematic slow-mo kill cam, then game-over freeze
-      if (!this.isGameOver && !this.isDying && this.player.physics.health <= 0) {
+      if (!this.isGameOver && !this.isDying && this.player.physics.health <= 0 && !training) {
         this.isDying = true;
         this.dyingTimer = 1.4;
         this.combatDirector.slowMoFactor = 0.22;

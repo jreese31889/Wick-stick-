@@ -15,11 +15,39 @@
  *       string (light / slam / flying kick), the air-slam landing commitment,
  *       the shrunken crouch hurtbox, and the enemy DIVE jump-in that the
  *       whole high/low triangle hangs off.
+ *   A5  G5 difficulty tiers: floors above the human startle baseline, PRO is
+ *       the shipped baseline, aim/decision pacing separates the tiers, HP and
+ *       damage never move with a tier, and the live reactions (gunshot ALERT,
+ *       shot-at COVER, poise-break RETREAT) land only after the tier latency.
+ *   A6  G7 Training Arena: the checklist is inert outside the drill, every one
+ *       of the eight marks fires from the real combat path, the drill writes
+ *       no progression, and the three dummy roles behave as shipped.
  */
 import { Camera } from './src/engine/Camera';
 import { CombatDirector } from './src/engine/CombatDirector';
 import { EnemyController } from './src/engine/EnemyController';
 import { PlayerController } from './src/engine/PlayerController';
+import {
+  BASE_AIM_SPREAD,
+  DIFFICULTY_TIERS,
+  MIN_HUMAN_REACTION,
+  aimSpreadPx,
+  currentDifficulty,
+  getDifficulty,
+  reactionDelay,
+  setDifficulty,
+} from './src/engine/Difficulty';
+import type { DifficultyProfile, DifficultyTier } from './src/engine/Difficulty';
+import {
+  TRAINING_CHECKS,
+  trainingIsActive,
+  trainingIsDone,
+  trainingMark,
+  trainingProgress,
+  trainingResetChecks,
+  trainingSetActive,
+} from './src/engine/TrainingRoom';
+import { PROGRESS_EVENTS, onProgress } from './src/profile/ProgressEvents';
 import type { InputState } from './src/types/game';
 
 const DT = 1 / 60;
@@ -552,6 +580,403 @@ function strikeConnects(crouch: boolean, box: { y: number; radius: number }): bo
   check('RUSHER rolls a low (SWEEP)', (rusher['SWEEP'] || 0) > 0, `n=${rusher['SWEEP'] || 0}`);
   check('ACROBAT rolls a jump-in (DIVE)', (acrobat['DIVE'] || 0) > 0, `n=${acrobat['DIVE'] || 0}`);
   check('ACROBAT rolls a low (SWEEP)', (acrobat['SWEEP'] || 0) > 0, `n=${acrobat['SWEEP'] || 0}`);
+}
+
+// ---------------------------------------------------------------- A5
+console.log('\nA5 — G5 difficulty tiers (behaviour only)');
+{
+  const TIERS: DifficultyTier[] = ['rookie', 'pro', 'continental'];
+
+  // 1 — every floor sits at or above the human startle baseline, and the
+  //     tiers are strictly ordered (ROOKIE flinches slowest).
+  const floors = TIERS.map(t => DIFFICULTY_TIERS[t].reactionMin);
+  check('every tier floor is at or above the human reaction baseline',
+    floors.every(f => f >= MIN_HUMAN_REACTION), `floors=${floors.join('/')}`);
+  check('the reaction floors are strictly ordered (rookie > pro > continental)',
+    floors[0] > floors[1] && floors[1] > floors[2], `${floors[0]} > ${floors[1]} > ${floors[2]}`);
+
+  // 2 — PRO is the shipped baseline: every scale 1.0, authored numbers intact.
+  const pro = DIFFICULTY_TIERS.pro;
+  check('PRO reproduces the shipped baseline (all scales = 1)',
+    pro.aimSpreadScale === 1 && pro.decisionCooldownScale === 1 &&
+    pro.defenseChanceScale === 1 && pro.flankRingScale === 1);
+  check('PRO keeps the authored squad gap (0.22 s)', pro.attackGap === 0.22, `gap=${pro.attackGap}`);
+  check('PRO keeps the authored aim error band (22 px)',
+    aimSpreadPx(pro) === BASE_AIM_SPREAD, `px=${aimSpreadPx(pro)}`);
+
+  // 3 — aim error tightens by tier and never collapses to a laser.
+  const spread = TIERS.map(t => aimSpreadPx(DIFFICULTY_TIERS[t]));
+  check('aim error tightens by tier and never collapses to a laser',
+    spread[0] > spread[1] && spread[1] > spread[2] && spread[2] > 4,
+    spread.map(s => s.toFixed(1)).join('/'));
+
+  // 4 — no profile can schedule a sub-human reaction, however it is authored.
+  const cheated: DifficultyProfile = { ...pro, reactionMin: 0, reactionJitter: 0 };
+  const draws = Array.from({ length: 64 }, () => reactionDelay(cheated));
+  check('reaction latency is clamped to the human floor',
+    draws.every(d => d >= MIN_HUMAN_REACTION), `min=${Math.min(...draws).toFixed(3)}`);
+
+  // 5 — every draw lands inside [floor, floor + jitter].
+  let bandOk = true;
+  for (const t of TIERS) {
+    const p = DIFFICULTY_TIERS[t];
+    for (let i = 0; i < 250; i++) {
+      const d = reactionDelay(p);
+      if (d < p.reactionMin - 1e-9 || d > p.reactionMin + p.reactionJitter + 1e-9) {
+        bandOk = false;
+      }
+    }
+  }
+  check('every latency draw stays inside the tier band', bandOk);
+
+  // 6 — a tier never moves a hit point or a damage number.
+  const vitals = TIERS.map(t => {
+    setDifficulty(t);
+    const e = new EnemyController(`vit-${t}`, 0, 0, 'BASIC');
+    const hp = e.maxHealth;
+    const applied = e.takeDamage(30, 100, -50, false);
+    return `${hp}/${e.maxHealth}/${applied}`;
+  });
+  check('a tier never touches HP or damage',
+    new Set(vitals).size === 1, vitals.join('  '));
+
+  // 7 — the decision pace separates the tiers (PRO = the shipped 1 s drain).
+  function framesToCooldownZero(tier: DifficultyTier): number {
+    setDifficulty(tier);
+    const e = new EnemyController(`drain-${tier}`, 0, 0, 'BASIC');
+    e.attackCooldown = 1.0;
+    e.state = 'IDLE';
+    let f = 0;
+    while (e.attackCooldown > 0 && f < 400) {
+      e.update(DT, { x: 5000, y: 0 }, 'IDLE', true, false);
+      f++;
+    }
+    return f;
+  }
+  const rookF = framesToCooldownZero('rookie');
+  const proF = framesToCooldownZero('pro');
+  const contF = framesToCooldownZero('continental');
+  check('the decision pace separates the tiers',
+    rookF < proF && proF < contF, `rookie=${rookF} pro=${proF} continental=${contF}`);
+  check('PRO drains a decision cooldown exactly as shipped',
+    Math.abs(proF - 60) <= 2, `pro=${proF} frames (shipped = 60)`);
+
+  // 8 — a live armed reaction waits out the tier latency before it lands.
+  setDifficulty('pro');
+  const react = new EnemyController('react', 0, 0, 'BASIC');
+  react.state = 'IDLE';
+  react.armReaction('ALERT');
+  const armedAt = react.pendingReaction;
+  let frames = 0;
+  while (react.pendingReaction >= 0 && frames < 120) {
+    react.update(DT, { x: 200, y: 0 }, 'IDLE', true, false);
+    frames++;
+  }
+  check('arming a reaction schedules it, it does not fire now',
+    armedAt >= 0.3 - 1e-9 && armedAt <= 0.52 + 1e-9, `armed=${armedAt.toFixed(3)}`);
+  check('the reaction lands only after the tier latency',
+    react.pendingReaction === -1 && frames >= 18, `frames=${frames} (floor = 18)`);
+  check('the fighter actually reacts — the guard comes up',
+    (react.state as string) === 'BLOCK', `state=${react.state}`);
+
+  // 9 — one committed round tells the room (GUNSHOT → ALERT).
+  const w = makeWorld();
+  setDifficulty('pro');
+  resetTarget(w, -300); // behind the muzzle: heard, never hit
+  step(w);
+  w.input.shoot = true;
+  w.input.shootJustPressed = true;
+  step(w);
+  w.input.shoot = false;
+  w.input.shootJustPressed = false;
+  const heard = w.enemies[0];
+  check('the round leaves the chamber',
+    w.player.physics.ammo === w.player.gunState.PISTOL.magSize - 1,
+    `ammo=${w.player.physics.ammo}`);
+  check('the room hears the shot (ALERT armed at range)',
+    heard.pendingReaction >= 0.3 - 1e-9, `pending=${heard.pendingReaction.toFixed(3)}`);
+  let heardFrames = 0;
+  while (heard.pendingReaction >= 0 && heardFrames < 120) {
+    heard.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+    heardFrames++;
+  }
+  check('the guard comes up only after the latency, not on the frame',
+    heardFrames >= 18 && heard.state === 'BLOCK',
+    `frames=${heardFrames} state=${heard.state}`);
+
+  // 10 — shot at: break for the prop, hold the seat, drop it on the clock.
+  setDifficulty('pro');
+  const cover = new EnemyController('cover', 0, 0, 'BASIC');
+  cover.state = 'IDLE';
+  cover.armReaction('COVER', 300, 1);
+  let land = 0;
+  while (cover.pendingReaction >= 0 && land < 120) {
+    cover.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+    land++;
+  }
+  check('the cover reaction arms a seat, not a panic',
+    cover.pendingReaction === -1 && cover.coverTargetX === 300,
+    `seat=${cover.coverTargetX} frames=${land}`);
+  let walk = 0;
+  while (walk < 400 && cover.coverTargetX !== null &&
+         Math.abs(cover.coverTargetX - cover.position.x) > 10) {
+    cover.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+    walk++;
+  }
+  check('the fighter closes on the seat',
+    cover.coverTargetX !== null && Math.abs(cover.coverTargetX - cover.position.x) <= 10,
+    `x=${cover.position.x.toFixed(0)} seat=${cover.coverTargetX} frames=${walk}`);
+  cover.update(DT, { x: 0, y: 0 }, 'IDLE', true, false); // the seat latches
+  check('and digs in behind it', (cover.state as string) === 'BLOCK', `state=${cover.state}`);
+  let seatFrames = 0;
+  while (cover.coverTargetX !== null && seatFrames < 400) {
+    cover.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+    seatFrames++;
+  }
+  check('the seat is held for the whole clock, then given up',
+    cover.coverTargetX === null && seatFrames > 0 && seatFrames <= 180,
+    `held=${seatFrames} frames`);
+  // A seat already held / a cooldown in flight downgrades the request to a
+  // plain ALERT, so the seat never re-arms the same prop on the same clock.
+  cover.armReaction('COVER', 300, 1);
+  let reland = 0;
+  while (cover.pendingReaction >= 0 && reland < 120) {
+    cover.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+    reland++;
+  }
+  check('the cover cooldown downgrades a second request instead of spamming it',
+    cover.pendingReaction === -1 && cover.coverTargetX === null,
+    `seat=${cover.coverTargetX} frames=${reland}`);
+
+  // 11 — poise broken: back out, then re-engage.
+  setDifficulty('pro');
+  const retreat = new EnemyController('retreat', 100, 0, 'BASIC');
+  retreat.state = 'IDLE';
+  retreat.guardBreak();
+  check('a poise break arms the retreat reaction',
+    retreat.pendingReaction >= 0.22 - 1e-9 && (retreat.state as string) === 'STAGGER',
+    `pending=${retreat.pendingReaction.toFixed(3)} state=${retreat.state}`);
+  let free = 0;
+  while (
+    free < 400 &&
+    !(retreat.retreatTimer > 0 && (retreat.state === 'IDLE' || retreat.state === 'APPROACH'))
+  ) {
+    retreat.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+    free++;
+  }
+  check('the retreat clock survives the stagger and reaches the fighter',
+    retreat.retreatTimer > 0, `timer=${retreat.retreatTimer.toFixed(2)} frames=${free}`);
+  retreat.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+  check('the fighter backs away from the one who broke the guard',
+    (retreat.state as string) === 'APPROACH' && retreat.velocity.x > 0,
+    `state=${retreat.state} vx=${retreat.velocity.x.toFixed(0)}`);
+
+  // 12 — the tier is a stored setting that round-trips and cannot be faked.
+  setDifficulty('rookie');
+  const back = currentDifficulty();
+  const backId = getDifficulty().id;
+  setDifficulty('nope' as DifficultyTier);
+  const fallback = currentDifficulty();
+  check('the tier round-trips through the setter',
+    back === 'rookie' && backId === 'rookie', `id=${back}/${backId}`);
+  check('an unknown tier falls back to PRO', fallback === 'pro', `id=${fallback}`);
+
+  setDifficulty('pro');
+}
+
+// ---------------------------------------------------------------- A6
+console.log('\nA6 — G7 Training Arena (checklist + dummy roles)');
+{
+  // 1 — the board is inert until the drill owns the run.
+  trainingSetActive(false);
+  trainingResetChecks();
+  trainingMark('JUMP_ATTACK');
+  check('the checklist ignores marks outside the drill',
+    !trainingIsDone('JUMP_ATTACK') && trainingProgress().done === 0,
+    `done=${trainingProgress().done}`);
+
+  // 2 — the board itself: eight authored mechanics, no duplicates.
+  check('the board ships exactly the eight promised mechanics',
+    TRAINING_CHECKS.length === 8, `n=${TRAINING_CHECKS.length}`);
+  check('checklist ids are unique',
+    new Set(TRAINING_CHECKS.map(c => c.id)).size === TRAINING_CHECKS.length);
+  check('every mechanic is written down with a hint',
+    TRAINING_CHECKS.every(c => c.label.length > 0 && c.hint.length > 0));
+
+  trainingSetActive(true);
+  trainingResetChecks();
+  check('entering the drill arms a clean board',
+    trainingIsActive() && trainingProgress().done === 0 && trainingProgress().total === 8,
+    `p=${trainingProgress().done}/${trainingProgress().total}`);
+
+  // 3 — every mark is fired by the real state machine, one tick at a time.
+  const w = makeWorld();
+  step(w); // sync the director onto IDLE
+
+  w.player.physics.grounded = false;
+  w.player.physics.position.y = -140;
+  w.player.forceState('ATTACK_FLYING_KICK');
+  step(w);
+  check('JUMP_ATTACK fires from the real state machine',
+    trainingIsDone('JUMP_ATTACK'), `state=${w.player.physics.state}`);
+
+  w.player.forceState('ATTACK_AIR_LIGHT');
+  step(w);
+  check('AIR_MOVE fires from the real state machine',
+    trainingIsDone('AIR_MOVE'), `state=${w.player.physics.state}`);
+
+  w.player.physics.grounded = true;
+  w.player.physics.position.y = 0;
+  w.player.forceState('ATTACK_CROUCH_POKE');
+  step(w);
+  check('CROUCH_ATTACK fires from the real state machine',
+    trainingIsDone('CROUCH_ATTACK'), `state=${w.player.physics.state}`);
+
+  w.player.forceState('ATTACK_SPECIAL');
+  step(w);
+  check('SPECIAL fires from the real state machine',
+    trainingIsDone('SPECIAL'), `state=${w.player.physics.state}`);
+
+  w.player.forceState('ATTACK_SUPER');
+  step(w);
+  check('SUPER fires from the real state machine',
+    trainingIsDone('SUPER'), `state=${w.player.physics.state}`);
+
+  // PISTOL WHIP — a body at arm's length, no round burned.
+  w.player.forceState('IDLE');
+  step(w);
+  resetTarget(w, 40);
+  w.player.physics.position.x = 0;
+  w.player.physics.facingRight = true;
+  const whipAmmo = w.player.physics.ammo;
+  w.input.shoot = true;
+  w.input.shootJustPressed = true;
+  step(w);
+  w.input.shoot = false;
+  w.input.shootJustPressed = false;
+  check('PISTOL_WHIP fires from the real shoot path',
+    trainingIsDone('PISTOL_WHIP'), `state=${w.player.physics.state}`);
+  check('the whip burns no round',
+    w.player.physics.ammo === whipAmmo, `${whipAmmo}->${whipAmmo === w.player.physics.ammo ? 'held' : w.player.physics.ammo}`);
+  // The whip banks hit-stop frames; the sim would skip the next frames whole.
+  w.director.hitStopFrames = 0;
+
+  // SLIDE FIRE — the round commits, the SLIDE pose is never stolen.
+  w.enemies[0].position.x = 400;
+  w.player.physics.isSliding = true;
+  w.player.physics.velocity.x = 320;
+  w.player.forceState('SLIDE');
+  const slideAmmo = w.player.physics.ammo;
+  w.input.shoot = true;
+  w.input.shootJustPressed = true;
+  step(w);
+  w.input.shoot = false;
+  w.input.shootJustPressed = false;
+  check('SLIDE_FIRE commits a round mid-slide',
+    trainingIsDone('SLIDE_FIRE'), `ammo=${w.player.physics.ammo}`);
+  check('the round really left',
+    w.player.physics.ammo === slideAmmo - 1, `${slideAmmo}->${w.player.physics.ammo}`);
+  check('the slide keeps the pose — no gun-shoot state, no cancel',
+    w.player.physics.state === 'SLIDE' && w.player.physics.isSliding,
+    `state=${w.player.physics.state} sliding=${w.player.physics.isSliding}`);
+
+  // TAKEDOWN — the checklist ticks, the drill writes nothing.
+  const events: string[] = [];
+  const offEvents = onProgress(e => events.push(e.type));
+  w.director.hitStopFrames = 0;
+  w.player.forceState('IDLE');
+  step(w);
+  resetTarget(w, 44);
+  w.input.grabJustPressed = true;
+  step(w);
+  w.input.grabJustPressed = false;
+  check('the grab locks on', w.enemies[0].state === 'GRAPPLED',
+    `state=${w.enemies[0].state}`);
+  const slamFrames = until(w, () => trainingIsDone('TAKEDOWN'), 90);
+  check('TAKEDOWN fires from the real grapple',
+    trainingIsDone('TAKEDOWN'), `frames=${slamFrames}`);
+  check('the same takedown writes no progression while the drill runs',
+    !events.includes(PROGRESS_EVENTS.EXECUTION), events.join(',') || '(silent)');
+  offEvents();
+
+  // 4 — a drill never writes progression, not even the damage tally.
+  const hits: string[] = [];
+  const offHits = onProgress(e => hits.push(e.type));
+  trainingSetActive(false);
+  w.player.takeDamage(5, 0, 0);
+  check('outside the drill the damage tally reports',
+    hits.includes(PROGRESS_EVENTS.PLAYER_DAMAGED), hits.join(',') || '(none)');
+  hits.length = 0;
+  trainingSetActive(true);
+  w.player.takeDamage(5, 0, 0);
+  check('inside the drill the damage tally is silent',
+    !hits.includes(PROGRESS_EVENTS.PLAYER_DAMAGED), hits.join(',') || '(none)');
+  offHits();
+
+  // 5 — the drill keeps the guns fed, but never papers over a reload.
+  w.player.physics.isReloading = false;
+  w.player.physics.ammo = 1;
+  w.player.trainingTopUp();
+  check('the drill tops the gun straight back up',
+    w.player.physics.ammo === w.player.gunState.PISTOL.magSize,
+    `ammo=${w.player.physics.ammo}`);
+  w.player.physics.isReloading = true;
+  w.player.physics.ammo = 1;
+  w.player.trainingTopUp();
+  check('a reload in flight is never papered over',
+    w.player.physics.ammo === 1, `ammo=${w.player.physics.ammo}`);
+  w.player.physics.isReloading = false;
+
+  // 6 — the three spawnable dummy roles.
+  const bag = new EnemyController('bag', 60, 0, 'BASIC');
+  bag.dummyMode = 'IDLE';
+  bag.state = 'IDLE';
+  for (let i = 0; i < 240; i++) bag.update(DT, { x: 0, y: 0 }, 'IDLE', true, false);
+  check('the sandbag never decides to act',
+    bag.state === 'IDLE' && bag.activeHitbox === null, `state=${bag.state}`);
+  bag.armReaction('ALERT');
+  check('the sandbag processes no reactions', bag.pendingReaction === -1);
+  const bagHp = bag.health;
+  bag.takeDamage(30, 100, -50, false);
+  check('the sandbag still reads as a real hit',
+    bag.health === bagHp - 30 && (bag.state as string) === 'HURT',
+    `state=${bag.state} hp=${bag.health}`);
+
+  const shooter = new EnemyController('shooter', 0, 0, 'BASIC');
+  shooter.dummyMode = 'SHOOTER';
+  shooter.dodgeChance = 0;
+  shooter.attackCooldown = 0;
+  shooter.state = 'IDLE';
+  let fired = false;
+  for (let i = 0; i < 180 && !fired; i++) {
+    shooter.update(DT, { x: 310, y: 0 }, 'IDLE', true, true);
+    if (shooter.pendingShots.length > 0) fired = true;
+  }
+  check('the SHOOTER dummy runs the shipped gunner lane and fires',
+    fired, `state=${shooter.state} shots=${shooter.pendingShots.length}`);
+
+  const attacker = new EnemyController('attacker', 60, 0, 'BASIC');
+  attacker.dummyMode = 'ATTACKER';
+  attacker.dodgeChance = 0;
+  attacker.attackCooldown = 0;
+  attacker.state = 'IDLE';
+  let woundUp = false;
+  for (let i = 0; i < 180 && !woundUp; i++) {
+    attacker.update(DT, { x: 0, y: 0 }, 'IDLE', true, true);
+    if ((attacker.state as string) === 'WINDUP') woundUp = true;
+  }
+  check('the ATTACKER dummy still swings (melee, no round)',
+    woundUp && attacker.pendingShots.length === 0,
+    `state=${attacker.state} shots=${attacker.pendingShots.length}`);
+
+  // 7 — leave the room the way the UI does.
+  trainingSetActive(false);
+  trainingResetChecks();
+  setDifficulty('pro');
+  check('leaving the drill disarms the board',
+    !trainingIsActive() && trainingProgress().done === 0);
+  check('the tier is back on the shipped baseline',
+    currentDifficulty() === 'pro' && getDifficulty().id === 'pro');
 }
 
 console.log(failures === 0 ? '\nALL GREEN' : `\n${failures} FAILURE(S)`);

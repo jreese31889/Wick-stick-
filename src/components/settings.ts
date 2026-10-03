@@ -1,5 +1,7 @@
 import { SoundFX } from '../engine/SoundFX';
 import { Music } from '../engine/Music';
+import { DIFFICULTY_TIERS, DIFFICULTY_ORDER } from '../engine/Difficulty';
+import type { DifficultyTier } from '../engine/Difficulty';
 
 /**
  * Shared menu state: persistent settings (audio / graphics), persistent run
@@ -13,6 +15,9 @@ export type Quality = 'low' | 'medium' | 'high';
 
 /** PHASE 3 4 — aim magnetism strength (Low is the shipped PHASE 1B cone). */
 export type AimAssistLevel = 'off' | 'low' | 'high';
+
+/** G5 — enemy-behaviour tier. Re-exported so menu code has one import. */
+export type { DifficultyTier } from '../engine/Difficulty';
 
 /** PHASE 3 2 — the touch controls a custom layout may reposition. */
 export type TouchControlId =
@@ -53,6 +58,12 @@ export interface GameSettings {
   musicVolume: number;
   /** Graphics quality tier driving the CSS effect budget. */
   quality: Quality;
+  /**
+   * G5 — difficulty tier. Scales enemy BEHAVIOR only (reaction latency, aim
+   * spread, decision pacing, flank/rush timing, poise-break retreat); never
+   * HP or damage. 'pro' is the shipped baseline.
+   */
+  difficulty: DifficultyTier;
   /** Show the FPS chip in the HUD (visible on xl+ layouts). */
   showFps: boolean;
   /** PHASE 1B E6: gameplay haptics (pad rumble + phone vibration). */
@@ -84,6 +95,7 @@ export const DEFAULT_SETTINGS: GameSettings = {
   sfxVolume: 100,
   musicVolume: 70,
   quality: 'high',
+  difficulty: 'pro',
   showFps: true,
   haptics: true,
   padMoveDeadzone: 15,
@@ -120,6 +132,18 @@ export const QUALITY_OPTIONS: { id: Quality; label: string; blurb: string }[] = 
     blurb: 'Full effects: frosted blur, glow shadows, animated HUD and vignette.',
   },
 ];
+
+/**
+ * G5 — difficulty tiers for the Options picker. Labels and blurbs come
+ * straight from the engine profile, so the UI can never drift from the
+ * numbers EnemyController actually runs on.
+ */
+export const DIFFICULTY_OPTIONS: { id: DifficultyTier; label: string; blurb: string }[] =
+  DIFFICULTY_ORDER.map((id) => ({
+    id,
+    label: DIFFICULTY_TIERS[id].label,
+    blurb: DIFFICULTY_TIERS[id].blurb,
+  }));
 
 export interface GameProgress {
   /** Stage ids the player has beaten (unlocks the next stage). */
@@ -212,6 +236,10 @@ function sanitizeAimAssist(value: unknown, fallback: AimAssistLevel): AimAssistL
   return value === 'off' || value === 'low' || value === 'high' ? value : fallback;
 }
 
+function sanitizeDifficulty(value: unknown, fallback: DifficultyTier): DifficultyTier {
+  return value === 'rookie' || value === 'pro' || value === 'continental' ? value : fallback;
+}
+
 export function loadSettings(): GameSettings {
   const raw = readJson(SETTINGS_KEY);
   if (!raw) return { ...DEFAULT_SETTINGS };
@@ -223,6 +251,7 @@ export function loadSettings(): GameSettings {
     sfxVolume: clamp(Math.round(num(raw.sfxVolume, DEFAULT_SETTINGS.sfxVolume)), 0, 100),
     musicVolume: clamp(Math.round(num(raw.musicVolume, DEFAULT_SETTINGS.musicVolume)), 0, 100),
     quality,
+    difficulty: sanitizeDifficulty(raw.difficulty, DEFAULT_SETTINGS.difficulty),
     showFps: typeof raw.showFps === 'boolean' ? raw.showFps : DEFAULT_SETTINGS.showFps,
     haptics: typeof raw.haptics === 'boolean' ? raw.haptics : DEFAULT_SETTINGS.haptics,
     // PHASE 3 — input polish

@@ -1,6 +1,8 @@
 import React from 'react';
-import { X, Lock, Check, Play, Swords, Users, Crown, Zap } from 'lucide-react';
+import { X, Lock, Check, Play, Swords, Users, Crown, Zap, Target, Crosshair } from 'lucide-react';
 import type { GameProgress } from './settings';
+import { DIFFICULTY_TIERS } from '../engine/Difficulty';
+import type { DifficultyTier } from '../engine/Difficulty';
 
 export interface StageDef {
   id: number;
@@ -85,6 +87,22 @@ export const STAGES: StageDef[] = [
   },
 ];
 
+/**
+ * G7 — the Training Arena's stand-in stage. Deliberately NOT in `STAGES`: it
+ * never enters the authored ladder, never unlocks anything and can never be
+ * mistaken for a contract by progression code (id 0, wave 1).
+ */
+export const TRAINING_STAGE: StageDef = {
+  id: 0,
+  name: 'Training Arena',
+  venue: 'Dojo Range',
+  subtitle: 'Practice',
+  wave: 1,
+  encounter: 'Spawnable dummies',
+  spawn: 'squad',
+  squad: 3,
+};
+
 /** A stage unlocks once the stage before it has been cleared. */
 export function isStageUnlocked(stage: StageDef, progress: GameProgress): boolean {
   if (stage.id === 1) return true;
@@ -107,7 +125,11 @@ function encounterIcon(stage: StageDef) {
 interface StageSelectModalProps {
   isOpen: boolean;
   progress: GameProgress;
+  /** G5 — active difficulty tier, shown as a chip on the board header. */
+  difficulty: DifficultyTier;
   onSelect: (stage: StageDef) => void;
+  /** G7 — launches the Training Arena (spawnable dummies + checklist). */
+  onTraining: () => void;
   onClose: () => void;
 }
 
@@ -118,7 +140,9 @@ interface StageSelectModalProps {
 export const StageSelectModal: React.FC<StageSelectModalProps> = ({
   isOpen,
   progress,
+  difficulty,
   onSelect,
+  onTraining,
   onClose,
 }) => {
   if (!isOpen) return null;
@@ -145,13 +169,21 @@ export const StageSelectModal: React.FC<StageSelectModalProps> = ({
               </span>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-neutral-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
-            title="Close"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            <span
+              className="px-2.5 py-1 rounded-lg border font-mono text-[10px] font-bold uppercase tracking-widest bg-amber-500/10 border-amber-400/50 text-amber-300"
+              title="Enemy behaviour tier — scaled by Options → Difficulty. HP and damage never change."
+            >
+              {DIFFICULTY_TIERS[difficulty].label}
+            </span>
+            <button
+              onClick={onClose}
+              className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-neutral-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+              title="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         <div className="flex gap-3 overflow-x-auto pb-2 snap-x snap-mandatory -mx-1 px-1">
@@ -215,6 +247,43 @@ export const StageSelectModal: React.FC<StageSelectModalProps> = ({
               </button>
             );
           })}
+
+          {/* G7 — Training Arena: always unlocked, never a contract. */}
+          <button
+            onClick={onTraining}
+            className="snap-start shrink-0 w-[210px] sm:w-[230px] min-h-[190px] rounded-xl border p-3.5 text-left flex flex-col gap-2 transition-all cursor-pointer bg-neutral-900/90 border-sky-500/40 hover:border-sky-300 hover:bg-neutral-900 active:scale-[0.98]"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-eyebrow font-mono uppercase text-neutral-500">Practice</span>
+              <span className="flex items-center gap-1 text-[9px] font-mono font-bold uppercase px-1.5 py-0.5 rounded bg-sky-500/20 text-sky-300 border border-sky-500/40">
+                <Target className="w-3 h-3" /> Open
+              </span>
+            </div>
+
+            <div className="font-black uppercase tracking-wide text-sm text-neutral-100 leading-tight">
+              Training Arena
+            </div>
+            <div className="text-[10px] font-mono uppercase tracking-wider text-neutral-500">
+              Spawnable dummies • instant reset
+            </div>
+
+            <div className="mt-auto flex items-center gap-2 rounded-lg bg-black/50 border border-white/10 px-2.5 py-2">
+              <Crosshair className="w-4 h-4 shrink-0 text-sky-400" />
+              <span className="text-[10px] font-mono text-neutral-300 leading-snug">
+                Run the mechanic checklist — no death, no contract
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between text-[10px] font-mono">
+              <span className="text-neutral-500">CHECKLIST</span>
+              <span className="text-sky-300 font-bold">8 mechanics</span>
+            </div>
+
+            <span className="flex items-center justify-center gap-1.5 min-h-[40px] rounded-lg bg-gradient-to-r from-sky-500 to-cyan-400 text-black text-[11px] font-black uppercase tracking-widest">
+              <Play className="w-3.5 h-3.5 fill-current" />
+              Enter
+            </span>
+          </button>
         </div>
 
         <div className="flex items-center justify-between gap-3 pt-1 border-t border-white/10 text-[10px] font-mono text-neutral-400">

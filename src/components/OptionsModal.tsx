@@ -14,9 +14,15 @@ import {
   Smartphone,
   Move,
   Music2,
+  Swords,
 } from 'lucide-react';
 import type { GameSettings } from './settings';
-import { AIM_ASSIST_OPTIONS, DEFAULT_SETTINGS, QUALITY_OPTIONS } from './settings';
+import {
+  AIM_ASSIST_OPTIONS,
+  DEFAULT_SETTINGS,
+  DIFFICULTY_OPTIONS,
+  QUALITY_OPTIONS,
+} from './settings';
 
 interface OptionsModalProps {
   isOpen: boolean;
@@ -202,6 +208,47 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
                 <button
                   key={option.id}
                   onClick={() => onChange({ quality: option.id })}
+                  className={`min-h-[52px] rounded-xl border px-3 py-2.5 text-left transition-all cursor-pointer ${
+                    active
+                      ? 'bg-gradient-to-r from-amber-500/25 to-yellow-500/15 border-amber-400 shadow-[0_0_16px_rgba(245,158,11,0.3)]'
+                      : 'bg-neutral-900 border-white/10 hover:border-white/25'
+                  }`}
+                >
+                  <div
+                    className={`text-xs font-black uppercase tracking-widest ${
+                      active ? 'text-amber-300' : 'text-neutral-300'
+                    }`}
+                  >
+                    {option.label}
+                  </div>
+                  <div className="text-[10px] font-mono text-neutral-400 leading-snug mt-0.5">
+                    {option.blurb}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* DIFFICULTY TIER — G5 (behaviour only, never HP) */}
+        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5 space-y-3">
+          <div>
+            <div className={LABEL}>
+              <Swords className="w-4 h-4 text-amber-400" />
+              Difficulty
+            </div>
+            <div className={BLURB}>
+              Changes how enemies react and decide — never their health or damage. PRO is the
+              shipped baseline.
+            </div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {DIFFICULTY_OPTIONS.map((option) => {
+              const active = settings.difficulty === option.id;
+              return (
+                <button
+                  key={option.id}
+                  onClick={() => onChange({ difficulty: option.id })}
                   className={`min-h-[52px] rounded-xl border px-3 py-2.5 text-left transition-all cursor-pointer ${
                     active
                       ? 'bg-gradient-to-r from-amber-500/25 to-yellow-500/15 border-amber-400 shadow-[0_0_16px_rgba(245,158,11,0.3)]'

@@ -6,6 +6,7 @@ import { SoundFX } from './SoundFX';
 import { Ragdoll } from './Ragdoll';
 import { GUNS, GUN_ORDER, GunId, isGun } from './Weapons';
 import { emitProgress, PROGRESS_EVENTS } from '../profile/ProgressEvents';
+import { trainingIsActive } from './TrainingRoom';
 import type { RunProfile } from '../profile/Progression';
 
 /** Rate-limited step toward a target: reaches it exactly, at any frame rate. */
@@ -375,6 +376,26 @@ export class PlayerController {
   /** Focus costs a flat chunk to trigger — never below 0 after the spend. */
   private static readonly FOCUS_COST = 35;
 
+  /**
+   * G7 — Training Arena only. Keeps every owned gun topped up between shots
+   * so the mechanic checklist never stalls on logistics. Skipped while a
+   * reload is in flight so the HUD and the reload state stay truthful.
+   */
+  public trainingTopUp(): void {
+    if (this.physics.isReloading) return;
+    for (let i = 0; i < GUN_ORDER.length; i++) {
+      const id = GUN_ORDER[i];
+      const gun = this.gunState[id];
+      if (!gun.owned) continue;
+      gun.ammo = gun.magSize;
+      gun.reserve = GUNS[id].reserveMax;
+    }
+    const held = this.gunState[this.currentGun];
+    this.physics.ammo = held.ammo;
+    this.physics.maxAmmo = held.magSize;
+    this.physics.reserveAmmo = held.reserve;
+  }
+
   public triggerFocus(): boolean {
     if (this.physics.focus >= PlayerController.FOCUS_COST && !this.physics.isFocusActive) {
       this.physics.focus = Math.max(0, this.physics.focus - PlayerController.FOCUS_COST);
@@ -475,7 +496,8 @@ export class PlayerController {
     if (taken > 0) {
       this.waveDamageTaken += taken;
       this.hurtFlash = 1;
-      emitProgress(PROGRESS_EVENTS.PLAYER_DAMAGED, { amount: taken });
+      // G7: a drill never writes progression — not even the damage tally.
+      if (!trainingIsActive()) emitProgress(PROGRESS_EVENTS.PLAYER_DAMAGED, { amount: taken });
     }
     this.physics.velocity.x = knockbackX;
     this.physics.velocity.y = knockbackY;
@@ -711,6 +733,12 @@ export class PlayerController {
 
     // FINISH SLIDE OR ROLL
     if (this.physics.isSliding) {
+      // G7 SLIDE-FIRE: the slide holds the body, the gun does not — a SHOOT
+      // press mid-slide runs the same deferred trigger the standing site
+      // runs, and the round still leaves (ammo, casing, tracer, sound). The
+      // pose and the momentum stay put, so the mechanic is fire-while-sliding
+      // rather than a slide cancel.
+      if (input.shootJustPressed) this.tryFireWeapon(input);
       if (this.physics.stateTimer > 0.42 || Math.abs(this.physics.velocity.x) < 80) {
         this.physics.isSliding = false;
         this.setState('IDLE');
@@ -777,50 +805,7 @@ export class PlayerController {
     }
 
     // TACTICAL GUN-FU / SHOTGUN / KNIFE THROW TRIGGER
-    if (input.shootJustPressed && !this.physics.isBlocking && !this.physics.isDodging && !this.physics.isSliding) {
-      if (this.physics.equippedWeapon === 'KNIFE') {
-        // Hurl tactical knife across arena!
-        this.hasThrownKnifeThisFrame = true;
-        this.physics.equippedWeapon = 'UNARMED';
-        this.setState('ATTACK_LIGHT_1');
-        return;
-      }
-
-      if (this.physics.equippedWeapon === 'SHOTGUN') {
-        if (this.physics.weaponDurability > 0) {
-          this.physics.weaponDurability--;
-          this.hasFiredBulletThisShot = true;
-          this.setState('ATTACK_GUN_SHOT');
-          SoundFX.playGunshot();
-          SoundFX.playPunch('slam');
-          const recoilDir = this.physics.facingRight ? -1 : 1;
-          this.physics.velocity.x = recoilDir * 220;
-          if (this.physics.weaponDurability <= 0) {
-            this.physics.equippedWeapon = 'UNARMED';
-          }
-          return;
-        }
-      }
-
-      // Non-pistol firearms defer to the salvo path (pellets / per-gun stats)
-      if (this.currentGun !== 'PISTOL') {
-        if (this.physics.isReloading || this.gunCooldown > 0) return;
-        if (this.physics.ammo <= 0) {
-          SoundFX.playGunCock();
-          this.beginReload();
-          return;
-        }
-        this.gunCooldown = GUNS[this.currentGun].fireInterval;
-        this.pendingSalvoShot = true;
-        return;
-      }
-
-      // Pistol: defer the whole resolution (point-blank PISTOL WHIP, real
-      // shot, or empty-chamber click) to CombatDirector — it is the only
-      // system with a view of live enemy range. No ammo is spent here.
-      this.pendingPistolShot = true;
-      return;
-    }
+    if (this.tryFireWeapon(input)) return;
 
     // Arsenal automatics (SMG): holding SHOOT keeps firing while the cooldown lapses
     const autoStats = GUNS[this.currentGun];
@@ -1354,6 +1339,65 @@ export class PlayerController {
         if (speed >= 170) return 'RUN';
         return speed >= 26 ? 'WALK' : 'IDLE';
     }
+  }
+
+  /**
+   * The SHOOT trigger, shared verbatim by the standing site and the slide
+   * (G7's SLIDE-FIRE). Returns true when the press was consumed, so the
+   * caller stops exactly where the old inline block used to.
+   *
+   * While a slide is live the fighter keeps the SLIDE pose: no gun-shoot
+   * state and no recoil write, but the round still leaves — ammo, casing,
+   * tracer and report all behave as they do standing up.
+   */
+  private tryFireWeapon(input: InputState): boolean {
+    if (!input.shootJustPressed || this.physics.isBlocking || this.physics.isDodging) return false;
+    const sliding = this.physics.isSliding;
+
+    if (this.physics.equippedWeapon === 'KNIFE') {
+      // Hurl tactical knife across arena!
+      this.hasThrownKnifeThisFrame = true;
+      this.physics.equippedWeapon = 'UNARMED';
+      if (!sliding) this.setState('ATTACK_LIGHT_1');
+      return true;
+    }
+
+    if (this.physics.equippedWeapon === 'SHOTGUN') {
+      if (this.physics.weaponDurability > 0) {
+        this.physics.weaponDurability--;
+        this.hasFiredBulletThisShot = true;
+        if (!sliding) this.setState('ATTACK_GUN_SHOT');
+        SoundFX.playGunshot();
+        SoundFX.playPunch('slam');
+        if (!sliding) {
+          const recoilDir = this.physics.facingRight ? -1 : 1;
+          this.physics.velocity.x = recoilDir * 220;
+        }
+        if (this.physics.weaponDurability <= 0) {
+          this.physics.equippedWeapon = 'UNARMED';
+        }
+        return true;
+      }
+    }
+
+    // Non-pistol firearms defer to the salvo path (pellets / per-gun stats)
+    if (this.currentGun !== 'PISTOL') {
+      if (this.physics.isReloading || this.gunCooldown > 0) return true;
+      if (this.physics.ammo <= 0) {
+        SoundFX.playGunCock();
+        this.beginReload();
+        return true;
+      }
+      this.gunCooldown = GUNS[this.currentGun].fireInterval;
+      this.pendingSalvoShot = true;
+      return true;
+    }
+
+    // Pistol: defer the whole resolution (point-blank PISTOL WHIP, real
+    // shot, or empty-chamber click) to CombatDirector — it is the only
+    // system with a view of live enemy range. No ammo is spent here.
+    this.pendingPistolShot = true;
+    return true;
   }
 
   private setState(newState: AnimationState): void {
