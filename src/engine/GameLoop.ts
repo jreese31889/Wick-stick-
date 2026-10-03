@@ -14,6 +14,9 @@ import { emitProgress, PROGRESS_EVENTS } from '../profile/ProgressEvents';
 import type { RunProfile } from '../profile/Progression';
 import { getDifficulty } from './Difficulty';
 import { trainingSetActive, trainingIsActive, trainingResetChecks } from './TrainingRoom';
+import { replayBuffer, REPLAY_HZ, REPLAY_NO_SLOT, REPLAY_PROJ_BULLET, REPLAY_PROJ_BLADE, REPLAY_PROJ_KNIFE } from './ReplayBuffer';
+import { clearEliminations, latestPlayerDeath, PLAYER_ID, PLAYER_NAME, enemyDisplayName, enemyWeaponId } from './Elimination';
+import { DeathCam, DEATH_CAM_FREEZE_SECONDS } from './DeathCam';
 
 export class GameLoop {
   public inputManager = new InputManager();
@@ -39,6 +42,28 @@ export class GameLoop {
   public isGameOver = false;
   private isDying = false;
   private dyingTimer = 0;
+  /**
+   * Latched the moment the fighter goes down. The old `!isDying && !isGameOver`
+   * guard let the death block re-fire in the one frame between the Death Cam
+   * ending and game-over landing — this makes "this life is over" a fact, not
+   * a function of two timers that can be simultaneously false.
+   */
+  private deathHandled = false;
+  /**
+   * DEATH CAM (owner spec §3): owns the 0.6 s freeze beat, the camera
+   * transition and the reconstruction. Reading `replaying` is how every other
+   * system knows the replay owns the screen.
+   */
+  public readonly deathCam = new DeathCam(replayBuffer);
+  /** 15 Hz snapshot cadence accumulator for the replay recorder. */
+  private replaySnapshotAccum = 0;
+  /**
+   * Set the frame the Death Cam ends on. The canvas is deliberately not
+   * repainted that frame, so the replay's closing black survives until React
+   * has the end screen up — otherwise the eye catches one flash of the live
+   * room between them.
+   */
+  private holdDeathEndFrame = false;
 
   // Performance telemetry
   public fps = 60;
@@ -117,6 +142,11 @@ export class GameLoop {
   constructor() {
     // Warm the real SFX sample bank (fetch + decode) before the first fight.
     SoundFX.preload();
+    // Phase flips must reach the React HUD inside the frame they happen —
+    // the overlay mounts on TRANSITION and unmounts when the sequence ends.
+    this.deathCam.onPhaseChange = () => {
+      if (this.onStateChange) this.onStateChange();
+    };
     this.environmentManager.setupRoomForWave(1);
     this.spawnSquad(1);
   }
@@ -132,6 +162,9 @@ export class GameLoop {
   }
 
   public setPaused(paused: boolean): void {
+    // The Death Cam owns the screen from the freeze beat onward — pausing
+    // would strand the player between two overlays, so the input is dropped.
+    if (this.deathCam.running) return;
     if (this.isPaused === paused) return;
     this.isPaused = paused;
     if (this.isPaused) {
@@ -146,6 +179,126 @@ export class GameLoop {
   /** P6B-02: forces the next paused/idle frame to repaint (used on resize). */
   public requestIdleRender(): void {
     this.idleRenderDue = true;
+  }
+
+  /**
+   * DEATH CAM — one frame of the reconstruction. The sim is already held by
+   * the caller; this only advances the replay clock, re-poses every body from
+   * records and eases the camera. Game-over lands the moment the sequence
+   * ends, whichever side ended it (normal tail, or the overlay's SKIP).
+   */
+  private stepDeathCam(dt: number): void {
+    const running = this.deathCam.update(
+      dt,
+      this.viewWidth,
+      this.viewHeight,
+      this.camera,
+      this.enemies,
+      this.renderer
+    );
+    // The scene is still, so the only moving listener is the framing itself.
+    SoundFX.setListenerX(this.camera.x);
+    this.renderer.updateParticles(dt);
+    if (!running) this.syncDeathCamEnd();
+  }
+
+  /** Consumes the Death Cam's end latch exactly once, then opens game-over. */
+  private syncDeathCamEnd(): void {
+    if (!this.deathCam.consumeFinished()) return;
+    if (this.isGameOver) return;
+    this.isGameOver = true;
+    this.holdDeathEndFrame = true;
+    if (this.onStateChange) this.onStateChange();
+  }
+
+  /**
+   * Fresh life, fresh history: drops any half-built sequence and rewinds both
+   * rings, so a new fight can never inherit a stale kill record or a replay
+   * window that still holds last run's bodies.
+   */
+  private resetDeathSequence(): void {
+    this.deathHandled = false;
+    this.holdDeathEndFrame = false;
+    this.deathCam.abort();
+    replayBuffer.clear();
+    clearEliminations();
+    this.replaySnapshotAccum = 0;
+  }
+
+  /**
+   * REPLAY RECORDER (owner spec §1) — one 15 Hz snapshot of the world as the
+   * player actually saw it: poses, weapon/aim state, health and every round or
+   * blade in flight, stamped with the camera that framed them. Zero allocations
+   * (every value is a primitive written straight into the ring's DataView).
+   *
+   * Called after combat resolution and after the camera settled, so a lethal
+   * blow and the frame it landed in are committed against the same clock.
+   */
+  private captureReplaySnapshot(): void {
+    const rb = replayBuffer;
+    const p = this.player;
+    rb.beginSnapshot(this.camera.x, this.camera.y, this.camera.zoom);
+
+    const pp = p.physics;
+    const playerSlot = rb.slotFor(PLAYER_ID, PLAYER_NAME, 'player', 'BASIC');
+    rb.writeActor(
+      playerSlot,
+      pp.position.x,
+      pp.position.y,
+      pp.velocity.x,
+      pp.velocity.y,
+      pp.facingRight,
+      pp.state,
+      pp.stateTimer,
+      pp.health,
+      pp.maxHealth,
+      pp.health > 0,
+      p.precisionAim,
+      pp.state === 'ATTACK_GUN_SHOT',
+      pp.grounded,
+      p.physics.equippedWeapon
+    );
+
+    for (const enemy of this.enemies) {
+      const slot = rb.slotFor(enemy.id, enemyDisplayName(enemy.type), 'enemy', enemy.type);
+      if (slot < 0) continue;
+      const ranged = enemy.type === 'GUNNER' || enemy.type === 'SNIPER';
+      rb.writeActor(
+        slot,
+        enemy.position.x,
+        enemy.position.y,
+        enemy.velocity.x,
+        enemy.velocity.y,
+        enemy.facingRight,
+        enemy.state,
+        enemy.stateTimer,
+        enemy.health,
+        enemy.maxHealth,
+        enemy.health > 0,
+        // GUNNERS telegraph the shot through WINDUP, recoil through ATTACK —
+        // both read straight off the recorded state id, no extra flag needed.
+        ranged && enemy.state === 'WINDUP',
+        ranged && enemy.state === 'ATTACK' && enemy.stateTimer < 0.12,
+        enemy.grounded,
+        enemyWeaponId(enemy.type)
+      );
+    }
+
+    for (const b of this.combatDirector.enemyBullets) {
+      rb.writeProjectile(b.x, b.y, b.vx, b.vy, REPLAY_PROJ_BULLET, rb.slotOf(b.ownerId ?? ''));
+    }
+    for (const proj of this.environmentManager.projectiles) {
+      rb.writeProjectile(
+        proj.x,
+        proj.y,
+        proj.vx,
+        proj.vy,
+        proj.type === 'KNIFE' ? REPLAY_PROJ_KNIFE : REPLAY_PROJ_BLADE,
+        REPLAY_NO_SLOT
+      );
+    }
+
+    rb.endSnapshot();
   }
 
   /**
@@ -338,6 +491,7 @@ export class GameLoop {
     this.isGameOver = false;
     this.isDying = false;
     this.dyingTimer = 0;
+    this.resetDeathSequence();
     // P3-02: hand the kill-cam body back to the pool before dropping it
     if (this.player.ragdoll) {
       ragdollPool.release(this.player.ragdoll);
@@ -400,6 +554,7 @@ export class GameLoop {
     this.isGameOver = false;
     this.isDying = false;
     this.dyingTimer = 0;
+    this.resetDeathSequence();
     this.spawnTrainingDummies();
     this.player.restockAmmo();
     if (this.onStateChange) this.onStateChange();
@@ -433,6 +588,7 @@ export class GameLoop {
     this.isDying = false;
     this.dyingTimer = 0;
     this.isPaused = false;
+    this.resetDeathSequence();
     // P3-02: recycle the old fighter's kill-cam body before the replacement
     if (this.player.ragdoll) {
       ragdollPool.release(this.player.ragdoll);
@@ -468,7 +624,7 @@ export class GameLoop {
     // thumb, they pick it up from the pause menu (or it was already paused).
     this.visibilityHandler = () => {
       if (document.hidden) {
-        if (!this.isPaused && !this.isGameOver) {
+        if (!this.isPaused && !this.isGameOver && !this.deathCam.running) {
           this.setPaused(true);
           // No held buttons while the app sits in the background.
           this.inputManager.releaseAll();
@@ -496,7 +652,9 @@ export class GameLoop {
         this.enemies,
         this.combatDirector,
         this.environmentManager,
-        this.debugMode
+        this.debugMode,
+        // Reconstructed frames paint from the buffer instead of live state.
+        this.deathCam.replaying ? this.deathCam.frame() : null
       );
       this.renderMsAccum += performance.now() - renderStart;
     };
@@ -532,9 +690,14 @@ export class GameLoop {
         if (!this.isPaused && !this.isGameOver && this.onStateChange) this.onStateChange();
       }
 
+      // DEATH CAM: the replay can end inside stepDeathCam, or out here when
+      // the overlay's SKIP button lands from a React event. One latch, one
+      // place to flip game-over — whichever side closed the sequence.
+      this.syncDeathCamEnd();
+
       // skipSim freezes the simulation but still paints (pause / game-over /
-      // hit-stop); renderFrame throttles the paint while an opaque overlay
-      // covers the canvas (10 Hz instead of every rAF).
+      // hit-stop / replay); renderFrame throttles the paint while an opaque
+      // overlay covers the canvas (10 Hz instead of every rAF).
       let skipSim = false;
       let renderFrame = true;
 
@@ -545,6 +708,10 @@ export class GameLoop {
           this.idleRenderDue = false;
           this.lastIdleRenderTime = timestamp;
         }
+      } else if (this.deathCam.replaying) {
+        // The reconstruction re-poses from recorded state — running the sim
+        // under it would fight the buffer for the same bodies.
+        skipSim = true;
       } else if (this.combatDirector.hitStopFrames > 0) {
         // Hit-stop / freeze frames: physics held, but speed lines and trails
         // animate off the wall clock — this path still renders every frame.
@@ -557,12 +724,24 @@ export class GameLoop {
         // resume from the pause menu (its footer promises it) — the state
         // this produces is never read by the frozen simulation.
         if (this.isPaused) this.pollInput();
-        if (renderFrame) renderScene();
+        if (this.deathCam.replaying) this.stepDeathCam(baseDt);
+        // The sequence may have just closed — hold its last (fully black)
+        // frame for one more paint so the end screen lands on black instead
+        // of flashing the live room underneath it.
+        if (renderFrame) {
+          if (!this.holdDeathEndFrame) renderScene();
+          this.holdDeathEndFrame = false;
+        }
         this.animFrameId = requestAnimationFrame(loop);
         return;
       }
 
       const simStart = performance.now();
+
+      // Recorder (owner spec §1): stream clock first, so every damage/shot
+      // marker this frame resolves against the same timestamp the snapshot
+      // committed below will carry.
+      replayBuffer.advance(baseDt);
 
       // PHASE 4: the world is heard from wherever the fighter is standing —
       // one field write, read by SoundFX when a spatial voice is placed.
@@ -826,13 +1005,20 @@ export class GameLoop {
         this.player.trainingTopUp();
       }
 
-      // 5b. PLAYER DEATH -> cinematic slow-mo kill cam, then game-over freeze
-      if (!this.isGameOver && !this.isDying && this.player.physics.health <= 0 && !training) {
+      // 5b. PLAYER DEATH -> Death Cam (spec §3) or the shipped kill-cam.
+      // `deathHandled` latches the instant health crosses zero, so no state
+      // combination downstream can start a second sequence for one life.
+      if (!this.deathHandled && this.player.physics.health <= 0 && !training) {
+        this.deathHandled = true;
         this.isDying = true;
-        this.dyingTimer = 1.4;
+        // Death Cam on -> the 0.6 s freeze beat; off -> legacy 1.4 s slow-mo,
+        // byte-for-byte the flow that shipped before (spec §7).
+        const deathCamOn = this.deathCam.start(latestPlayerDeath());
+        const deathSeconds = deathCamOn ? DEATH_CAM_FREEZE_SECONDS : 1.4;
+        this.dyingTimer = deathSeconds;
         this.combatDirector.slowMoFactor = 0.22;
-        this.combatDirector.slowMoTimer = 1.4;
-        this.combatDirector.speedLinesTimer = 1.2;
+        this.combatDirector.slowMoTimer = deathSeconds;
+        this.combatDirector.speedLinesTimer = Math.min(1.2, deathSeconds);
         this.camera.addTrauma(0.7);
         SoundFX.playPunch('slam');
         // Detach the player into a ragdoll for the kill-cam
@@ -850,8 +1036,13 @@ export class GameLoop {
         this.dyingTimer -= baseDt;
         if (this.dyingTimer <= 0) {
           this.isDying = false;
-          this.isGameOver = true;
-          if (this.onStateChange) this.onStateChange();
+          // Hand the screen to the reconstruction, or fall straight through to
+          // game-over when the replay is off / auto-skipped / out of coverage.
+          if (!this.deathCam.beginReplay(this.enemies, this.viewWidth)) {
+            this.deathCam.abort();
+            this.isGameOver = true;
+            if (this.onStateChange) this.onStateChange();
+          }
         }
       }
 
@@ -886,6 +1077,16 @@ export class GameLoop {
         this.player.physics.facingRight,
         baseDt
       );
+
+      // 6b. REPLAY RECORDER (owner spec §1) — one snapshot at 15 Hz, taken
+      // after combat resolved and after the camera settled, so the frame the
+      // replay restores is the frame the player actually saw.
+      this.replaySnapshotAccum += baseDt;
+      const replayInterval = 1 / REPLAY_HZ;
+      if (this.replaySnapshotAccum >= replayInterval) {
+        this.replaySnapshotAccum -= replayInterval;
+        this.captureReplaySnapshot();
+      }
 
       // 7. PARTICLES UPDATE
       this.renderer.updateParticles(baseDt);

@@ -1,5 +1,43 @@
 import { StickFigurePose, RigJoint, EnemyType } from '../types/game';
-import { EnemyController } from './EnemyController';
+import type { Ragdoll } from './Ragdoll';
+
+/**
+ * DEATH CAM — the exact shape an enemy silhouette needs to be drawn.
+ *
+ * Declared structurally (no EnemyController import) so the replay player can
+ * hand the rig a body it built from recorded states: the live controller
+ * satisfies it unchanged, and a reconstruction never has to fake an AI object.
+ */
+export interface EnemyRigTarget {
+  pose: StickFigurePose;
+  facingRight: boolean;
+  suitColor: string;
+  skinColor: string;
+  shirtColor: string;
+  tieColor: string;
+  isStaggered: boolean;
+  /** Live tumbling body — never drawn during a replay (records have no ragdoll). */
+  ragdoll: Ragdoll | null;
+  health: number;
+  maxHealth: number;
+  ghostHealth: number;
+  staggerMeter: number;
+  maxStagger: number;
+  state: string;
+  position: { x: number; y: number };
+  hpVisibleTimer: number;
+  disarmTimer: number;
+  type: EnemyType;
+  eliteVariant: boolean;
+  lastHitTime: number;
+}
+
+export interface EnemyRigOptions {
+  /** Drop the overhead HP/stagger HUD (the replay overlay owns the screen). */
+  showStatus?: boolean;
+  /** Draw the keyframed pose even when a live ragdoll is attached. */
+  ignoreRagdoll?: boolean;
+}
 
 /** HUD tag + accent colour for every archetype, so new recruits read correctly. */
 const ARCHETYPE_TAGS: Record<EnemyType, [string, string]> = {
@@ -47,11 +85,14 @@ const HP_PCT_LABELS: string[] = (() => {
 export class EnemyRig {
   public render(
     ctx: CanvasRenderingContext2D,
-    enemy: EnemyController,
-    debugMode: boolean = false
+    enemy: EnemyRigTarget,
+    debugMode: boolean = false,
+    opts?: EnemyRigOptions
   ): void {
     const pose = enemy.pose;
     const isStaggered = enemy.isStaggered;
+    const showStatus = opts?.showStatus !== false;
+    const ignoreRagdoll = opts?.ignoreRagdoll === true;
 
     ctx.save();
     ctx.lineCap = 'round';
@@ -59,7 +100,7 @@ export class EnemyRig {
 
     // Ragdoll death: render the tumbling body instead of the keyframed rig
     // (Ragdoll already draws its own dark under-stroke)
-    if (enemy.ragdoll && !enemy.ragdoll.dead) {
+    if (!ignoreRagdoll && enemy.ragdoll && !enemy.ragdoll.dead) {
       enemy.ragdoll.render(ctx, enemy.suitColor, enemy.skinColor);
       ctx.restore();
       return;
@@ -79,7 +120,7 @@ export class EnemyRig {
     this.renderRimLight(ctx, pose);
 
     // 3. Overhead Health & Stun Bar
-    this.renderStatusOverhead(ctx, enemy);
+    if (showStatus) this.renderStatusOverhead(ctx, enemy);
 
     // 3b. Hit-flash: brief white glow on recent damage (cheap: one radial
     // gradient for ~90ms, alpha falls off as the flash expires)
@@ -104,7 +145,7 @@ export class EnemyRig {
   }
 
   /** One full figure pass: back limbs → coat → torso → front limbs → head. */
-  private renderBody(ctx: CanvasRenderingContext2D, enemy: EnemyController, outline: boolean): void {
+  private renderBody(ctx: CanvasRenderingContext2D, enemy: EnemyRigTarget, outline: boolean): void {
     const pose = enemy.pose;
     const facingRight = enemy.facingRight;
     const suit = enemy.suitColor;
@@ -459,7 +500,7 @@ export class EnemyRig {
     }
   }
 
-  private renderStatusOverhead(ctx: CanvasRenderingContext2D, enemy: EnemyController): void {
+  private renderStatusOverhead(ctx: CanvasRenderingContext2D, enemy: EnemyRigTarget): void {
     if (enemy.health <= 0 && enemy.state === 'DOWNED') return;
 
     // Direct User Mandate: Only display health bar when enemy has taken damage recently!

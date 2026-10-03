@@ -9,6 +9,14 @@ import { POSE_JOINTS } from './AnimationController';
 import { StickFigurePose, EnemyBullet } from '../types/game';
 import { PLAYER_STYLE, WEAPON_TINT } from './Palettes';
 import { FIGURE_SCALE } from './StickRig';
+import {
+  DEATH_CAM_FX_AIM,
+  DEATH_CAM_FX_FLASH,
+  DEATH_CAM_FX_RING,
+  DEATH_CAM_FX_SPARK,
+  type DeathCamFrame,
+} from './DeathCam';
+import { REPLAY_PROJ_BULLET, REPLAY_PROJ_BLADE, REPLAY_PROJ_KNIFE } from './ReplayBuffer';
 
 export interface DustParticle {
   x: number;
@@ -401,7 +409,14 @@ export class Renderer {
     enemies: EnemyController[],
     combatDirector: CombatDirector,
     environmentManager?: EnvironmentManager,
-    debugMode: boolean = false
+    debugMode: boolean = false,
+    /**
+     * DEATH CAM (owner spec §4): when set, this frame is a reconstruction —
+     * the live bodies, particles and HUD are swapped for the recorded ones.
+     * The stage, floor, decals, destructibles and screen grade still draw, so
+     * the replay reads as the same room rather than a separate view.
+     */
+    replay: DeathCamFrame | null = null
   ): void {
     // P1-02: cached gradients belong to the context they were built from —
     // a fresh canvas (GameCanvas remount) invalidates the whole set.
@@ -480,9 +495,37 @@ export class Renderer {
       this.renderGlassShards(ctx, environmentManager);
       this.renderDroppedWeapons(ctx, environmentManager);
       this.renderGoldCoins(ctx, environmentManager);
-      this.renderProjectiles(ctx, environmentManager);
       this.renderHealthPacks(ctx, environmentManager);
       this.renderAmmoPacks(ctx, environmentManager);
+    }
+
+    // DEATH CAM — the reconstruction owns everything from here down: the live
+    // actors, dust, aim lanes and combat HUD are replaced by their recorded
+    // equivalents, and the frame closes with the head/tail black that seams
+    // the run into the replay.
+    if (replay) {
+      this.renderReplayActors(ctx, debugMode, replay);
+      this.renderReplayProjectiles(ctx, replay);
+      this.renderReplayFx(ctx, replay);
+      this.renderMuzzleBlooms(ctx);
+      this.renderNearLayer(ctx, camera.x, environmentManager);
+      ctx.restore();
+
+      this.renderColorGrade(ctx, width, height, environmentManager);
+      this.renderVignette(ctx, width, height, camera.traumaLevel * 0.6, 0);
+      this.renderGrain(ctx, width, height);
+      if (replay.fade > 0) {
+        ctx.fillStyle = `rgba(0, 0, 0, ${Math.min(1, replay.fade)})`;
+        ctx.fillRect(0, 0, width, height);
+      }
+      return;
+    }
+
+    // 4b. THROWN KNIVES & BLADES — live only: during a replay the same props
+    // come out of the ring buffer, and drawing both would leave one frozen at
+    // the position it had when the run stopped.
+    if (environmentManager) {
+      this.renderProjectiles(ctx, environmentManager);
     }
 
     // 5. DUST & MOTION PARTICLES
@@ -597,6 +640,153 @@ export class Renderer {
    * frame's view. Bounds already include CULL_PADDING, so callers never need
    * to pad again — anything failing this test is off-canvas by a wide margin.
    */
+  /**
+   * DEATH CAM — the reconstructed bodies.
+   *
+   * The player ghost is re-posed from the buffer's own AnimationController and
+   * rendered through a private StickRig, because the necktie is verlet cloth
+   * pinned to a neck joint: without a fresh pin every frame the tie draws
+   * detached from the collar. Enemies reuse the shipped EnemyRig against their
+   * live controller, which DeathCam has just rewritten from records — the
+   * overhead status plate is dropped because the replay overlay already owns
+   * naming and framing, and the ragdoll is ignored because records carry none.
+   */
+  private renderReplayActors(
+    ctx: CanvasRenderingContext2D,
+    debugMode: boolean,
+    replay: DeathCamFrame
+  ): void {
+    ctx.save();
+    if (replay.playerPose) {
+      this.renderShadow(ctx, replay.playerX, replay.playerY, FIGURE_SCALE);
+    }
+    for (let i = 0; i < replay.enemyCount; i++) {
+      const enemy = replay.enemies[i];
+      if (!this.inView(enemy.position.x, enemy.position.y, 96)) continue;
+      this.renderShadow(ctx, enemy.position.x, enemy.position.y);
+    }
+    ctx.restore();
+
+    for (let i = 0; i < replay.enemyCount; i++) {
+      const enemy = replay.enemies[i];
+      if (!this.inView(enemy.position.x, enemy.position.y, 96)) continue;
+      this.enemyRig.render(ctx, enemy, debugMode, { showStatus: false, ignoreRagdoll: true });
+    }
+
+    if (replay.playerPose) {
+      replay.playerRig.render(
+        ctx,
+        replay.playerPose,
+        replay.playerFacingRight,
+        debugMode,
+        replay.playerWeapon,
+        false,
+        1,
+        1
+      );
+    }
+  }
+
+  /**
+   * DEATH CAM — rounds and blades still in flight at this timestamp, drawn as
+   * short velocity-aligned streaks (matches how the live tracer pass reads).
+   */
+  private renderReplayProjectiles(ctx: CanvasRenderingContext2D, replay: DeathCamFrame): void {
+    if (replay.projectileCount <= 0) return;
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (let i = 0; i < replay.projectileCount; i++) {
+      const p = replay.projectiles[i];
+      const speed = Math.hypot(p.vx, p.vy) || 1;
+      const nx = p.vx / speed;
+      const ny = p.vy / speed;
+      const bullet = p.kind === REPLAY_PROJ_BULLET;
+      const len = bullet ? 15 : p.kind === REPLAY_PROJ_KNIFE ? 22 : 30;
+      ctx.strokeStyle = bullet
+        ? 'rgba(253, 230, 138, 0.92)'
+        : p.kind === REPLAY_PROJ_BLADE
+          ? 'rgba(148, 163, 184, 0.95)'
+          : 'rgba(226, 232, 240, 0.95)';
+      ctx.lineWidth = bullet ? 2 : 3;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - nx * len, p.y - ny * len);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /**
+   * DEATH CAM — impacts, sparks, rings and aim lanes taken from the recorded
+   * event stream. Drawn from the Death Cam's own pool (CombatDirector's live
+   * FX only decay while its update runs, which it does not during a replay),
+   * with the authored lifetime carried in the slot so a flash plays out over
+   * its duration instead of dying on the frame it fired.
+   */
+  private renderReplayFx(ctx: CanvasRenderingContext2D, replay: DeathCamFrame): void {
+    if (replay.fxCount <= 0) return;
+    ctx.save();
+    for (let i = 0; i < replay.fxCount; i++) {
+      const fx = replay.fx[i];
+      const k = Math.max(0, Math.min(1, fx.life / Math.max(1e-4, fx.maxLife)));
+      if (k <= 0) continue;
+      switch (fx.kind) {
+        case DEATH_CAM_FX_FLASH: {
+          const radius = Math.max(1, fx.size * (1.4 - 0.4 * k));
+          const g = ctx.createRadialGradient(fx.x, fx.y, 0, fx.x, fx.y, radius);
+          g.addColorStop(0, 'rgba(255, 255, 255, 1)');
+          g.addColorStop(0.4, fx.color);
+          g.addColorStop(1, 'rgba(0, 0, 0, 0)');
+          ctx.globalAlpha = k;
+          ctx.fillStyle = g;
+          ctx.beginPath();
+          ctx.arc(fx.x, fx.y, radius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          break;
+        }
+        case DEATH_CAM_FX_RING: {
+          const grow = 1 - k;
+          ctx.globalAlpha = k;
+          ctx.strokeStyle = fx.color;
+          ctx.lineWidth = 4 * k + 0.5;
+          ctx.beginPath();
+          ctx.arc(fx.x, fx.y, 8 + fx.size * grow, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+          break;
+        }
+        case DEATH_CAM_FX_SPARK: {
+          ctx.globalAlpha = k;
+          ctx.strokeStyle = fx.color;
+          ctx.lineWidth = 2;
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(fx.x, fx.y);
+          ctx.lineTo(fx.x2, fx.y2);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+          break;
+        }
+        default: {
+          // DEATH_CAM_FX_AIM — the recorded precision-aim lane.
+          ctx.globalAlpha = Math.min(1, k);
+          ctx.strokeStyle = fx.color;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([6, 8]);
+          ctx.beginPath();
+          ctx.moveTo(fx.x, fx.y);
+          ctx.lineTo(fx.x2, fx.y2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+          break;
+        }
+      }
+    }
+    ctx.restore();
+  }
+
   private inView(x: number, y: number, pad: number = 0): boolean {
     return (
       x >= this.viewLeft - pad &&

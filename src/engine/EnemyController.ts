@@ -4,6 +4,7 @@ import { SoundFX } from './SoundFX';
 import { mixPose, translatePose, smoothstep, strikeCurve } from './AnimationController';
 import { Ragdoll, ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
+import { enemyDisplayName, recordDamageEvent, resolveEnemyElimination } from './Elimination';
 import { getDifficulty, reactionDelay, aimSpreadPx } from './Difficulty';
 
 /**
@@ -62,7 +63,19 @@ const AI_THROTTLE_INTERVAL = 1 / 20;
  * CombatDirector.MAX_ENEMY_BULLETS).
  */
 export const enemyBulletPool = new ObjectPool<EnemyBullet>(
-  () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, maxLife: 0, damage: 0, pierceBlock: false }),
+  () => ({
+    x: 0,
+    y: 0,
+    vx: 0,
+    vy: 0,
+    life: 0,
+    maxLife: 0,
+    damage: 0,
+    pierceBlock: false,
+    ownerId: '',
+    ownerName: '',
+    weaponId: '',
+  }),
   80
 );
 
@@ -569,6 +582,18 @@ export class EnemyController {
     this.applyPhysics(dt);
 
     // Procedural Stick Pose Generation
+    this.updatePose(dt);
+  }
+
+  /**
+   * DEATH CAM (spec §9) — re-poses this body from RECORDS only.
+   *
+   * Called by the replay player with a state / phase / transform read out of
+   * the buffer. It runs the shipped pose generator and NOTHING else: no AI
+   * decision, no physics, no damage. The enemy therefore shows exactly what
+   * it did at record time — it is never re-simulated.
+   */
+  public poseFromRecorded(dt: number): void {
     this.updatePose(dt);
   }
 
@@ -1413,6 +1438,21 @@ export class EnemyController {
     this.health = Math.max(0, this.health - applied);
     this.hpVisibleTimer = 3.2; // Show health bar only upon taking damage
     this.lastHitTime = performance.now();
+
+    // DEATH CAM: timestamp the blow and, when it was the killing one, resolve
+    // the attribution record — both while the attack context is still live.
+    if (applied > 0) {
+      recordDamageEvent(
+        this.id,
+        enemyDisplayName(this.type),
+        'enemy',
+        this.position.x,
+        this.position.y,
+        applied,
+        this.type
+      );
+      if (this.health <= 0) resolveEnemyElimination(this, applied);
+    }
 
     // Phase 1 C6: threshold check on the new health total
     if (this.health > 0) this.checkBossPhase();

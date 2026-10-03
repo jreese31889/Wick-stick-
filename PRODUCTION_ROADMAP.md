@@ -6,7 +6,7 @@
 
 Legend: ✅ DONE (ships today) · 🟡 PARTIAL (works, but a documented half of the contract is missing) · ⛔ NEW (does not exist in `src/`).
 
-Summary: **41 features — 31 DONE · 4 PARTIAL · 6 NEW.**
+Summary: **41 features — 31 DONE · 4 PARTIAL · 6 NEW**, plus **H. Death Cam & Kill Replay** (landed in this change set, 8/8 DONE).
 
 ---
 
@@ -106,6 +106,23 @@ One draw is `max(MIN_HUMAN_REACTION, reactionMin) + rand × jitter`, so **0.20 s
 
 ---
 
+## H. Death Cam & kill replay (owner spec 2026-10-03)
+
+| # | Feature | Status | Implementing file / symbol |
+|---|---------|--------|----------------------------|
+| H1 | Rolling replay buffer — 15 Hz snapshots over an 8 s window, hard 160 KiB ceiling: pose, state id + phase, weapon, aiming/recoil/grounded, health, camera, in-flight rounds & blades | ✅ | `src/engine/ReplayBuffer.ts` (`REPLAY_HZ = 15`, `REPLAY_SECONDS = 8`, `REPLAY_SNAPSHOT_SLOTS`, `REPLAY_BYTE_BUDGET`, `byteLength`, `beginSnapshot`/`writeActor`/`writeProjectile`/`endSnapshot`, `ReplaySource` seam) |
+| H2 | Kill attribution — elimination type, weapon, body part, applied damage, killer identity/name/slot and the killer→victim range, stamped at kill time | ✅ | `src/engine/Elimination.ts` (`setAttackContext`, `resolvePlayerElimination`/`resolveEnemyElimination` → `finish`, `latestPlayerDeath`, `clearEliminations`); call sites: `CombatDirector` (melee, special strikes, gun-fu, judo slam, grip execution, thrown-body pin, prop slam) and `EnemyController.takeDamage` |
+| H3 | Death sequence — 0.6 s slow-motion freeze on the ragdoll → camera transition → reconstruction → the existing game-over flow; **off = the shipped flow byte-for-byte** | ✅ | `src/engine/DeathCam.ts` (`start` / `beginReplay` / `update` / `finish` / `skip` / `consumeFinished`, phases `OFF·FREEZE·TRANSITION·REPLAY`), `GameLoop.ts` (`deathHandled`, `stepDeathCam`, `syncDeathCamEnd`, `holdDeathEndFrame`) |
+| H4 | Four framings — `KILLER_CLOSE` / `KILLER_WIDE` / `CINEMATIC` / `OVERHEAD`, auto-selected from the recorded geometry, manually switchable mid-replay with damped easing | ✅ | `DeathCam.autoSelectMode`, `frameCamera`, `fitZoom`, `setMode`; overlay buttons in `src/components/DeathCamOverlay.tsx` |
+| H5 | Replay HUD — ELIMINATED BY, weapon chip, range, elimination type, framing buttons, progress bar + clock, SKIP; progress painted from rAF straight to the DOM | ✅ | `src/components/DeathCamOverlay.tsx` (mounted `App.tsx`, `visible = gameLoop.deathCam.overlayVisible`); Escape and system-back map to SKIP while a replay runs |
+| H6 | Settings — master switch, length 3/4/5/6 s, cinematic, slow motion, camera shake, auto-skip; persisted and sanitised on load | ✅ | `src/components/settings.ts` (`deathCam*` fields, `sanitizeDeathCamDuration`), `ProfileStore.sanitizeSettings`, `OptionsModal.tsx` (DEATH CAM block), applied `App.tsx` → `gameLoop.deathCam.applySettings` |
+| H7 | Replay FX + audio — muzzle flashes, impacts, sparks, rings and aim lanes fired from the recorded event stream; a `SoundFX.timeScale` ramp rides the slow-motion window | ✅ | `DeathCam.pumpEvents` / `spawnFx` / `decayFx` / `clockRate`; `Renderer.renderReplayFx` / `renderReplayProjectiles` / `renderMuzzleBlooms`; `SoundFX.timeScale` applied in `playSample` + `playWorld` |
+| H8 | Headless coverage for H1–H7 | ✅ | `smoke_combat.ts` **section B — 45 checks** (ring wraparound + byte ceiling, five attribution paths, killer position reconstructed at the lethal timestamp, camera auto-select + manual switch, full FREEZE→REPLAY→latch run, skip / auto-skip / off / no-history fallbacks, settings round trip). Suite **172 PASS / 0 FAIL**, exit 0 |
+
+**Byte budget:** ring = 122 slots × 1 186 B = 144 692 B, event ring = 96 × 20 B = 1 920 B → **146 612 B of the 160 KiB ceiling**, asserted every run.
+
+---
+
 ## Phase 1 implementation targets (this change set)
 
 | Pillar | Features | Where |
@@ -177,6 +194,37 @@ Only `CombatDirector.ts`, `EnemyController.ts` and `PlayerController.ts` changed
 - `smoke_combat.ts` drives `CombatDirector`/`EnemyController`/`PlayerController` headlessly but **not** `GameLoop`/`App` — the death floor, dummy spawn list, door/wave gates and panel UI are covered by code review only.
 - This repo has no `@types/react` and `strict` is off, so **JSX props are not type-checked** (`StageSelectModal` `difficulty`/`onTraining`, `TrainingPanel` `onReset`/`onExit`, `OptionsModal` difficulty card). Those were hand-verified against each component's own prop declarations; `tsc` passing does not prove them.
 - Difficulty is stored in `settings` and applied through `App`'s settings effect; a profile written by an older build sanitises to `'pro'`, so the tier is invisible until the player picks one.
+
+## Phase 7 — Death Cam & kill replay (this change set)
+
+**Verification:** `npx tsc --noEmit` green · `npm run build` green · `npx tsx smoke_combat.ts` **172 PASS / 0 FAIL** (`ALL GREEN`, exit 0 — A1–A6 untouched, section **B** new).
+
+**Scope:** new `src/engine/DeathCam.ts`, `src/engine/ReplayBuffer.ts`, `src/engine/Elimination.ts`, `src/components/DeathCamOverlay.tsx`; `GameLoop`, `Renderer`, `EnemyController`, `EnemyRig`, `CombatDirector`, `SoundFX`; settings/profile persistence; `OptionsModal`, `App`; `smoke_combat.ts`.
+
+### Architecture — the replay is a reconstruction, never a video
+
+| Phase | Length | What runs | What the player sees |
+|-------|--------|-----------|----------------------|
+| `FREEZE` | 0.60 s | simulation held, `slowMoFactor` ramped, ragdoll frozen where it fell, `DEATH_CAM_FREEZE_SECONDS` | the killing blow hangs on the body |
+| `TRANSITION` | 0.70 s | **the first 0.7 s of playback** — replay clock starts at `t0`, camera eases from the live pose onto the killer, fade-in over 0.35 s | the world rewinds under a black wipe |
+| `REPLAY` | settings 3/4/5/6 s (default 4) | `ReplaySource` read-back only; no sim, no AI, no `CombatDirector.update` | keyframed actors + recorded FX on loop |
+| end | — | `finish()` → `consumeFinished()` latch → the shipped game-over flow | the closing black is held one extra paint (`holdDeathEndFrame`) so the end screen never flashes the live room |
+
+- **Window:** `start = killTime - 0.7 × duration`, clamped into `[source.startTime, killTime]`; `end = min(start + duration, source.endTime)`; under `MIN_COVERAGE_SECONDS = 1.5` of history the death cam declines and the shipped flow runs untouched.
+- **Ghost player:** a `DeathCam`-owned `AnimationController` + `StickRig`, fed `updatePhysics(vx, vy, facingRight, dt, neck.x, neck.y, flutter)` every frame so the tie keeps fluttering.
+- **Ghost enemies:** live `EnemyController` objects rewritten from the ring then `poseFromRecorded(dt)` — pose only, zero AI, zero damage.
+- **Camera modes:** `autoSelectMode()` → no killer actor ⇒ `OVERHEAD`; killer+victim both fit ⇒ `KILLER_WIDE`; else `KILLER_CLOSE`. `CINEMATIC` is manual-only and gated by `deathCamCinematic`. All four ease through a shared `damp()` so a switch never snaps.
+
+### Honest caveats
+
+- **No ragdoll in the replay.** Bodies are keyframed from the ring, so a ragdoll that came to rest at the end of the run resumes as a standing/downed pose at `t0`. Live death still ragdolls (that is the `FREEZE` beat).
+- **Status plates, boss/combo/style HUD, room banner, damage popups, sniper sights, aim laser, afterimages and live particles do not render during a replay** — they either have no recorded equivalent or would desync. Blood decals, destructibles, dropped weapons, coins, packs, exit door and glass shards do render (they are frozen at the moment of death and correct).
+- **Thrown knives draw once during a replay** (from the ring only) — `renderProjectiles(environmentManager)` is gated to the live path so a frozen live copy cannot double-draw beside the recorded one.
+- **FX come from a dedicated 64-slot pool on `DeathCam`**, not `CombatDirector`'s, because combat particles only decay inside `CombatDirector.update`, which does not run while the sim is held.
+- **`smoke_combat.ts` drives the engine headlessly but not `GameLoop`/`App`** — the freeze/transition/replay/latch ordering, `holdDeathEndFrame` and the overlay/Escape routing are covered by the `DeathCam`-level tests plus code review, not a rendered frame.
+- **JSX props are not type-checked** (no `@types/react`, `strict` off) — `DeathCamOverlay` and the new `OptionsModal` DEATH CAM block were hand-verified against each component's own prop declarations.
+
+**Guardrails held:** settings off ⇒ the pre-existing death path runs unchanged (asserted, not assumed); no damage number, cooldown, hit-stop frame or gun-fu trigger was touched for this feature; `SoundFX.playSample`/`playWorld` signatures unchanged (`playbackRate ×= timeScale` only, reset to 1 on `start`/`finish`/`abort`); pause and `visibilitychange` auto-pause are both blocked while a replay runs; every prior smoke check still passes. No git commit.
 
 ## Phase 2+ backlog (explicitly not in this change set)
 

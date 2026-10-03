@@ -2,9 +2,11 @@
 
 All files were sourced **2026-10-02** from CC0 (public-domain dedication) releases that
 allow direct download without an account. No game code was changed; these are drop-in assets.
+The 12 firearm reports were (re)sliced and dropped in **2026-10-03** for the per-class
+gun banks — see “Firearms” below.
 
 **Processing applied to every file:** single-event slice/trim → downmix to mono →
-44.1 kHz Ogg Vorbis (quality 5) → peak-normalized to −1 dBFS. All files are 5–21 KB.
+44.1 kHz Ogg Vorbis (quality 5) → peak-normalized to −1 dBFS. All files are 5–22 KB.
 
 CC0 1.0 Universal: https://creativecommons.org/publicdomain/zero/1.0/ — commercial use OK,
 no attribution required (credits kept here for provenance).
@@ -16,15 +18,33 @@ no attribution required (credits kept here for provenance).
 Pack: **The Free Firearm Sound Library** — recorded by Ben Jaszczak, Brian Nelson,
 Kevin Heras and Matthew Nanney; preserved on OpenGameArt by **bart**. License: **CC0**.
 Source page: https://opengameart.org/content/the-free-firearm-sound-library
-(direct file: `Prepared SFX Library.7z`; weapon/mic details per the included
-`Prepared Master Sheet.csv`). Single shots sliced from the multi-shot recordings.
+(archive: `Prepared SFX Library.7z`; weapon/mic details per the included
+`Prepared Master Sheet.csv`). Each class's single shots were sliced on silence
+boundaries from the multi-shot studio takes → mono 44.1 kHz → loudnorm (peak −1 dB)
+→ Ogg Vorbis q5.
+
+`SoundFX.ts` loads these into four banks — `PISTOL` / `SMG` / `SHOTGUN` / `RIFLE` — and
+`playGunReport(kind)` only ever picks from the matching bank, so the classes differ by
+what was recorded (no pitch shaping, no synthetic layers).
 
 | File | Original | Recording |
 |---|---|---|
-| `gun_pistol_shot1.ogg` | `1911/A_42P.wav` | Colt 1911, .45 ACP semi-auto pistol, near distance, front of shooter |
-| `gun_pistol_shot2.ogg` | `Walther PPQ/X_39P.wav` | Walther PPQ, 9mm striker pistol, near distance, front of shooter |
-| `gun_pistol_shot3.ogg` | `Smith & Wesson 642/V_27P.wav` | Smith & Wesson 642, .38 Special revolver, near distance |
-| `gun_pistol_shot4.ogg` | `Bersa/F_47P.wav` | Bersa, .380 ACP semi-auto pistol, near distance |
+| `gun_pistol_shot1.ogg` | `1911/A_42P.wav` | Colt 1911, .45 ACP semi-auto pistol — shot 1, near distance, front of shooter |
+| `gun_pistol_shot2.ogg` | `1911/A_42P.wav` | Colt 1911, .45 ACP semi-auto pistol — shot 2 (same take, separate shot) |
+| `gun_pistol_shot3.ogg` | `1911/A_34P.wav` | Colt 1911, .45 ACP semi-auto pistol — separate take |
+| `gun_smg_shot1.ogg` | `G_31P.wav` | Carl Gustav M45 “Swedish K”, 9 mm SMG — shot 1 |
+| `gun_smg_shot2.ogg` | `G_31P.wav` | Carl Gustav M45 “Swedish K”, 9 mm SMG — shot 2 |
+| `gun_smg_shot3.ogg` | `G_31P.wav` | Carl Gustav M45 “Swedish K”, 9 mm SMG — shot 3 |
+| `gun_shotgun_shot1.ogg` | `N_26P.wav` | Mossberg pump shotgun — shot 1 |
+| `gun_shotgun_shot2.ogg` | `N_26P.wav` | Mossberg pump shotgun — shot 2 |
+| `gun_shotgun_shot3.ogg` | `K_22P.wav` | Winchester Model 12 shotgun |
+| `gun_rifle_shot1.ogg` | `C_28P.wav` | AK-47, 7.62×39 — shot 1 |
+| `gun_rifle_shot2.ogg` | `C_28P.wav` | AK-47, 7.62×39 — shot 2 |
+| `gun_rifle_shot3.ogg` | `C_28P.wav` | AK-47, 7.62×39 — shot 3 |
+
+Retired **2026-10-03**: `gun_pistol_shot4.ogg` (was `Bersa/F_47P.wav`, Bersa .380 ACP,
+same pack) — dropped from the pistol bank when the per-class banks landed, so the
+pistol plays the three Colt 1911 slices only. The file itself was removed from the repo.
 
 Pack: **Gun reload sounds** by **SpringySpringo**. License: **CC0**.
 Source page: https://opengameart.org/content/gun-reload-sounds

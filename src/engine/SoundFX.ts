@@ -1,7 +1,7 @@
 /**
  * Sample-based Web Audio sound effects for John Stick.
  *
- * The 20 CC0 recordings in `public/assets/audio` (see SOURCES.md) are fetched
+ * The 28 CC0 recordings in `public/assets/audio` (see SOURCES.md) are fetched
  * and decoded into AudioBuffers once at init, then triggered as one-shots.
  * Every public method keeps the exact signature of the old oscillator synth,
  * so no call site had to change. A sample that fails to fetch/decode is simply
@@ -10,6 +10,11 @@
  *
  * Per-hit `playbackRate` jitter keeps repeated triggers (a punch string, a
  * volley of shots) from sounding machine-gunned.
+ *
+ * REAL GUN REPORTS — each weapon class has its own bank of real firearm
+ * recordings (Colt 1911 / Carl Gustav M45 / Mossberg + Winchester / AK-47,
+ * see SOURCES.md), so the classes differ by what was recorded, not by pitch
+ * shifting. Gun reports play at playbackRate 1.0 with only a ±0.03 detune.
  *
  * PHASE 4 E5/E2 — spatial voices + music ducking:
  *   • World sounds take an optional world-x. Distance from the listener
@@ -28,10 +33,18 @@
 import { Music } from './Music';
 
 const SAMPLE_FILES = {
-  shot1: 'gun_pistol_shot1.ogg',
-  shot2: 'gun_pistol_shot2.ogg',
-  shot3: 'gun_pistol_shot3.ogg',
-  shot4: 'gun_pistol_shot4.ogg',
+  pistolShot1: 'gun_pistol_shot1.ogg',
+  pistolShot2: 'gun_pistol_shot2.ogg',
+  pistolShot3: 'gun_pistol_shot3.ogg',
+  smgShot1: 'gun_smg_shot1.ogg',
+  smgShot2: 'gun_smg_shot2.ogg',
+  smgShot3: 'gun_smg_shot3.ogg',
+  shotgunShot1: 'gun_shotgun_shot1.ogg',
+  shotgunShot2: 'gun_shotgun_shot2.ogg',
+  shotgunShot3: 'gun_shotgun_shot3.ogg',
+  rifleShot1: 'gun_rifle_shot1.ogg',
+  rifleShot2: 'gun_rifle_shot2.ogg',
+  rifleShot3: 'gun_rifle_shot3.ogg',
   reload: 'sfx_reload.ogg',
   gunCock: 'sfx_gun_cock.ogg',
   punchLight: 'sfx_punch_light.ogg',
@@ -52,6 +65,37 @@ const SAMPLE_FILES = {
 
 type SampleId = keyof typeof SAMPLE_FILES;
 
+/** Weapon class reported by `playGunReport`. */
+type GunKind = 'PISTOL' | 'SMG' | 'SHOTGUN' | 'RIFLE';
+
+/**
+ * Real per-class gun banks — every class plays only its own recordings, so a
+ * pistol never sounds like a rifle and no fake pitch-shaping is involved.
+ * Three single-shot slices per class (see SOURCES.md for the source takes).
+ */
+const GUN_BANKS: Record<GunKind, readonly SampleId[]> = {
+  PISTOL: ['pistolShot1', 'pistolShot2', 'pistolShot3'], // Colt 1911 .45 ACP
+  SMG: ['smgShot1', 'smgShot2', 'smgShot3'], // Carl Gustav M45 9 mm
+  SHOTGUN: ['shotgunShot1', 'shotgunShot2', 'shotgunShot3'], // Mossberg / Win Model 12
+  RIFLE: ['rifleShot1', 'rifleShot2', 'rifleShot3'], // AK-47 7.62x39
+};
+
+/** Per-class report level — the recordings are peak-normalised, so this only balances the mix. */
+const GUN_GAINS: Record<GunKind, number> = {
+  PISTOL: 0.5,
+  SMG: 0.36,
+  SHOTGUN: 0.7,
+  RIFLE: 0.6,
+};
+
+/** Light random detune on every gun report (±), so repeats never sound cloned. */
+const GUN_DETUNE = 0.03;
+
+/** Random pick from a real gun bank. */
+function pickGunSample(bank: readonly SampleId[]): SampleId {
+  return bank[(Math.random() * bank.length) | 0];
+}
+
 /** Directory of the CC0 sample pack. */
 const AUDIO_BASE = '/assets/audio/';
 
@@ -62,8 +106,6 @@ const SAMPLE_URLS: Record<SampleId, string> = (() => {
   }
   return urls;
 })();
-
-const GUNSHOT_SAMPLES: SampleId[] = ['shot1', 'shot2', 'shot3', 'shot4'];
 
 /* ---------------- PHASE 4 — spatial voice pool ---------------- */
 
@@ -88,6 +130,14 @@ interface SpatialVoice {
 
 class SoundEngine {
   public enabled: boolean = true;
+
+  /**
+   * Global playback-rate multiplier. The Death Cam's slow-motion ramp drives
+   * this (spec §6 "audio slowed to match") — every voice is scaled by it at
+   * start, so the whole mix follows the replay clock without per-cue calls.
+   * Always reset to 1 when the replay ends.
+   */
+  public timeScale: number = 1;
 
   private ctx: AudioContext | null = null;
   private buffers = new Map<SampleId, AudioBuffer>();
@@ -243,7 +293,7 @@ class SoundEngine {
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       const jittered = jitter > 0 ? rate + (Math.random() * 2 - 1) * jitter : rate;
-      source.playbackRate.value = Math.min(3, Math.max(0.25, jittered));
+      source.playbackRate.value = Math.min(3, Math.max(0.25, jittered * this.timeScale));
 
       const gain = ctx.createGain();
       gain.gain.value = volume;
@@ -293,7 +343,7 @@ class SoundEngine {
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       const jittered = jitter > 0 ? rate + (Math.random() * 2 - 1) * jitter : rate;
-      source.playbackRate.value = Math.min(3, Math.max(0.25, jittered));
+      source.playbackRate.value = Math.min(3, Math.max(0.25, jittered * this.timeScale));
 
       this.spatialize(voice, sourceX, volume);
       source.connect(voice.input);
@@ -327,6 +377,15 @@ class SoundEngine {
   ): void {
     if (x === undefined) this.playSample(id, volume, rate, jitter, delay);
     else this.playWorld(id, volume, x, rate, jitter, delay);
+  }
+
+  /**
+   * One real gun report: a random slice from the class's bank at
+   * playbackRate 1.0 with only the light ±GUN_DETUNE detune — the voicing
+   * comes from the recording itself, never from pitch shaping.
+   */
+  private fireGun(kind: GunKind, x?: number): void {
+    this.fire(pickGunSample(GUN_BANKS[kind]), GUN_GAINS[kind], x, 1, GUN_DETUNE);
   }
 
   /** Swing / whiff air movement. Pitch parameter scales playbackRate.
@@ -366,39 +425,20 @@ class SoundEngine {
     this.playSample('slide', 0.5, 1, 0.05);
   }
 
-  /** Pistol report: random one of the four real recordings + rate jitter.
+  /** Pistol report: random one of the three real Colt 1911 slices + light detune.
    *  `x` = muzzle position (enemy gunfire passes theirs). */
   public playGunshot(x?: number) {
-    const pick = GUNSHOT_SAMPLES[(Math.random() * GUNSHOT_SAMPLES.length) | 0];
-    this.fire(pick, 0.5, x, 1, 0.06);
+    this.fireGun('PISTOL', x);
   }
 
   /**
-   * Per-weapon report (Phase 1 E4). New method — `playGunshot()` keeps its
-   * exact shipped signature, so every existing call site is untouched.
-   * The four guns are voiced from the same sample bank via rate/volume shaping.
+   * Per-weapon report (Phase 1 E4). `playGunshot()` keeps its exact shipped
+   * signature, so every existing call site is untouched. Each class picks from
+   * its OWN real recording bank at playbackRate 1.0 — no fake pitch-shaping and
+   * no synthetic layer; the guns sound different because the recordings are.
    */
-  public playGunReport(kind: 'PISTOL' | 'SMG' | 'SHOTGUN' | 'RIFLE', x?: number) {
-    const pick = GUNSHOT_SAMPLES[(Math.random() * GUNSHOT_SAMPLES.length) | 0];
-    switch (kind) {
-      case 'SMG':
-        // Crisp, dry and rapid — lighter gain, slight up-pitch
-        this.fire(pick, 0.36, x, 1.18, 0.07);
-        break;
-      case 'SHOTGUN':
-        // Deep boom: down-pitched report + a body thud underneath
-        this.fire(pick, 0.7, x, 0.62, 0.05);
-        this.fire('slam', 0.4, x, 0.7, 0.05, 0.01);
-        break;
-      case 'RIFLE':
-        // Long, hard crack — down-pitch with a touch more gain
-        this.fire(pick, 0.6, x, 0.82, 0.04);
-        break;
-      case 'PISTOL':
-      default:
-        this.playGunshot(x);
-        break;
-    }
+  public playGunReport(kind: GunKind, x?: number) {
+    this.fireGun(kind in GUN_BANKS ? kind : 'PISTOL', x);
   }
 
   /** Explosive-barrel detonation (Phase 1 D3/E4): slammed low boom. */

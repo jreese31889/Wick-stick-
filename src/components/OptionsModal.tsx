@@ -15,11 +15,13 @@ import {
   Move,
   Music2,
   Swords,
+  Film,
 } from 'lucide-react';
 import type { GameSettings } from './settings';
 import {
   AIM_ASSIST_OPTIONS,
   DEFAULT_SETTINGS,
+  DEATH_CAM_DURATIONS,
   DIFFICULTY_OPTIONS,
   QUALITY_OPTIONS,
 } from './settings';
@@ -73,6 +75,48 @@ const Slider: React.FC<{
     />
   </div>
 );
+
+/**
+ * DEATH CAM §7 — the four switches beside the master toggle. Each entry owns
+ * its own getter/setter so the patch stays a literal and the compiler checks
+ * every key against GameSettings.
+ */
+const DEATH_CAM_TOGGLES: {
+  id: string;
+  label: string;
+  blurb: string;
+  get: (s: GameSettings) => boolean;
+  set: (v: boolean) => Partial<GameSettings>;
+}[] = [
+  {
+    id: 'cinematic',
+    label: 'Cinematic',
+    blurb: 'Extra framings + vignette push',
+    get: (s) => s.deathCamCinematic,
+    set: (v) => ({ deathCamCinematic: v }),
+  },
+  {
+    id: 'slowmo',
+    label: 'Slow motion',
+    blurb: 'Rate drop + audio on the blow',
+    get: (s) => s.deathCamSlowMotion,
+    set: (v) => ({ deathCamSlowMotion: v }),
+  },
+  {
+    id: 'shake',
+    label: 'Camera shake',
+    blurb: 'Trauma on replay impacts',
+    get: (s) => s.deathCamShake,
+    set: (v) => ({ deathCamShake: v }),
+  },
+  {
+    id: 'autoskip',
+    label: 'Auto skip',
+    blurb: 'Skip replay after the freeze',
+    get: (s) => s.deathCamAutoSkip,
+    set: (v) => ({ deathCamAutoSkip: v }),
+  },
+];
 
 /**
  * Options: master SFX volume, graphics quality tier, the HUD FPS chip and the
@@ -472,6 +516,98 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
             <Move className="w-4 h-4" />
             Edit touch layout
           </button>
+        </div>
+
+        {/* DEATH CAM — kill replay (owner spec 2026-10-03) */}
+        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5 space-y-3">
+          <div>
+            <div className={LABEL}>
+              <Film className="w-4 h-4 text-amber-400" />
+              Death Cam
+            </div>
+            <div className={BLURB}>
+              On death: a slow-motion freeze, a camera move into the kill, then the run-up rebuilt
+              from the last few seconds. Off keeps the shipped death sequence untouched.
+            </div>
+          </div>
+          <div className={ROW}>
+            <div>
+              <div className="text-[10px] font-mono uppercase tracking-wider text-neutral-400">
+                Kill replay
+              </div>
+              <div className="text-[10px] font-mono text-neutral-500 mt-0.5 leading-snug">
+                Escape / SKIP exits instantly at any point.
+              </div>
+            </div>
+            <button
+              onClick={() => onChange({ deathCam: !settings.deathCam })}
+              className={`min-h-[44px] px-5 rounded-xl border font-black uppercase tracking-widest text-xs transition-all cursor-pointer ${
+                settings.deathCam
+                  ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                  : 'bg-neutral-900 border-white/10 text-neutral-400'
+              }`}
+            >
+              {settings.deathCam ? 'On' : 'Off'}
+            </button>
+          </div>
+
+          <div
+            className={
+              settings.deathCam ? 'space-y-3' : 'space-y-3 opacity-40 pointer-events-none'
+            }
+          >
+            <div>
+              <div className="text-[10px] font-mono uppercase tracking-wider text-neutral-400 mb-1.5">
+                Replay length
+              </div>
+              <div className="grid grid-cols-4 gap-2">
+                {DEATH_CAM_DURATIONS.map((seconds) => {
+                  const active = settings.deathCamDuration === seconds;
+                  return (
+                    <button
+                      key={seconds}
+                      onClick={() => onChange({ deathCamDuration: seconds })}
+                      className={`min-h-[44px] rounded-xl border font-black uppercase tracking-widest text-xs transition-all cursor-pointer ${
+                        active
+                          ? 'bg-gradient-to-r from-amber-500/30 to-yellow-500/15 border-amber-400 shadow-[0_0_16px_rgba(245,158,11,0.3)] text-amber-300'
+                          : 'bg-neutral-900 border-white/10 text-neutral-300 hover:border-white/25'
+                      }`}
+                    >
+                      {seconds}s
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {DEATH_CAM_TOGGLES.map((toggle) => {
+                const value = toggle.get(settings);
+                return (
+                  <div key={toggle.id} className={ROW}>
+                    <div>
+                      <div className="text-[10px] font-mono uppercase tracking-wider text-neutral-400">
+                        {toggle.label}
+                      </div>
+                      <div className="text-[10px] font-mono text-neutral-500 mt-0.5 leading-snug">
+                        {toggle.blurb}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => onChange(toggle.set(!value))}
+                      className={`min-h-[44px] px-5 rounded-xl border font-black uppercase tracking-widest text-xs transition-all cursor-pointer ${
+                        value
+                          ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                          : 'bg-neutral-900 border-white/10 text-neutral-400'
+                      }`}
+                    >
+                      {value ? 'On' : 'Off'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
 
         {/* DANGER ZONE — PHASE 2 profile wipe (two-step confirm) */}

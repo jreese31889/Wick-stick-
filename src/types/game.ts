@@ -375,6 +375,16 @@ export interface EnemyBullet {
   damage: number;
   /** Sniper rounds ignore the player's guard — dodge is the only answer */
   pierceBlock?: boolean;
+  /**
+   * DEATH CAM: who pulled the trigger. The pool erases authorship, but kill
+   * attribution needs it when a round lands lethal — stamped at drain time by
+   * CombatDirector, where the shooter is still known.
+   */
+  ownerId?: string;
+  /** Display name of the shooter, resolved when the round is drained. */
+  ownerName?: string;
+  /** Weapon id of the shooter ('SIDEARM' | 'RIFLE'), stamped at drain time. */
+  weaponId?: string;
 }
 
 export type RoomTheme = 'CONTINENTAL_LOUNGE' | 'NEON_GALLERY' | 'RAINY_ALLEY' | 'PENTHOUSE_SUITE';
@@ -403,3 +413,66 @@ export interface PerkDef {
 /** Combo-meter finishers. Costs are declared on PlayerController. */
 export type SpecialMoveId = 'SPIN_SLASH' | 'EXECUTIONER';
 
+// ============================================================
+// DEATH CAM (owner spec 2026-10-03): kill attribution domain types.
+// Kept in the types module so the recorder, the resolver and the UI all
+// depend on plain data — never on engine classes (no import cycles).
+// ============================================================
+
+/**
+ * How a lethal blow landed, derived from the real damage path it took —
+ * never inferred after the fact. 'FALL' and 'ENVIRONMENT' exist because a
+ * future authoritative stream can resolve them too; the local build only
+ * emits what the shipped combat actually produces.
+ */
+export type EliminationType =
+  | 'SHOT'
+  | 'MELEE'
+  | 'TAKEDOWN'
+  | 'EXECUTION'
+  | 'ENVIRONMENT'
+  | 'EXPLOSION'
+  | 'FALL';
+
+/** Which band of the rig the blow landed in (best effort, from hit zones). */
+export type HitBodyPart = 'HEAD' | 'TORSO' | 'LIMB' | 'NONE';
+
+/**
+ * The resolved answer to "who killed whom, with what, from where".
+ * Built the moment a lethal damage event lands and kept in a small ring, so
+ * the Death Cam can show it even after the killer body is gone — the record
+ * is self-contained (name/weapon/distance copied, never re-derived later).
+ */
+export interface EliminationRecord {
+  /** Victim identity: 'player' or the enemy's spawn id. */
+  victimId: string;
+  victimName: string;
+  /** Killer identity: 'player', an enemy id, or '' for unattributed. */
+  killerId: string;
+  /** Display name resolved AT kill time (killer may be dead/gone by replay). */
+  killerName: string;
+  /** Replay-buffer actor slot of the killer (-1 = not in the window). */
+  killerSlot: number;
+  /** Weapon id ('PISTOL' | 'KATANA' | 'SIDEARM' | 'UNARMED' | ...). */
+  weaponId: string;
+  /** Human label for the overlay, resolved at kill time. */
+  weaponName: string;
+  /** Killer→victim distance at the moment of the kill. */
+  distancePx: number;
+  distanceM: number;
+  type: EliminationType;
+  bodyPart: HitBodyPart;
+  /** Damage that actually landed (after mitigation). */
+  amount: number;
+  /** Replay-buffer clock (seconds) of the lethal event. */
+  timestamp: number;
+  /** World positions at the kill, for framing fallbacks. */
+  killerX: number;
+  killerY: number;
+  lethalX: number;
+  lethalY: number;
+  /** True when the player dealt the kill (kill-feed direction). */
+  byPlayer: boolean;
+  /** True when the player was the victim (drives the Death Cam). */
+  onPlayer: boolean;
+}

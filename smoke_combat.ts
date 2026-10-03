@@ -48,7 +48,35 @@ import {
   trainingSetActive,
 } from './src/engine/TrainingRoom';
 import { PROGRESS_EVENTS, onProgress } from './src/profile/ProgressEvents';
-import type { InputState } from './src/types/game';
+import {
+  REPLAY_BYTE_BUDGET,
+  REPLAY_HZ,
+  REPLAY_NO_SLOT,
+  REPLAY_SNAPSHOT_SLOTS,
+  ReplayBuffer,
+  makeReplaySample,
+  replayBuffer,
+} from './src/engine/ReplayBuffer';
+import {
+  DEATH_CAM_DURATIONS,
+  DeathCam,
+  sanitizeDeathCamDuration,
+} from './src/engine/DeathCam';
+import {
+  clearEliminations,
+  latestPlayerDeath,
+  resolveEnemyElimination,
+  resolvePlayerElimination,
+  setAttackContext,
+} from './src/engine/Elimination';
+import { SoundFX } from './src/engine/SoundFX';
+import {
+  DEFAULT_SETTINGS,
+  loadSettings,
+  saveSettings,
+} from './src/components/settings';
+import type { GameSettings } from './src/components/settings';
+import type { EliminationType, InputState } from './src/types/game';
 
 const DT = 1 / 60;
 const NEARBY_X = 60; // inside every strike window the tests use
@@ -977,6 +1005,257 @@ console.log('\nA6 — G7 Training Arena (checklist + dummy roles)');
     !trainingIsActive() && trainingProgress().done === 0);
   check('the tier is back on the shipped baseline',
     currentDifficulty() === 'pro' && getDifficulty().id === 'pro');
+}
+
+// ---------------------------------------------------------------- B
+console.log('\nB — DEATH CAM & KILL REPLAY (owner spec 2026-10-03)');
+
+// B1 — the recorder ring: it wraps, it keeps the newest frames, and it never
+// blows the documented ceiling (spec §2). Pushing 3× capacity through a fresh
+// ring is what a long run costs, so the window must be a window, not a log.
+{
+  const rb = new ReplayBuffer();
+  const killerSlot = rb.slotFor('ring-killer', 'THE HANDSHAKER', 'enemy', 'BOSS');
+  const frames = REPLAY_SNAPSHOT_SLOTS * 3 + 10;
+  for (let i = 0; i < frames; i++) {
+    rb.advance(1 / REPLAY_HZ);
+    rb.beginSnapshot(i, -60, 1.3);
+    rb.writeActor(killerSlot, 200 + i * 0.1, 0, 60, 0, false, 'WINDUP', 0.02, 80, 100, true, false, false, true, 'KATANA');
+    rb.writeActor(0, 0, 0, 0, 0, true, 'IDLE', 0, 100, 100, true, false, false, true, 'UNARMED');
+    rb.endSnapshot();
+  }
+  check('the ring wraps instead of growing', rb.count === rb.capacity, `${rb.count}/${rb.capacity} slots after ${frames} frames`);
+  check('the window keeps the newest frames after wraparound',
+    rb.startTime > 1 && Math.abs(rb.endTime - rb.now()) < 1e-6,
+    `window ${rb.startTime.toFixed(2)}s → ${rb.endTime.toFixed(2)}s`);
+  check('the recorder stays inside the documented byte budget',
+    rb.byteLength <= REPLAY_BYTE_BUDGET,
+    `${rb.byteLength} B ≤ ${REPLAY_BYTE_BUDGET} B`);
+}
+
+// B2 — kill attribution: every authored EliminationType reaches the record
+// with its weapon, its distance and the right kill-feed direction (spec §1).
+{
+  const victim = new EnemyController('attribution-victim', 60, 0, 'BASIC');
+  const cases: { type: EliminationType; weapon: string; id: string; name: string; player: boolean }[] = [
+    { type: 'SHOT', weapon: 'PISTOL', id: 'player', name: 'JOHN', player: true },
+    { type: 'MELEE', weapon: 'KATANA', id: 'player', name: 'JOHN', player: true },
+    { type: 'TAKEDOWN', weapon: 'UNARMED', id: 'player', name: 'JOHN', player: true },
+    { type: 'EXECUTION', weapon: 'KNIFE', id: 'player', name: 'JOHN', player: true },
+    { type: 'ENVIRONMENT', weapon: 'EXPLOSIVE_BARREL', id: '', name: 'THE BARREL', player: false },
+  ];
+  for (const c of cases) {
+    clearEliminations();
+    victim.health = 0;
+    setAttackContext(c.type, c.id, c.name, c.weapon, 40, -60, 'TORSO');
+    const rec = resolveEnemyElimination(victim, 12);
+    check(`attribution resolves ${c.type} with a range`,
+      !!rec && rec.type === c.type && rec.byPlayer === c.player && rec.weaponName.length > 0 && rec.distanceM > 0,
+      rec ? `${rec.type}/${rec.weaponName} ${rec.distanceM.toFixed(2)}m by=${rec.byPlayer}` : 'no record');
+  }
+  clearEliminations();
+  victim.health = 0;
+  setAttackContext('ENVIRONMENT', '', 'THE BARREL', 'EXPLOSIVE_BARREL', 40, -60, 'TORSO');
+  const envRec = resolveEnemyElimination(victim, 12);
+  check('an environment kill claims no killer slot',
+    !!envRec && envRec.killerSlot === REPLAY_NO_SLOT && !envRec.byPlayer,
+    envRec ? `slot=${envRec.killerSlot}` : 'no record');
+}
+
+// B3 — reconstruction: the killer's recorded position at the lethal timestamp
+// must be the position the replay will show (spec §4/§9).
+const history = (() => {
+  replayBuffer.clear();
+  clearEliminations();
+  const killerId = 'replay-killer';
+  const killerSlot = replayBuffer.slotFor(killerId, 'THE HANDSHAKER', 'enemy', 'BOSS');
+  const playerSlot = replayBuffer.slotFor('player', 'JOHN', 'player', 'BASIC');
+  const frames = 30; // 2 s at 15 Hz
+  let lastKillerX = 0;
+  for (let i = 0; i < frames; i++) {
+    replayBuffer.advance(1 / REPLAY_HZ);
+    lastKillerX = 200 + i * 2;
+    replayBuffer.beginSnapshot(0, -60, 1.3);
+    replayBuffer.writeActor(killerSlot, lastKillerX, 0, 120, 0, false, 'WINDUP', 0.05, 80, 100, true, false, false, true, 'KATANA');
+    replayBuffer.writeActor(playerSlot, 0, 0, 0, 0, true, 'HURT', 0.1, 100, 100, true, false, false, true, 'UNARMED');
+    // One recorded muzzle event, right in the middle of the run-up — the
+    // replay's flash/SFX sync is driven purely off these markers.
+    if (i === 15) replayBuffer.recordShot(killerSlot, 'PISTOL', lastKillerX, -60);
+    replayBuffer.endSnapshot();
+  }
+  setAttackContext('SHOT', killerId, 'THE HANDSHAKER', 'PISTOL', 240, -60, 'HEAD');
+  const record = resolvePlayerElimination('JOHN', 0, 0, 100);
+  return { record, lastKillerX, frames };
+})();
+
+{
+  const { record, lastKillerX } = history;
+  check('a player death resolves into a replay record',
+    !!record && !!latestPlayerDeath() && record.onPlayer && record.killerName === 'THE HANDSHAKER',
+    record ? `${record.type} by ${record.killerName}` : 'no record');
+  check('the lethal timestamp sits on the recorded clock',
+    !!record && Math.abs(record.timestamp - replayBuffer.endTime) < 1e-6,
+    record ? `t=${record.timestamp.toFixed(2)}s end=${replayBuffer.endTime.toFixed(2)}s` : 'no record');
+
+  const dc = new DeathCam(replayBuffer);
+  check('the Death Cam arms on a player death with a full window',
+    dc.start(record), `phase=${dc.phase}`);
+  const at = dc.killerPositionAt(record.timestamp);
+  check('the replay reconstructs the killer at the lethal timestamp',
+    !!at && Math.abs(at.x - lastKillerX) < 1.5,
+    at ? `x=${at.x.toFixed(1)} want≈${lastKillerX}` : 'no sample');
+  const pAt = dc.playerPositionAt(record.timestamp);
+  check('…and the victim beside them',
+    !!pAt && Math.abs(pAt.x) < 1.5, pAt ? `x=${pAt.x.toFixed(1)}` : 'no sample');
+}
+
+// B4 — camera auto-select + the manual switch (spec §4).
+{
+  const sample = makeReplaySample();
+  const a0 = sample.actors[0];
+  a0.slot = 3; a0.kind = 'player'; a0.x = 0; a0.y = 0; a0.alive = true;
+  const a1 = sample.actors[1];
+  a1.slot = 5; a1.kind = 'enemy'; a1.x = 120; a1.y = 0; a1.alive = true;
+  sample.actorCount = 2;
+  check('both bodies readable -> two-shot',
+    DeathCam.autoSelectMode(sample, 960, 5) === 'KILLER_WIDE', DeathCam.autoSelectMode(sample, 960, 5));
+  check('two-shot will not fit -> tight on the killer',
+    DeathCam.autoSelectMode(sample, 200, 5) === 'KILLER_CLOSE', DeathCam.autoSelectMode(sample, 200, 5));
+  sample.actorCount = 1; // killer left the window
+  check('no killer actor in the window -> overhead',
+    DeathCam.autoSelectMode(sample, 960, 5) === 'OVERHEAD', DeathCam.autoSelectMode(sample, 960, 5));
+  check('an unknown slot never frames as a body',
+    DeathCam.autoSelectMode(sample, 960, 99) === 'OVERHEAD', DeathCam.autoSelectMode(sample, 960, 99));
+
+  const manual = new DeathCam(replayBuffer);
+  manual.applySettings({ enabled: true, cinematic: false });
+  manual.setMode('CINEMATIC');
+  check('CINEMATIC is gated off when the setting is off', manual.mode !== 'CINEMATIC', manual.mode);
+  manual.setMode('OVERHEAD');
+  check('a manual switch lands', manual.mode === 'OVERHEAD', manual.mode);
+  manual.setMode('WIDE' as never);
+  check('an unknown mode is ignored', manual.mode === 'OVERHEAD', manual.mode);
+  manual.applySettings({ cinematic: true });
+  manual.setMode('CINEMATIC');
+  check('CINEMATIC arms once the setting allows it', manual.mode === 'CINEMATIC', manual.mode);
+}
+
+// B5 — the sequence itself: freeze → transition → replay → latch, plus the
+// skip path, the auto-skip path and "Death Cam off" (spec §3, §5, §7).
+{
+  const { record } = history;
+  const ghost = new EnemyController('replay-killer', 240, 0, 'BOSS');
+  const cam = new Camera();
+  let blooms = 0;
+  const sink = { spawnMuzzleBloom: () => { blooms++; } };
+  const soundWasOn = SoundFX.enabled;
+  SoundFX.enabled = false;
+
+  try {
+    const dc = new DeathCam(replayBuffer);
+    dc.applySettings({ enabled: true, duration: 3 });
+    check('the freeze beat opens the sequence', dc.start(record) && dc.phase === 'FREEZE', dc.phase);
+    check('the replay is not on screen during the freeze', !dc.replaying && !dc.overlayVisible);
+
+    check('the reconstruction takes the screen', dc.beginReplay([ghost], 960), `phase=${dc.phase}`);
+    check('the replay opens at the head of the window', dc.progress === 0, dc.progress.toFixed(3));
+    check('the window never promises more history than exists',
+      dc.windowSeconds > 0.2 && dc.windowSeconds <= 3 + 1e-6,
+      `${dc.windowSeconds.toFixed(2)}s of a 3s setting`);
+
+    let peak = 0;
+    let frames = 0;
+    while (dc.replaying && frames < 900) {
+      dc.update(1 / 60, 960, 540, cam, [ghost], sink);
+      peak = Math.max(peak, dc.progress);
+      frames++;
+    }
+    check('the replay plays through to the end', dc.phase === 'OFF', `${frames} frames, phase=${dc.phase}`);
+    check('the progress bar reaches 100% before it closes', peak >= 0.999, `peak=${peak.toFixed(3)}`);
+    check('the reconstruction posed the recorded bodies',
+      dc.frame().enemyCount === 1 && dc.frame().playerPose !== null,
+      `enemies=${dc.frame().enemyCount} player=${dc.frame().playerPose ? 'yes' : 'no'}`);
+    check('the end latches exactly once', dc.consumeFinished() && !dc.consumeFinished());
+    check('a finished replay stops driving the audio clock', SoundFX.timeScale === 1);
+
+    const skipper = new DeathCam(replayBuffer);
+    skipper.applySettings({ enabled: true });
+    skipper.start(record);
+    skipper.beginReplay([ghost], 960);
+    skipper.skip();
+    check('SKIP drops straight out of the replay',
+      skipper.phase === 'OFF' && skipper.consumeFinished() && !skipper.consumeFinished());
+
+    const auto = new DeathCam(replayBuffer);
+    auto.applySettings({ enabled: true, autoSkip: true });
+    auto.start(record);
+    check('auto-skip still runs the freeze beat', auto.phase === 'FREEZE', auto.phase);
+    check('auto-skip then refuses the replay', auto.beginReplay([], 960) === false && auto.phase === 'OFF');
+
+    const legacy = new DeathCam(replayBuffer);
+    legacy.applySettings({ enabled: false });
+    check('Death Cam off leaves the shipped flow alone',
+      legacy.start(record) === false && legacy.phase === 'OFF' && !legacy.running);
+
+    const empty = new DeathCam(new ReplayBuffer());
+    check('no recorded history falls back to the shipped flow',
+      empty.start(record) === false && !empty.running);
+  } finally {
+    SoundFX.enabled = soundWasOn;
+  }
+  check('the replay fires the recorded muzzle events', blooms >= 1, `${blooms} blooms`);
+}
+
+// B6 — settings: authored durations, sanitising, and persistence (spec §7).
+{
+  check('the authored duration list is exactly the four',
+    DEATH_CAM_DURATIONS.join(',') === '3,4,5,6', DEATH_CAM_DURATIONS.join(','));
+  check('a bogus duration falls back to the default', sanitizeDeathCamDuration(7, 4) === 4);
+  check('a persisted duration is honoured', sanitizeDeathCamDuration(6, 4) === 6);
+  check('a non-numeric duration falls back', sanitizeDeathCamDuration('wide', 4) === 4);
+
+  const store = new Map<string, string>();
+  const shim = {
+    getItem: (k: string) => (store.has(k) ? (store.get(k) as string) : null),
+    setItem: (k: string, v: string) => { store.set(k, String(v)); },
+    removeItem: (k: string) => { store.delete(k); },
+    clear: () => { store.clear(); },
+    key: () => null,
+    get length() { return store.size; },
+  };
+  const scope = globalThis as unknown as { window?: unknown };
+  const hadWindow = Object.prototype.hasOwnProperty.call(scope, 'window');
+  const prevWindow = scope.window;
+  scope.window = { localStorage: shim };
+  try {
+    saveSettings({
+      ...DEFAULT_SETTINGS,
+      deathCam: false,
+      deathCamDuration: 6,
+      deathCamCinematic: false,
+      deathCamSlowMotion: false,
+      deathCamShake: false,
+      deathCamAutoSkip: true,
+    });
+    const back = loadSettings();
+    check('every death cam setting survives a save/load round trip',
+      back.deathCam === false && back.deathCamDuration === 6 && back.deathCamCinematic === false &&
+      back.deathCamSlowMotion === false && back.deathCamShake === false && back.deathCamAutoSkip === true,
+      `on=${back.deathCam} dur=${back.deathCamDuration} skip=${back.deathCamAutoSkip}`);
+
+    saveSettings({ ...DEFAULT_SETTINGS, deathCamDuration: 42, deathCam: 'yes' } as unknown as GameSettings);
+    const dirty = loadSettings();
+    check('a corrupt death cam block falls back to the shipped defaults',
+      dirty.deathCamDuration === 4 && dirty.deathCam === true,
+      `dur=${dirty.deathCamDuration} on=${dirty.deathCam}`);
+  } finally {
+    if (hadWindow) scope.window = prevWindow;
+    else delete scope.window;
+  }
+  const restored = loadSettings();
+  check('storage back off, the shipped defaults still load',
+    restored.deathCamDuration === 4 && restored.deathCam === true,
+    `dur=${restored.deathCamDuration}`);
 }
 
 console.log(failures === 0 ? '\nALL GREEN' : `\n${failures} FAILURE(S)`);

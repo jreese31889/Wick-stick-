@@ -19,7 +19,14 @@ import {
   UPGRADES,
   type UpgradeId,
 } from './Catalogs';
-import { DEFAULT_SETTINGS, loadSettings, sanitizeTouchLayout, type GameSettings } from '../components/settings';
+import {
+  DEFAULT_SETTINGS,
+  loadSettings,
+  sanitizeTouchLayout,
+  sanitizeDeathCamDuration,
+  type GameSettings,
+} from '../components/settings';
+
 
 export const PROFILE_KEY = 'johnstick-profile-v1';
 export const PROFILE_VERSION = 1;
@@ -174,6 +181,14 @@ function sanitizeSettings(raw: unknown): GameSettings {
     hudOpacity: clampInt(obj.hudOpacity, fallback.hudOpacity, 40, 100),
     touchLayout:
       obj.touchLayout !== undefined ? sanitizeTouchLayout(obj.touchLayout) : fallback.touchLayout,
+    // DEATH CAM §7 — rides along in the profile exactly like the audio/menu
+    // settings, so a wipe never silently changes how the player dies.
+    deathCam: bool(obj.deathCam, fallback.deathCam),
+    deathCamDuration: sanitizeDeathCamDuration(obj.deathCamDuration, fallback.deathCamDuration),
+    deathCamCinematic: bool(obj.deathCamCinematic, fallback.deathCamCinematic),
+    deathCamSlowMotion: bool(obj.deathCamSlowMotion, fallback.deathCamSlowMotion),
+    deathCamShake: bool(obj.deathCamShake, fallback.deathCamShake),
+    deathCamAutoSkip: bool(obj.deathCamAutoSkip, fallback.deathCamAutoSkip),
   };
 }
 

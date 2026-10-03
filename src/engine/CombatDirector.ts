@@ -10,6 +10,18 @@ import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, 
 import { EnvironmentManager } from './EnvironmentManager';
 import { GUNS, falloffMultiplier } from './Weapons';
 import { trainingIsActive, trainingMark } from './TrainingRoom';
+import {
+  ENVIRONMENT_NAME,
+  enemyDisplayName,
+  enemyWeaponId,
+  recordDamageEvent,
+  resetAttackContext,
+  resolveEnemyElimination,
+  resolvePlayerElimination,
+  setAttackContext,
+  setPlayerAttackContext,
+} from './Elimination';
+import { replayBuffer } from './ReplayBuffer';
 
 /**
  * Distance along a ray to a vertical target segment (x = targetX, y within
@@ -462,6 +474,11 @@ export class CombatDirector {
     camera: Camera,
     environmentManager?: EnvironmentManager
   ) {
+    // DEATH CAM: neutral attribution for this frame. Every damage call below
+    // re-stamps the context it needs right before it lands, so a stale
+    // context can never credit the wrong fighter.
+    resetAttackContext();
+
     // 1. Slow motion timer
     if (this.slowMoTimer > 0) {
       this.slowMoTimer -= dt;
@@ -611,6 +628,8 @@ export class CombatDirector {
       environmentManager.checkProjectilesAgainstEnemies(enemies, (enemy, damage, px, py) => {
         const dir = player.physics.facingRight ? 1 : -1;
         const rawDamage = Math.max(1, Math.round(damage * this.comboDamageMultiplier()));
+        // DEATH CAM: thrown knife — credit the player, mark the round for replay.
+        setPlayerAttackContext('SHOT', 'KNIFE', px, py, 'NONE');
         const knifeDamage = enemy.takeDamage(rawDamage, dir * 340, -140, false);
         // Phased through on a dodge roll — the knife buries itself in the floor
         if (knifeDamage <= 0) {
@@ -858,6 +877,11 @@ export class CombatDirector {
     // G5 — the room hears the round before it sees where it landed.
     this.signalGunshot(originX, enemies);
 
+    // DEATH CAM: attribute every resolution below to this round, and drop the
+    // muzzle marker into the replay window (flash / tracer / report sync).
+    setPlayerAttackContext('SHOT', player.currentGun, originX, originY, 'NONE');
+    replayBuffer.recordShot(replayBuffer.slotOf('player'), player.currentGun, originX, originY);
+
     // 2. Raycast against active enemies along bullet trajectory
     let closestEnemy: EnemyController | null = null;
     let closestT = 99999;
@@ -923,6 +947,7 @@ export class CombatDirector {
         this.addPopup(impactX, impactY - 20, 'WHIFF', '#94a3b8', 15);
       } else if (closestEnemy.state === 'BLOCK' && !isPointBlank) {
         // Guarded by enemy
+        setPlayerAttackContext('SHOT', player.currentGun, originX, originY, 'TORSO');
         closestEnemy.takeDamage(10, dir * 160, -60, false);
         this.hitStopFrames = 4;
         camera.addTrauma(0.18);
@@ -932,6 +957,7 @@ export class CombatDirector {
         Haptics.cue('hit');
       } else if (isPointBlank) {
         // == POINT-BLANK GUN-FU EXECUTION ==
+        setPlayerAttackContext('EXECUTION', player.currentGun, originX, originY, 'TORSO');
         const damage = Math.max(1, Math.round(42 * this.comboDamageMultiplier()));
         closestEnemy.takeDamage(damage, dir * 520, -220, true);
         closestEnemy.state = 'KNOCKBACK';
@@ -955,6 +981,7 @@ export class CombatDirector {
         // Standard bullet impact. PHASE 1B hit zones: a round that lands in
         // the head band pays a 1.6x precision multiplier + style credit —
         // body damage stays exactly at the shipped 28.
+        setPlayerAttackContext('SHOT', player.currentGun, originX, originY, isHeadshot ? 'HEAD' : 'TORSO');
         const rawDamage = Math.max(
           1,
           Math.round(28 * this.comboDamageMultiplier() * (isHeadshot ? 1.6 : 1))
@@ -992,7 +1019,7 @@ export class CombatDirector {
 
       // PHASE 1B ricochet: a share of wall strikes skip off at the reflected
       // angle and resolve one more (half-damage) pass down range.
-      this.resolveRicochet(enemies, endX, endY, -dirX, dirY, camera, environmentManager, 28);
+      this.resolveRicochet(enemies, endX, endY, -dirX, dirY, camera, environmentManager, 28, player.currentGun);
     }
   }
 
@@ -1082,7 +1109,8 @@ export class CombatDirector {
     dy: number,
     camera: Camera,
     environmentManager: EnvironmentManager | undefined,
-    baseDamage: number
+    baseDamage: number,
+    weaponId: string
   ): void {
     if (Math.random() >= 0.45) return;
     const n = Math.hypot(dx, dy) || 1;
@@ -1119,6 +1147,9 @@ export class CombatDirector {
       const impactX = fromX + dx * enemyT - dir * 8;
       const impactY = fromY + dy * enemyT;
       this.pushTracer(fromX, fromY, impactX, impactY, 0.1, 2.5);
+      // DEATH CAM: the bounce is still the player's round — same attribution.
+      setPlayerAttackContext('SHOT', weaponId, fromX, fromY, 'NONE');
+      replayBuffer.recordShot(replayBuffer.slotOf('player'), weaponId, fromX, fromY);
       if (enemy.evading) {
         this.spawnSparks(impactX, impactY, -dir, 5, '#94a3b8');
         return;
@@ -1236,6 +1267,9 @@ export class CombatDirector {
     this.ejectCasing(originX, originY, dirShot);
     // G5 — the room hears the salvo too.
     this.signalGunshot(originX, enemies);
+    // DEATH CAM: salvo attribution + one muzzle marker for the replay window.
+    setPlayerAttackContext('SHOT', stats.id, originX, originY, 'NONE');
+    replayBuffer.recordShot(replayBuffer.slotOf('player'), stats.id, originX, originY);
     const spreadScale = player.precisionAim ? 0.35 : 1;
 
     const MAX_RANGE = 1500;
@@ -1301,6 +1335,7 @@ export class CombatDirector {
         }
 
         const falloff = falloffMultiplier(stats, enemyT);
+        setPlayerAttackContext('SHOT', stats.id, originX, originY, 'TORSO');
         if (enemy.state === 'BLOCK') {
           const chip = Math.max(2, Math.round(stats.damage * 0.3 * falloff));
           const landed = enemy.takeDamage(chip, dir * 140, -50, false);
@@ -1316,6 +1351,7 @@ export class CombatDirector {
 
         // PHASE 1B hit zones: rounds landing in the head band pay 1.6x.
         const isHeadshot = impactY <= enemy.position.y - 88;
+        setPlayerAttackContext('SHOT', stats.id, originX, originY, isHeadshot ? 'HEAD' : 'TORSO');
         const raw = Math.max(
           1,
           Math.round(stats.damage * falloff * comboMult * (isHeadshot ? 1.6 : 1))
@@ -1354,7 +1390,7 @@ export class CombatDirector {
           this.spawnSparks(endX, endY, -dir, 6, this.surfaceColor('WALL'));
           // PHASE 1B ricochet: the lead pellet may skip off the wall once
           // (45% roll inside) and resolve a half-damage second pass.
-          this.resolveRicochet(enemies, endX, endY, -dx, dy, camera, environmentManager, stats.damage);
+          this.resolveRicochet(enemies, endX, endY, -dx, dy, camera, environmentManager, stats.damage, stats.id);
         }
       }
     }
@@ -1401,6 +1437,11 @@ export class CombatDirector {
     this.speedLinesTimer = 0.3;
     this.slowMoFactor = 0.45;
     this.slowMoTimer = 0.22;
+
+    // DEATH CAM: the blast answers to the environment, and one marker lets the
+    // replay re-fire its flash/shockwave at the right instant.
+    setAttackContext('ENVIRONMENT', '', ENVIRONMENT_NAME, 'EXPLOSIVE_BARREL', x, y, 'TORSO');
+    replayBuffer.recordShot(replayBuffer.slotOf(''), 'EXPLOSIVE_BARREL', x, y);
 
     for (const enemy of enemies) {
       if (enemy.health <= 0) continue;
@@ -1475,6 +1516,9 @@ export class CombatDirector {
     if (!target) return false;
     // G7 checklist: the whip is marked the frame the target is found.
     trainingMark('PISTOL_WHIP');
+
+    // DEATH CAM: a melee blow thrown with the gun still in hand.
+    setPlayerAttackContext('MELEE', 'PISTOL', px, py, 'TORSO');
 
     const impactX = target.position.x - f * 12;
     const impactY = py - 64;
@@ -1806,6 +1850,16 @@ export class CombatDirector {
         // popup and the health bar are driven by the same resolved number.
         const landDamage = resolveDamage(enemy, baseDamage);
 
+        // DEATH CAM: every branch below lands the same strike — attribute it
+        // once (weapon in hand, head band when the arc crossed the skull).
+        setPlayerAttackContext(
+          'MELEE',
+          player.physics.equippedWeapon,
+          player.physics.position.x,
+          player.physics.position.y,
+          impactY <= enemy.position.y - 88 ? 'HEAD' : 'TORSO'
+        );
+
         // Check if enemy is guarding (BLOCK state)
         if (enemy.state === 'BLOCK') {
           if (
@@ -1853,6 +1907,9 @@ export class CombatDirector {
             // == BLOCKED! Light attacks absorbed with reduced damage ==
             const chipDamage = Math.max(2, Math.round(landDamage * 0.2));
             enemy.health = Math.max(0, enemy.health - chipDamage);
+            // DEATH CAM: this path never reaches EnemyController.takeDamage,
+            // so lethal chip resolves its own attribution record.
+            if (enemy.health <= 0) resolveEnemyElimination(enemy, chipDamage);
             // Lethal chip damage must still kill cleanly: ragdoll + DOWNED so
             // defeat cinematics, loot and wave-clear detection see a real death
             if (enemy.health <= 0 && !enemy.ragdoll) {
@@ -2116,6 +2173,15 @@ export class CombatDirector {
         continue;
       }
 
+      // DEATH CAM: the finisher still lands with whatever is in John's hand —
+      // attribute it before the context is cleared on the next update.
+      setPlayerAttackContext(
+        'MELEE',
+        player.physics.equippedWeapon,
+        player.physics.position.x,
+        player.physics.position.y,
+        impactY <= enemy.position.y - 88 ? 'HEAD' : 'TORSO'
+      );
       const applied = enemy.takeDamage(damage, dirAway * knockbackX, knockbackY, true);
       if (applied <= 0) continue;
       connected = true;
@@ -2244,6 +2310,17 @@ export class CombatDirector {
         }
 
         // Unblocked Hit: Player takes damage
+        // DEATH CAM: stamp the swing that actually landed — without this the
+        // neutral default context would credit John with his own death.
+        setAttackContext(
+          'MELEE',
+          enemy.id,
+          enemyDisplayName(enemy.type),
+          enemyWeaponId(enemy.type),
+          hb.x,
+          hb.y,
+          'TORSO'
+        );
         player.takeDamage(hb.damage, hb.knockbackX, hb.knockbackY);
         SoundFX.playPunch('heavy', hb.x); // PHASE 4: struck from the enemy's side
         camera.addTrauma(0.35);
@@ -2323,6 +2400,11 @@ export class CombatDirector {
     for (const e of enemies) {
       if (e.pendingShots.length === 0) continue;
       for (const b of e.pendingShots) {
+        // DEATH CAM: stamp authorship while the shooter is still known — the
+        // shared pool erases it, and attribution needs it when this lands.
+        b.ownerId = e.id;
+        b.ownerName = enemyDisplayName(e.type);
+        b.weaponId = enemyWeaponId(e.type);
         this.enemyBullets.push(b);
         // P3-01: cap the live set — oldest round recycles back to the pool
         trimOldest(
@@ -2341,6 +2423,8 @@ export class CombatDirector {
           3
         );
         SoundFX.playGunshot(b.x); // PHASE 4: reported from the shooter's muzzle
+        // DEATH CAM: muzzle marker so playback re-fires flash + report here.
+        replayBuffer.recordShot(replayBuffer.slotOf(e.id), b.weaponId ?? 'SIDEARM', b.x, b.y);
       }
       e.pendingShots.length = 0;
     }
@@ -2409,11 +2493,29 @@ export class CombatDirector {
 
         const dir = Math.sign(b.vx) || 1;
 
+        // DEATH CAM: the round remembers who pulled the trigger (stamped at
+        // drain), so both the blocked and the clean path attribute correctly.
+        setAttackContext(
+          'SHOT',
+          b.ownerId ?? '',
+          b.ownerName ?? ENVIRONMENT_NAME,
+          b.weaponId ?? 'SIDEARM',
+          b.x,
+          b.y,
+          'TORSO'
+        );
+
         if (isBlocking && !b.pierceBlock) {
           // Blocked round: chip damage + block spark (uses the same
           // blocking flag the melee path in checkEnemyAttacks uses)
           const chip = Math.max(2, Math.round(b.damage * 0.25));
+          const chipBefore = player.physics.health;
           player.physics.health = Math.max(0, player.physics.health - chip);
+          recordDamageEvent('player', 'JOHN STICK', 'player', px, py, chip);
+          // DEATH CAM: blocked chip never reaches PlayerController.takeDamage.
+          if (chipBefore > 0 && player.physics.health <= 0) {
+            resolvePlayerElimination('JOHN STICK', player.physics.position.x, player.physics.position.y, chip);
+          }
           player.physics.stamina = Math.max(0, player.physics.stamina - 10);
           player.physics.velocity.x = dir * 120;
           camera.addTrauma(0.12);
@@ -2495,6 +2597,14 @@ export class CombatDirector {
         if (!isGlass) {
           // Solid props hurt: modest body damage on top of the shatter
           const slam = Math.max(6, Math.round(speed * 0.03));
+          // DEATH CAM: environmental kill — the body is the projectile.
+          setPlayerAttackContext(
+            'ENVIRONMENT',
+            isBarrel ? 'EXPLOSIVE_BARREL' : 'ENVIRONMENT',
+            enemy.position.x,
+            enemy.position.y,
+            'TORSO'
+          );
           enemy.takeDamage(slam, dirE * 120, -80, false);
         }
 
@@ -2563,6 +2673,8 @@ export class CombatDirector {
         this.speedLinesTimer = 0.32;
 
         const damage = Math.max(1, Math.round(42 * this.comboDamageMultiplier()));
+        // DEATH CAM: a judo slam is a takedown, not a plain melee blow.
+        setPlayerAttackContext('TAKEDOWN', player.physics.equippedWeapon, px, py, 'TORSO');
         enemy.takeDamage(damage, -f * 120, 0, true);
         enemy.state = 'KNOCKBACK';
         enemy.stateTimer = 0;
@@ -2653,6 +2765,10 @@ export class CombatDirector {
       this.pushTracer(px + f * 34, py - 62, headX, headY, 0.13, 3.5);
 
       const damage = Math.max(1, Math.round(100 * this.comboDamageMultiplier()));
+      // DEATH CAM: temple round at arm's length is an execution, and the
+      // muzzle marker lets playback re-fire the flash + report on cue.
+      setPlayerAttackContext('EXECUTION', 'PISTOL', px + f * 34, py - 62, 'HEAD');
+      replayBuffer.recordShot(replayBuffer.slotOf('player'), 'PISTOL', px + f * 34, py - 62);
       const landed = enemy.takeDamage(damage, f * 520, -300, true);
 
       if (landed > 0) {
@@ -2754,6 +2870,9 @@ export class CombatDirector {
 
         const dir = Math.sign(body.velocity.x) || 1;
         const pinDamage = Math.max(1, Math.round(18 * this.comboDamageMultiplier()));
+        // DEATH CAM: the bowling pin is John's own takedown doing the work —
+        // credit the throw, not the corpse that carried it.
+        setPlayerAttackContext('ENVIRONMENT', 'THROWN_BODY', body.position.x, body.position.y, 'TORSO');
         const landed = other.takeDamage(pinDamage, dir * 470, -190, true);
         if (landed <= 0) continue;
 

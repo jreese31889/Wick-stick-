@@ -1,6 +1,7 @@
 import { SoundFX } from '../engine/SoundFX';
 import { Music } from '../engine/Music';
 import { DIFFICULTY_TIERS, DIFFICULTY_ORDER } from '../engine/Difficulty';
+import { sanitizeDeathCamDuration } from '../engine/DeathCam';
 import type { DifficultyTier } from '../engine/Difficulty';
 
 /**
@@ -12,6 +13,9 @@ import type { DifficultyTier } from '../engine/Difficulty';
  */
 
 export type Quality = 'low' | 'medium' | 'high';
+
+/** DEATH CAM §7 — re-exported so menu code has one import for the list. */
+export { sanitizeDeathCamDuration, DEATH_CAM_DURATIONS } from '../engine/DeathCam';
 
 /** PHASE 3 4 — aim magnetism strength (Low is the shipped PHASE 1B cone). */
 export type AimAssistLevel = 'off' | 'low' | 'high';
@@ -89,6 +93,24 @@ export interface GameSettings {
   hudOpacity: number;
   /** PHASE 3 2: custom touch layout (null = default positions). */
   touchLayout: TouchLayout | null;
+  /* -------------------------------------------------------------- */
+  /* DEATH CAM — kill replay (owner spec 2026-10-03)                 */
+  /* -------------------------------------------------------------- */
+  /**
+   * DEATH CAM §7 — master switch. Off leaves the shipped death flow exactly
+   * as it was: no freeze beat, no reconstruction, straight to game-over.
+   */
+  deathCam: boolean;
+  /** DEATH CAM §7 — replay length in seconds (authored 3 / 4 / 5 / 6). */
+  deathCamDuration: number;
+  /** DEATH CAM §7 — cinematic flourishes (CINEMATIC framing, vignette push). */
+  deathCamCinematic: boolean;
+  /** DEATH CAM §7 — slow-motion ramp across the lethal moment (+ audio rate). */
+  deathCamSlowMotion: boolean;
+  /** DEATH CAM §7 — trauma shake on replay impacts. */
+  deathCamShake: boolean;
+  /** DEATH CAM §7 — skip the replay entirely once the freeze beat ends. */
+  deathCamAutoSkip: boolean;
 }
 
 export const DEFAULT_SETTINGS: GameSettings = {
@@ -107,6 +129,12 @@ export const DEFAULT_SETTINGS: GameSettings = {
   touchButtonScale: 100,
   hudOpacity: 100,
   touchLayout: null,
+  deathCam: true,
+  deathCamDuration: 4,
+  deathCamCinematic: true,
+  deathCamSlowMotion: true,
+  deathCamShake: true,
+  deathCamAutoSkip: false,
 };
 
 export const AIM_ASSIST_OPTIONS: { id: AimAssistLevel; label: string; blurb: string }[] = [
@@ -264,6 +292,27 @@ export function loadSettings(): GameSettings {
     touchButtonScale: clamp(Math.round(num(raw.touchButtonScale, DEFAULT_SETTINGS.touchButtonScale)), 70, 140),
     hudOpacity: clamp(Math.round(num(raw.hudOpacity, DEFAULT_SETTINGS.hudOpacity)), 40, 100),
     touchLayout: sanitizeTouchLayout(raw.touchLayout),
+    // DEATH CAM — the duration list is owned by the engine (the same constant
+    // drives the replay clock), so a new authored length lands in one place.
+    deathCam: typeof raw.deathCam === 'boolean' ? raw.deathCam : DEFAULT_SETTINGS.deathCam,
+    deathCamDuration: sanitizeDeathCamDuration(
+      raw.deathCamDuration,
+      DEFAULT_SETTINGS.deathCamDuration
+    ),
+    deathCamCinematic:
+      typeof raw.deathCamCinematic === 'boolean'
+        ? raw.deathCamCinematic
+        : DEFAULT_SETTINGS.deathCamCinematic,
+    deathCamSlowMotion:
+      typeof raw.deathCamSlowMotion === 'boolean'
+        ? raw.deathCamSlowMotion
+        : DEFAULT_SETTINGS.deathCamSlowMotion,
+    deathCamShake:
+      typeof raw.deathCamShake === 'boolean' ? raw.deathCamShake : DEFAULT_SETTINGS.deathCamShake,
+    deathCamAutoSkip:
+      typeof raw.deathCamAutoSkip === 'boolean'
+        ? raw.deathCamAutoSkip
+        : DEFAULT_SETTINGS.deathCamAutoSkip,
   };
 }
 

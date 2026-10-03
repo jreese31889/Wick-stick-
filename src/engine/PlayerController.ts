@@ -6,6 +6,7 @@ import { SoundFX } from './SoundFX';
 import { Ragdoll } from './Ragdoll';
 import { GUNS, GUN_ORDER, GunId, isGun } from './Weapons';
 import { emitProgress, PROGRESS_EVENTS } from '../profile/ProgressEvents';
+import { recordDamageEvent, resolvePlayerElimination } from './Elimination';
 import { trainingIsActive } from './TrainingRoom';
 import type { RunProfile } from '../profile/Progression';
 
@@ -498,6 +499,14 @@ export class PlayerController {
       this.hurtFlash = 1;
       // G7: a drill never writes progression — not even the damage tally.
       if (!trainingIsActive()) emitProgress(PROGRESS_EVENTS.PLAYER_DAMAGED, { amount: taken });
+      // DEATH CAM: timestamp the blow while the attack context still knows who
+      // swung, with what and from where — it is cleared on the next update.
+      recordDamageEvent('player', 'JOHN STICK', 'player', this.physics.position.x, this.physics.position.y, taken);
+      if (this.physics.health <= 0) {
+        // The killing blow resolves the attribution record the Death Cam plays:
+        // by the time the death sequence runs, that context is already gone.
+        resolvePlayerElimination('JOHN STICK', this.physics.position.x, this.physics.position.y, taken);
+      }
     }
     this.physics.velocity.x = knockbackX;
     this.physics.velocity.y = knockbackY;

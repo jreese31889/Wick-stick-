@@ -43,6 +43,7 @@ import { TouchLayoutEditor } from './components/TouchLayoutEditor';
 import { StageSelectModal, STAGES, getNextStage, TRAINING_STAGE } from './components/StageSelectModal';
 import type { StageDef } from './components/StageSelectModal';
 import { TrainingPanel } from './components/TrainingPanel';
+import { DeathCamOverlay } from './components/DeathCamOverlay';
 import { setDifficulty } from './engine/Difficulty';
 import { GameOverScreen } from './components/GameOverScreen';
 import type { RunStats } from './components/GameOverScreen';
@@ -817,6 +818,16 @@ export default function App() {
     gameLoop.aimAssist = settings.aimAssist;
     // G5: the enemy-behaviour tier (module-level, read every frame by the AI)
     setDifficulty(settings.difficulty);
+    // DEATH CAM §7: replay behaviour + framing flourishes. Pushed through
+    // GameLoop so a live replay picks up a change the moment it applies.
+    gameLoop.deathCam.applySettings({
+      enabled: settings.deathCam,
+      duration: settings.deathCamDuration,
+      cinematic: settings.deathCamCinematic,
+      slowMotion: settings.deathCamSlowMotion,
+      shake: settings.deathCamShake,
+      autoSkip: settings.deathCamAutoSkip,
+    });
     setIsMuted(settings.sfxVolume === 0);
     saveSettings(settings);
     // PHASE 2: settings ride along in the profile (audio/graphics survive a wipe)
@@ -856,6 +867,8 @@ export default function App() {
 
   const isPaused = gameLoop.isPaused;
   const isGameOver = gameLoop.isGameOver;
+  /** DEATH CAM §4/§5 — true from the camera transition until the replay ends. */
+  const deathCamPlaying = gameLoop.deathCam.overlayVisible;
 
   // PHASE 4 E5 — arm the score after the first real user gesture (autoplay
   // policy), then keep it on the screen that owns the session: title theme,
@@ -912,16 +925,22 @@ export default function App() {
     showProfile,
   ]);
 
-  // Escape closes the topmost dialog, otherwise it toggles the pause menu
+  // Escape closes the topmost dialog, otherwise it toggles the pause menu.
+  // DEATH CAM §5: while a replay owns the screen, Escape is SKIP — pausing
+  // over a reconstruction is never what the player meant.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      if (gameLoop.deathCam.replaying) {
+        gameLoop.deathCam.skip();
+        return;
+      }
       if (closeTopmostOverlay()) return;
       if (hasStarted && !isGameOver && !showVictory) togglePauseRef.current();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [closeTopmostOverlay, hasStarted, isGameOver, showVictory]);
+  }, [closeTopmostOverlay, hasStarted, isGameOver, showVictory, gameLoop]);
 
   /**
    * PHASE 3 5 — the one system-back policy (Android hardware back, browser
@@ -930,6 +949,10 @@ export default function App() {
    * run → quit a finished run to the title → confirm exit at the root screen.
    */
   const handleSystemBack = useCallback((): boolean => {
+    if (gameLoop.deathCam.replaying) {
+      gameLoop.deathCam.skip();
+      return true;
+    }
     if (closeTopmostOverlay()) return true;
     if (hasStarted && !isGameOver && !victoryOpenRef.current) {
       togglePauseRef.current(); // active run → pause; paused run → resume
@@ -941,7 +964,7 @@ export default function App() {
     }
     setShowExitConfirm(true); // root screen → explicit confirm, never a dead tap
     return true;
-  }, [closeTopmostOverlay, hasStarted, isGameOver, goToTitle]);
+  }, [closeTopmostOverlay, hasStarted, isGameOver, goToTitle, gameLoop]);
 
   const backHandlerRef = useRef(handleSystemBack);
   useEffect(() => {
@@ -1939,8 +1962,10 @@ export default function App() {
         />
       )}
 
-      {/* 7. MOBILE ON-SCREEN VIRTUAL CONTROLS (gameplay + layout editing) */}
-      {(hasStarted && !isGameOver && !showVictory) || layoutEditorOpen ? (
+      {/* 7. MOBILE ON-SCREEN VIRTUAL CONTROLS (gameplay + layout editing).
+          DEATH CAM §4: the reconstruction holds the sim, so the pad is pulled
+          — nothing there is pressable while the replay plays. */}
+      {(hasStarted && !isGameOver && !showVictory && !deathCamPlaying) || layoutEditorOpen ? (
         <VirtualControls
           inputManager={gameLoop.inputManager}
           equippedWeapon={physics.equippedWeapon}
@@ -2041,6 +2066,14 @@ export default function App() {
           onHowToPlay={() => setShowHowToPlay(true)}
         />
       )}
+
+      {/* 6c. DEATH CAM — kill replay HUD (identity, framings, progress, SKIP) */}
+      <DeathCamOverlay
+        visible={deathCamPlaying}
+        deathCam={gameLoop.deathCam}
+        onSkip={() => gameLoop.deathCam.skip()}
+        onMode={(mode) => gameLoop.deathCam.setMode(mode)}
+      />
 
       {/* 10. END SCREENS — contract defeat & High Table victory with run stats */}
       {showEndScreen && (
