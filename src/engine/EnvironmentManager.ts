@@ -486,8 +486,9 @@ export class EnvironmentManager {
     }
 
     const isCrate = obj.type === 'CRATE';
-    if (isCrate) SoundFX.playPunch('slam');
-    else SoundFX.playGlassShatter();
+    // PHASE 4: prop sounds sit at the prop's world x (distance + stereo pan).
+    if (isCrate) SoundFX.playPunch('slam', obj.x);
+    else SoundFX.playGlassShatter(obj.x);
 
     // Shard palette by surface (wood splinters for crates, glass otherwise)
     const colors = isCrate

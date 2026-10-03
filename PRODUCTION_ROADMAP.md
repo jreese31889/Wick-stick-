@@ -6,7 +6,7 @@
 
 Legend: ✅ DONE (ships today) · 🟡 PARTIAL (works, but a documented half of the contract is missing) · ⛔ NEW (does not exist in `src/`).
 
-Summary: **41 features — 27 DONE · 5 PARTIAL · 9 NEW.**
+Summary: **41 features — 29 DONE · 4 PARTIAL · 8 NEW.**
 
 ---
 
@@ -68,8 +68,8 @@ Summary: **41 features — 27 DONE · 5 PARTIAL · 9 NEW.**
 | E2 | Blood decals + pooled death ragdolls with joint constraints | ✅ | `CombatDirector.spawnBlood`, `src/engine/Ragdoll.ts`, `ragdollPool` recycle `GameLoop.ts:140-145/:266` |
 | E3 | **Surface-aware impact FX (wood / glass / barrel / wall colour + debris)** | ⛔ NEW | Impacts are hard-coded per hit (`CombatDirector.ts:507/:515/:527-543/:556`); no prop/surface context reaches the FX path |
 | E4 | **Distinct weapon audio: per-gun reports + explosion boom** | ⛔ NEW | Every gun shares `SoundFX.playGunshot` (`SoundFX.ts:193-196`); no explosion sound. Existing signatures must not change — land as new methods `playGunReport(kind)` / `playExplosion()` |
-| E5 | **Music system: menu + dynamic combat score** | ⛔ NEW | Zero music code (`rg music` = 0), zero assets, no `musicVolume` setting (`settings.ts:13-20`) |
-| E6 | Haptics / controller rumble | 🟡 PARTIAL | `InputManager.vibrate` (`:232-263`) supports pad rumble + phone vibration, but is **never called by gameplay** — only the 15 ms touch-button tick (`VirtualControls.tsx:125-131`) |
+| E5 | **Music system: menu + dynamic combat score** | ✅ | `src/engine/Music.ts` — procedural 96 BPM score (5 layer buses, bar-locked pattern swaps, menu/run/paused/victory/death scenes, 4 run-intensity tiers fed from `App.tsx`), `settings.musicVolume` + `OptionsModal` slider, SFX ducking from `SoundFX.playSample`/`playWorld` |
+| E6 | Haptics / controller rumble | ✅ | `src/engine/Haptics.ts` (`cue`, distance-scaled `cueAt`, `takedown` pattern, `heartbeat` pattern) driven from `CombatDirector` (finisher, grapple slam, execution, barrel slam) + low-HP heartbeat `GameLoop.updateHeartbeat` |
 
 ## F. UI, flow, platform (5)
 
@@ -96,4 +96,4 @@ Summary: **41 features — 27 DONE · 5 PARTIAL · 9 NEW.**
 
 ## Phase 2+ backlog (explicitly not in this change set)
 
-- A9 input buffering + dodge/block attack chains · C8 `EndlessLevelManager` + rewardMultiplier · E5 music · E6 gameplay haptics · B8 touch aim stick · F1 milestone/contract persistence + virtual pause button · style meter (design §14) · cinematic finisher system (design §15) · attack-input bug register in `GAME_AUDIT.md` §8 (comboMeter never written ⇒ `SPIN_SLASH`/`EXECUTIONER` unreachable).
+- A9 input buffering + dodge/block attack chains · C8 `EndlessLevelManager` + rewardMultiplier · B8 touch aim stick · F1 milestone/contract persistence + virtual pause button · style meter (design §14) · cinematic finisher system (design §15) · attack-input bug register in `GAME_AUDIT.md` §8 (comboMeter never written ⇒ `SPIN_SLASH`/`EXECUTIONER` unreachable).

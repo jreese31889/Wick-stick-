@@ -148,6 +148,8 @@ function sanitizeSettings(raw: unknown): GameSettings {
       : fallback.quality;
   return {
     sfxVolume: Math.min(100, Math.max(0, Math.round(num(obj.sfxVolume, fallback.sfxVolume)))),
+    // PHASE 4 E5: score level rides along with the rest of the audio profile.
+    musicVolume: clampInt(obj.musicVolume, fallback.musicVolume, 0, 100),
     quality,
     showFps: bool(obj.showFps, fallback.showFps),
     haptics: bool(obj.haptics, fallback.haptics),

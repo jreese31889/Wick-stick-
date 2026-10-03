@@ -1,4 +1,5 @@
 import { SoundFX } from '../engine/SoundFX';
+import { Music } from '../engine/Music';
 
 /**
  * Shared menu state: persistent settings (audio / graphics), persistent run
@@ -45,6 +46,11 @@ export interface TouchLayout {
 export interface GameSettings {
   /** Master SFX volume, 0-100. 0 silences every effect. */
   sfxVolume: number;
+  /**
+   * PHASE 4 E5: adaptive score volume, 0-100. Rides on the same master bus
+   * as the SFX fader, so the HUD mute (sfxVolume 0) silences music too.
+   */
+  musicVolume: number;
   /** Graphics quality tier driving the CSS effect budget. */
   quality: Quality;
   /** Show the FPS chip in the HUD (visible on xl+ layouts). */
@@ -76,6 +82,7 @@ export interface GameSettings {
 
 export const DEFAULT_SETTINGS: GameSettings = {
   sfxVolume: 100,
+  musicVolume: 70,
   quality: 'high',
   showFps: true,
   haptics: true,
@@ -214,6 +221,7 @@ export function loadSettings(): GameSettings {
       : DEFAULT_SETTINGS.quality;
   return {
     sfxVolume: clamp(Math.round(num(raw.sfxVolume, DEFAULT_SETTINGS.sfxVolume)), 0, 100),
+    musicVolume: clamp(Math.round(num(raw.musicVolume, DEFAULT_SETTINGS.musicVolume)), 0, 100),
     quality,
     showFps: typeof raw.showFps === 'boolean' ? raw.showFps : DEFAULT_SETTINGS.showFps,
     haptics: typeof raw.haptics === 'boolean' ? raw.haptics : DEFAULT_SETTINGS.haptics,
@@ -347,4 +355,15 @@ export function applySfxVolume(volume: number): void {
   const clamped = clamp(Math.round(volume), 0, 100);
   SoundFX.enabled = clamped > 0;
   setMasterVolume(clamped / 100);
+}
+
+/**
+ * PHASE 4 E5 — 0-100 music volume on the score's own bus.
+ *
+ * The music bus hangs off the same patched master fader the SFX use, so this
+ * slider only sets the *relative* score level: pulling the master (HUD mute /
+ * Sound Volume slider) still takes the music down with it.
+ */
+export function applyMusicVolume(volume: number): void {
+  Music.setVolume(clamp(Math.round(volume), 0, 100));
 }

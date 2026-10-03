@@ -728,7 +728,7 @@ export class EnemyController {
           this.hasHitPlayerThisAttack = true;
           this.attackPattern = 'RIPOSTE';
           const f = this.facingRight ? 1 : -1;
-          SoundFX.playWhoosh(1.15);
+          SoundFX.playWhoosh(1.15, this.position.x);
           this.velocity.x = f * 260;
           this.activeHitbox = {
             x: this.position.x + f * 46,
@@ -791,7 +791,7 @@ export class EnemyController {
           } else if (this.attackPattern === 'HEAVY_HOOK') {
             // Heavy lunging punch
             this.velocity.x = f * 220;
-            SoundFX.playWhoosh(0.75);
+            SoundFX.playWhoosh(0.75, this.position.x);
             this.activeHitbox = {
               x: this.position.x + f * 45,
               y: this.position.y - 70,
@@ -804,7 +804,7 @@ export class EnemyController {
           } else if (this.attackPattern === 'SLAM') {
             // BERSERKER overhead slam: slow, hits like a truck, floors you
             this.velocity.x = f * 60;
-            SoundFX.playWhoosh(0.6);
+            SoundFX.playWhoosh(0.6, this.position.x);
             this.activeHitbox = {
               x: this.position.x + f * 38,
               y: this.position.y - 46,
@@ -817,7 +817,7 @@ export class EnemyController {
           } else if (this.attackPattern === 'FLURRY') {
             // BERSERKER three-hit string — re-armed from the ATTACK case
             this.velocity.x = f * 90;
-            SoundFX.playWhoosh(1.25);
+            SoundFX.playWhoosh(1.25, this.position.x);
             this.activeHitbox = {
               x: this.position.x + f * 40,
               y: this.position.y - 68,
@@ -830,7 +830,7 @@ export class EnemyController {
           } else if (this.attackPattern === 'LUNGE') {
             // ACROBAT gap-closer: covers ground fast with a long lead leg
             this.velocity.x = f * 400;
-            SoundFX.playWhoosh(1.05);
+            SoundFX.playWhoosh(1.05, this.position.x);
             this.activeHitbox = {
               x: this.position.x + f * 52,
               y: this.position.y - 46,
@@ -843,7 +843,7 @@ export class EnemyController {
           } else if (this.attackPattern === 'SWEEP') {
             // Low sweep kick
             this.velocity.x = f * 180;
-            SoundFX.playWhoosh(1.1);
+            SoundFX.playWhoosh(1.1, this.position.x);
             this.activeHitbox = {
               x: this.position.x + f * 40,
               y: this.position.y - 20,
@@ -856,7 +856,7 @@ export class EnemyController {
           } else {
             // Fast lead jab (GUNNERs fight weak up close — they'd rather be shooting)
             this.velocity.x = f * 150;
-            SoundFX.playWhoosh(0.9);
+            SoundFX.playWhoosh(0.9, this.position.x);
             this.activeHitbox = {
               x: this.position.x + f * 42,
               y: this.position.y - 70,
@@ -1053,7 +1053,7 @@ export class EnemyController {
     if (this.position.y >= floorY) {
       this.position.y = floorY;
       if (!this.grounded && Math.abs(this.velocity.y) > 220) {
-        SoundFX.playPunch('light');
+        SoundFX.playPunch('light', this.position.x);
       }
       this.velocity.y = 0;
       this.grounded = true;
@@ -1078,7 +1078,7 @@ export class EnemyController {
     this.velocity.x = away * this.moveSpeed * 3.2;
     this.velocity.y = -180;
     this.grounded = false;
-    SoundFX.playWhoosh(1.25);
+    SoundFX.playWhoosh(1.25, this.position.x);
   }
 
   /**

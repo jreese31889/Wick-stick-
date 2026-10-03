@@ -5,6 +5,7 @@ import { CombatDirector } from './CombatDirector';
 import { Camera } from './Camera';
 import { Renderer } from './Renderer';
 import { SoundFX } from './SoundFX';
+import { Haptics } from './Haptics';
 import { EnvironmentManager } from './EnvironmentManager';
 import { GUNS } from './Weapons';
 import { ragdollPool } from './Ragdoll';
@@ -104,6 +105,9 @@ export class GameLoop {
   // Signature-move HUD bookkeeping
   private lastPlayerStateForBanner = '';
   private flyingKickAirborne = false;
+
+  // PHASE 4 E6 — countdown to the next low-HP heartbeat thump.
+  private heartTimer = 0;
 
   // Callback to sync state with React HUD
   private onStateChange?: () => void;
@@ -501,6 +505,10 @@ export class GameLoop {
 
       const simStart = performance.now();
 
+      // PHASE 4: the world is heard from wherever the fighter is standing —
+      // one field write, read by SoundFX when a spatial voice is placed.
+      SoundFX.setListenerX(this.player.physics.position.x);
+
       // Apply Slow Motion if active (e.g. perfect parry)
       const effectiveDt = baseDt * this.combatDirector.slowMoFactor;
 
@@ -752,6 +760,11 @@ export class GameLoop {
         }
       }
 
+      // 5c. PHASE 4 E6 — low-HP heartbeat warning. One boolean test while
+      // the haptics setting is off, so a disabled toggle costs nothing here.
+      if (Haptics.enabled) this.updateHeartbeat(baseDt);
+      else this.heartTimer = 0;
+
       // 6. CAMERA UPDATE (Frames player and nearest active hostile)
       // Single pass over this.enemies — no per-frame filter() allocation,
       // which was a guaranteed garbage-collector hit every single frame.
@@ -814,6 +827,26 @@ export class GameLoop {
       this.visibilityHandler = null;
     }
     this.inputManager.destroy();
+  }
+
+  /**
+   * PHASE 4 E6 — the low-HP warning: a lub-dub rumble that beats faster the
+   * closer to death the fighter is (0.95 s at 29 % health, 0.60 s on the
+   * ropes). Only ever reached while Haptics.enabled is true — the caller
+   * gates it — so turning the setting off costs one boolean per frame.
+   */
+  private updateHeartbeat(dt: number): void {
+    const physics = this.player.physics;
+    const frac = physics.maxHealth > 0 ? physics.health / physics.maxHealth : 1;
+    if (frac <= 0 || frac >= 0.3 || this.isDying) {
+      this.heartTimer = 0;
+      return;
+    }
+    this.heartTimer -= dt;
+    if (this.heartTimer <= 0) {
+      Haptics.heartbeat();
+      this.heartTimer = 0.6 + 0.35 * (frac / 0.3);
+    }
   }
 
   /**

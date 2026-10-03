@@ -13,6 +13,7 @@ import {
   Crosshair,
   Smartphone,
   Move,
+  Music2,
 } from 'lucide-react';
 import type { GameSettings } from './settings';
 import { AIM_ASSIST_OPTIONS, DEFAULT_SETTINGS, QUALITY_OPTIONS } from './settings';
@@ -86,6 +87,7 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
   if (!isOpen) return null;
 
   const volume = settings.sfxVolume;
+  const music = settings.musicVolume;
 
   return (
     <div
@@ -119,7 +121,7 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
         </div>
 
         {/* SOUND VOLUME */}
-        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5">
+        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5 space-y-3.5">
           <div className={ROW}>
             <div>
               <div className={LABEL}>
@@ -148,6 +150,35 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
               />
               <span className="w-12 text-right font-mono font-black text-sm text-amber-300">
                 {volume}%
+              </span>
+            </div>
+          </div>
+
+          {/* PHASE 4 E5 — adaptive score level, beside the master fader */}
+          <div className={ROW}>
+            <div>
+              <div className={LABEL}>
+                <Music2 className="w-4 h-4 text-sky-400" />
+                Music Volume
+              </div>
+              <div className={BLURB}>
+                Procedural score — menu theme, combat layers and stings. 0 stops the music engine.
+              </div>
+            </div>
+            <div className="flex items-center gap-3 w-full sm:w-64 shrink-0">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={music}
+                aria-label="Music volume"
+                onChange={(e) => onChange({ musicVolume: Number(e.target.value) })}
+                className="menu-range flex-1"
+                style={{ '--vol': `${music}%` } as React.CSSProperties}
+              />
+              <span className="w-12 text-right font-mono font-black text-sm text-amber-300">
+                {music}%
               </span>
             </div>
           </div>

@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import { SoundFX } from './engine/SoundFX';
 import { Haptics } from './engine/Haptics';
+import { Music } from './engine/Music';
 import { AIAgentsModal } from './components/AIAgentsModal';
 import { HowToPlayModal } from './components/HowToPlayModal';
 import { RotateDeviceOverlay } from './components/RotateDeviceOverlay';
@@ -45,6 +46,7 @@ import { GameOverScreen } from './components/GameOverScreen';
 import type { RunStats } from './components/GameOverScreen';
 import {
   applyQuality,
+  applyMusicVolume,
   applySfxVolume,
   loadProgress,
   loadSettings,
@@ -222,6 +224,30 @@ const PERK_ICONS: Record<typeof PERK_CATALOG[number]['id'], typeof Shield> = {
   BULLET_DEFLECT: Sparkles,
   SOVEREIGN_MAGNUM: Target,
 };
+
+/**
+ * PHASE 4 E5 — how hot the run score should be right now.
+ *   0 explore (squad wiped) · 1 tension (alive, still at range)
+ *   2 combat (engaged)     · 3 boss (High Table duellist standing)
+ * A single pass over the squad, no allocation — safe at the tracker's 4 Hz.
+ */
+function sampleScoreIntensity(loop: GameLoop): number {
+  let alive = 0;
+  let engaged = 0;
+  let boss = false;
+  const playerX = loop.player.physics.position.x;
+  for (const enemy of loop.enemies) {
+    if (enemy.health <= 0 || enemy.state === 'DOWNED') continue;
+    alive++;
+    if (enemy.type === 'BOSS' || enemy.type === 'MARQUIS') boss = true;
+    const gap = Math.abs(enemy.position.x - playerX);
+    if (gap < 420 || enemy.state === 'WINDUP' || enemy.state === 'ATTACK') engaged++;
+  }
+  if (boss) return 3;
+  if (engaged > 0) return 2;
+  if (alive > 0) return 1;
+  return 0;
+}
 
 export default function App() {
   const gameLoop = useMemo(() => new GameLoop(), []);
@@ -567,6 +593,8 @@ export default function App() {
     // PHASE 2: fresh run — new coin ledger, new wave-clear payout window
     runBankRef.current = 0;
     lastClearedWaveRef.current = null;
+    // PHASE 4 E5: back to the explore pulse until the squad shows up
+    Music.setIntensity(0);
     setShowVictory(false);
   }, []);
 
@@ -716,6 +744,8 @@ export default function App() {
   useEffect(() => {
     applyQuality(settings.quality);
     applySfxVolume(settings.sfxVolume);
+    // PHASE 4 E5: score level on the music bus (0 stops the scheduler too)
+    applyMusicVolume(settings.musicVolume);
     gameLoop.soundMuted = settings.sfxVolume === 0;
     // P5-01 + P5-02: one knob → canvas resolution, blur gates, FX budgets
     gameLoop.quality = settings.quality;
@@ -769,6 +799,21 @@ export default function App() {
 
   const isPaused = gameLoop.isPaused;
   const isGameOver = gameLoop.isGameOver;
+
+  // PHASE 4 E5 — arm the score after the first real user gesture (autoplay
+  // policy), then keep it on the screen that owns the session: title theme,
+  // adaptive run score, and a halt behind pause / defeat / victory.
+  useEffect(() => {
+    Music.init();
+  }, []);
+
+  useEffect(() => {
+    if (!hasStarted) Music.setScene('menu');
+    else if (isGameOver) Music.setScene('gameover');
+    else if (showVictory) Music.setScene('victory');
+    else if (isPaused) Music.setScene('paused');
+    else Music.setScene('run');
+  }, [hasStarted, isGameOver, showVictory, isPaused]);
 
   // Escape / Android back both run this shared overlay stack so a system
   // back press can never do something the Escape key wouldn't.
@@ -871,6 +916,8 @@ export default function App() {
       const frozen = gameLoop.isPaused || gameLoop.isGameOver || victoryOpenRef.current;
 
       if (!frozen) {
+        // PHASE 4 E5: the score layers against the live squad state at 4 Hz.
+        Music.setIntensity(sampleScoreIntensity(gameLoop));
         runSecondsRef.current += delta;
         const whole = Math.floor(runSecondsRef.current);
         if (whole !== displayedSecondsRef.current) {

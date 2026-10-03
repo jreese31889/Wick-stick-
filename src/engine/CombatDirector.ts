@@ -447,7 +447,7 @@ export class CombatDirector {
         }
         this.hitStopFrames = 7;
         camera.addTrauma(0.35);
-        SoundFX.playKnifeStab(); // blade bites into flesh
+        SoundFX.playKnifeStab(px); // blade bites into flesh (spatial: impact point)
         this.spawnShockwave(px, py, 45, '#fef08a');
         this.spawnSparks(px, py, dir, 14, '#ffffff');
         this.spawnBlood(px, py, dir, 8);
@@ -472,12 +472,12 @@ export class CombatDirector {
         this.slowMoTimer = 0.35;
         this.speedLinesTimer = 0.3;
         this.spawnShockwave(enemy.position.x, enemy.position.y - 55, 85, '#f59e0b');
-        SoundFX.playGunCock();
+        SoundFX.playGunCock(enemy.position.x); // PHASE 4: boss flourish, from the boss
       }
 
       if (enemy.wallImpact) {
         enemy.wallImpact = false;
-        SoundFX.playPunch('heavy');
+        SoundFX.playPunch('heavy', enemy.position.x);
         camera.addTrauma(0.32);
         this.spawnShockwave(enemy.position.x, enemy.position.y - 45, 50, '#fbbf24');
         this.spawnSparks(enemy.position.x, enemy.position.y - 45, enemy.position.x > 0 ? -1 : 1, 14, '#fbbf24');
@@ -602,7 +602,7 @@ export class CombatDirector {
 
     // 12. PHASE 1B 7: bodies thrown into props — glass shatters, crates and
     // barrels are smashed (barrels cook off), the impact hurts the throwee.
-    this.resolveEnvironmentalImpacts(enemies, environmentManager, camera);
+    this.resolveEnvironmentalImpacts(enemies, environmentManager, camera, player.physics.position.x);
   }
 
   private checkPlayerGunfire(
@@ -1176,8 +1176,10 @@ export class CombatDirector {
     environmentManager: EnvironmentManager
   ): void {
     const RADIUS = 205;
-    SoundFX.playExplosion();
-    Haptics.cue('boom');
+    // PHASE 4: the blast is heard where it happened, and felt in proportion
+    // to how far away the player was standing when it went up.
+    SoundFX.playExplosion(x);
+    Haptics.cueAt('boom', Math.abs(x - player.physics.position.x));
     this.spawnShockwave(x, y, RADIUS, '#fb923c');
     this.spawnSparks(x, y, 1, 24, '#fdba74');
     this.spawnSparks(x, y, -1, 18, '#fef08a');
@@ -1653,7 +1655,10 @@ export class CombatDirector {
         else if (isFinisherHit) this.registerStyle('FINISHER');
         else if (soundType === 'kick') this.registerStyle('KICK');
         else this.registerStyle('JAB');
-        Haptics.cue(isFinisherHit || isHeavy ? 'heavy' : 'hit');
+        // PHASE 4 E6: the chain finisher gets its own build-and-slam rumble
+        // pattern; a plain heavy still lands as the single stronger buzz.
+        if (isFinisherHit) Haptics.takedown();
+        else Haptics.cue(isHeavy ? 'heavy' : 'hit');
 
         // Particles & Popups — blood sprays from the impact point on every landed hit
         this.spawnSparks(impactX, impactY, f, isHeavy ? 14 : 8, isHeavy ? '#f59e0b' : '#ef4444');
@@ -1719,7 +1724,7 @@ export class CombatDirector {
           const blockDuration = player.physics.stateTimer;
           if (blockDuration < 0.2) {
             // == PERFECT PARRY! ==
-            SoundFX.playParry();
+            SoundFX.playParry(hb.x);
             camera.addTrauma(0.35);
             this.hitStopFrames = 10;
             this.slowMoFactor = 0.25;
@@ -1745,7 +1750,7 @@ export class CombatDirector {
             return;
           } else {
             // Standard Block Guard
-            SoundFX.playPunch('light');
+            SoundFX.playPunch('light', hb.x);
             player.physics.stamina = Math.max(0, player.physics.stamina - 15);
             player.physics.velocity.x = hb.knockbackX * 0.3;
             camera.addTrauma(0.12);
@@ -1757,7 +1762,7 @@ export class CombatDirector {
 
         // Unblocked Hit: Player takes damage
         player.takeDamage(hb.damage, hb.knockbackX, hb.knockbackY);
-        SoundFX.playPunch('heavy');
+        SoundFX.playPunch('heavy', hb.x); // PHASE 4: struck from the enemy's side
         camera.addTrauma(0.35);
         this.hitStopFrames = hb.hitStopFrames;
         this.breakCombo(); // Chain interrupted
@@ -1852,7 +1857,7 @@ export class CombatDirector {
           0.09,
           3
         );
-        SoundFX.playGunshot();
+        SoundFX.playGunshot(b.x); // PHASE 4: reported from the shooter's muzzle
       }
       e.pendingShots.length = 0;
     }
@@ -1963,7 +1968,8 @@ export class CombatDirector {
   private resolveEnvironmentalImpacts(
     enemies: EnemyController[],
     environmentManager: EnvironmentManager | undefined,
-    camera: Camera
+    camera: Camera,
+    playerX: number
   ): void {
     if (!environmentManager) return;
 
@@ -2014,7 +2020,7 @@ export class CombatDirector {
         );
         this.announceMove(isBarrel ? 'ENVIRONMENTAL KILL' : 'ENV IMPACT');
         camera.addTrauma(isBarrel ? 0.5 : 0.28);
-        Haptics.cue(isBarrel ? 'boom' : 'heavy');
+        Haptics.cueAt(isBarrel ? 'boom' : 'heavy', Math.abs(enemy.position.x - playerX));
         break;
       }
     }
@@ -2088,7 +2094,7 @@ export class CombatDirector {
         // PHASE 1B 9/8: the slam frame gets the tightest framing of the move
         camera.pushIn(1.42, 0.95);
         this.registerStyle('TAKEDOWN');
-        Haptics.cue('takedown');
+        Haptics.takedown(); // PHASE 4 E6: multi-pulse judo-slam flourish
 
         // == GUN-FU RELEASE: the slammed body becomes the projectile ==
         // Aim it at whoever is left standing so the throw bowls through the
@@ -2179,7 +2185,7 @@ export class CombatDirector {
         // PHASE 1B 9/8: temple shot gets its own push-in + style credit
         camera.pushIn(1.45, 1.0);
         this.registerStyle('EXECUTION');
-        Haptics.cue('takedown');
+        Haptics.takedown(); // PHASE 4 E6: temple-shot flourish
       } else {
         // Rolled through the muzzle — release them instead of leaving a
         // GRAPPLED husk behind when the grapple ends
@@ -2262,7 +2268,7 @@ export class CombatDirector {
         body.velocity.x *= 0.72; // energy transferred into the pin
         this.hitStopFrames = Math.max(this.hitStopFrames, 5);
         camera.addTrauma(0.3);
-        SoundFX.playPunch('heavy');
+        SoundFX.playPunch('heavy', other.position.x);
         this.spawnShockwave(other.position.x, other.position.y - 50, 45, '#fbbf24');
         this.spawnSparks(other.position.x, other.position.y - 50, dir, 14, '#fbbf24');
         this.spawnBlood(other.position.x, other.position.y - 56, dir, 8);

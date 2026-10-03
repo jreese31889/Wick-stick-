@@ -10,7 +10,22 @@
  *
  * Per-hit `playbackRate` jitter keeps repeated triggers (a punch string, a
  * volley of shots) from sounding machine-gunned.
+ *
+ * PHASE 4 E5/E2 — spatial voices + music ducking:
+ *   • World sounds take an optional world-x. Distance from the listener
+ *     (the player, pushed every frame by GameLoop) sets attenuation and a
+ *     gentle low-pass, and the horizontal offset sets the stereo pan.
+ *     Omitting x keeps the exact shipped centred/full-level path, which is
+ *     what every player-owned sound uses.
+ *   • The gain → filter → panner strip for a spatial voice comes from a
+ *     fixed pool built once per context. Only the AudioBufferSourceNode
+ *     (which WebAudio forces you to allocate per trigger) is transient, so
+ *     a wall of hits never allocates a node graph.
+ *   • Peaks also duck the score (Music.duck) so a fat combo sits on top of
+ *     the mix instead of fighting it.
  */
+
+import { Music } from './Music';
 
 const SAMPLE_FILES = {
   shot1: 'gun_pistol_shot1.ogg',
@@ -50,12 +65,37 @@ const SAMPLE_URLS: Record<SampleId, string> = (() => {
 
 const GUNSHOT_SAMPLES: SampleId[] = ['shot1', 'shot2', 'shot3', 'shot4'];
 
+/* ---------------- PHASE 4 — spatial voice pool ---------------- */
+
+/** Distance (px) at which a world sound has lost half its level. */
+const SPATIAL_REF = 700;
+/** Horizontal distance mapped to full stereo separation. */
+const SPATIAL_PAN = 650;
+/** Beyond this the low-pass has already eaten the top end. */
+const SPATIAL_MAX_PAN = 0.85;
+/** Fixed number of reusable gain → filter → panner strips. */
+const SPATIAL_VOICES = 8;
+/** SFX at or above this gain pull the score down while they ring out. */
+const DUCK_THRESHOLD = 0.55;
+
+interface SpatialVoice {
+  input: GainNode;
+  filter: BiquadFilterNode;
+  panner: StereoPannerNode;
+  /** ctx time when this strip frees up (sources are one-shot). */
+  busyUntil: number;
+}
+
 class SoundEngine {
   public enabled: boolean = true;
 
   private ctx: AudioContext | null = null;
   private buffers = new Map<SampleId, AudioBuffer>();
   private loadStarted = false;
+
+  /** PHASE 4: listener (player) world x — pushed once per frame. */
+  private listenerX = 0;
+  private readonly voices: SpatialVoice[] = [];
 
   /**
    * Builds the AudioContext and starts fetching + decoding every sample.
@@ -69,6 +109,14 @@ class SoundEngine {
   public preload(): void {
     this.initCtx();
     this.loadSamples();
+  }
+
+  /**
+   * PHASE 4 — where the world is heard from. Called by GameLoop with the
+   * player's x each frame; a plain field write, so it costs nothing.
+   */
+  public setListenerX(x: number): void {
+    this.listenerX = x;
   }
 
   private initCtx() {
@@ -116,6 +164,56 @@ class SoundEngine {
   }
 
   /**
+   * Builds the reusable spatial strips once per context. Each is
+   * gain → low-pass → stereo pan → master fader (ctx.destination is patched
+   * by settings.ts), so a world voice only ever varies two param values.
+   */
+  private buildVoices(ctx: AudioContext): void {
+    while (this.voices.length < SPATIAL_VOICES) {
+      try {
+        const input = ctx.createGain();
+        const filter = ctx.createBiquadFilter();
+        filter.type = 'lowpass';
+        filter.frequency.value = 20000;
+        const panner = ctx.createStereoPanner();
+        input.connect(filter);
+        filter.connect(panner);
+        panner.connect(ctx.destination);
+        this.voices.push({ input, filter, panner, busyUntil: 0 });
+      } catch {
+        break; // No spatial hardware → the centred path still plays.
+      }
+    }
+  }
+
+  /** First free strip, or null when the pool is saturated (caller falls back). */
+  private acquireVoice(ctx: AudioContext): SpatialVoice | null {
+    if (this.voices.length < SPATIAL_VOICES) this.buildVoices(ctx);
+    const now = ctx.currentTime;
+    for (const voice of this.voices) {
+      if (voice.busyUntil <= now) return voice;
+    }
+    return null;
+  }
+
+  /**
+   * Distance + pan model for a world source.
+   * `att` is an inverse-distance curve (1 at the player, 0.5 at 700 px),
+   * `pan` mirrors how far left/right the source sits, and the low-pass
+   * closes down as the source gets further away (air absorption).
+   */
+  private spatialize(voice: SpatialVoice, sourceX: number, volume: number): number {
+    const dx = sourceX - this.listenerX;
+    const dist = Math.abs(dx);
+    const att = SPATIAL_REF / (SPATIAL_REF + dist);
+    const pan = Math.max(-1, Math.min(1, dx / SPATIAL_PAN)) * SPATIAL_MAX_PAN;
+    voice.input.gain.value = volume * att;
+    voice.panner.pan.value = pan;
+    voice.filter.frequency.value = Math.max(900, Math.min(20000, 20000 - dist * 7));
+    return att;
+  }
+
+  /**
    * One-shot sample trigger.
    *
    * @param volume  per-effect gain (files are peak-normalised to -1 dBFS)
@@ -136,6 +234,11 @@ class SoundEngine {
     const buffer = this.buffers.get(id);
     if (!buffer) return; // Not loaded (or failed to load) — silent skip.
 
+    // PHASE 4 E5: loud effects duck the score while they ring out.
+    if (volume >= DUCK_THRESHOLD) {
+      Music.duck(volume >= 0.75 ? 0.5 : 0.32, 0.12);
+    }
+
     try {
       const source = ctx.createBufferSource();
       source.buffer = buffer;
@@ -154,34 +257,108 @@ class SoundEngine {
     }
   }
 
-  /** Swing / whiff air movement. Pitch parameter scales playbackRate. */
-  public playWhoosh(pitchMultiplier = 1.0) {
-    const id: SampleId = Math.random() < 0.5 ? 'whoosh' : 'whoosh2';
-    this.playSample(id, 0.4, pitchMultiplier, 0.05);
+  /**
+   * PHASE 4 — spatialised one-shot. Same rules as playSample, but the voice
+   * routes through a pooled strip placed at `sourceX` in the world. Falls
+   * back to the shipped centred path when the pool is saturated, so a hit
+   * is never dropped or cut short.
+   */
+  private playWorld(
+    id: SampleId,
+    volume: number,
+    sourceX: number,
+    rate = 1,
+    jitter = 0,
+    delay = 0
+  ): void {
+    if (!this.enabled) return;
+    if (!this.loadStarted) this.preload();
+    this.initCtx();
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const buffer = this.buffers.get(id);
+    if (!buffer) return;
+
+    const voice = this.acquireVoice(ctx);
+    if (!voice) {
+      this.playSample(id, volume, rate, jitter, delay);
+      return;
+    }
+
+    if (volume >= DUCK_THRESHOLD) {
+      Music.duck(volume >= 0.75 ? 0.5 : 0.32, 0.12);
+    }
+
+    try {
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      const jittered = jitter > 0 ? rate + (Math.random() * 2 - 1) * jitter : rate;
+      source.playbackRate.value = Math.min(3, Math.max(0.25, jittered));
+
+      this.spatialize(voice, sourceX, volume);
+      source.connect(voice.input);
+
+      const start = ctx.currentTime + Math.max(0, delay);
+      voice.busyUntil = start + buffer.duration / source.playbackRate.value + 0.04;
+      source.onended = () => {
+        try {
+          source.disconnect();
+        } catch {
+          // Already torn down — fine.
+        }
+      };
+      source.start(start);
+    } catch {
+      // Audio safety — a dead node must never take the frame down.
+    }
   }
 
-  /** Impacts: light jab / heavy punch / kick thud / body slam. */
-  public playPunch(type: 'light' | 'heavy' | 'kick' | 'slam' = 'light') {
+  /**
+   * Shared router for every effect that can be world-sourced: passing an `x`
+   * spatialises it, omitting it keeps the shipped centred/full path.
+   */
+  private fire(
+    id: SampleId,
+    volume: number,
+    x: number | undefined,
+    rate = 1,
+    jitter = 0,
+    delay = 0
+  ): void {
+    if (x === undefined) this.playSample(id, volume, rate, jitter, delay);
+    else this.playWorld(id, volume, x, rate, jitter, delay);
+  }
+
+  /** Swing / whiff air movement. Pitch parameter scales playbackRate.
+   *  `x` = swing origin (enemy swings pass theirs — player swings centre). */
+  public playWhoosh(pitchMultiplier = 1.0, x?: number) {
+    const id: SampleId = Math.random() < 0.5 ? 'whoosh' : 'whoosh2';
+    this.fire(id, 0.4, x, pitchMultiplier, 0.05);
+  }
+
+  /** Impacts: light jab / heavy punch / kick thud / body slam.
+   *  `x` = impact origin in world space (undefined = the player's own hit). */
+  public playPunch(type: 'light' | 'heavy' | 'kick' | 'slam' = 'light', x?: number) {
     switch (type) {
       case 'heavy':
-        this.playSample('punchHeavy', 0.62, 1, 0.06);
+        this.fire('punchHeavy', 0.62, x, 1, 0.06);
         break;
       case 'kick':
-        this.playSample('kick', 0.6, 1, 0.06);
+        this.fire('kick', 0.6, x, 1, 0.06);
         break;
       case 'slam':
-        this.playSample('slam', 0.7, 1, 0.05);
+        this.fire('slam', 0.7, x, 1, 0.05);
         break;
       case 'light':
       default:
-        this.playSample('punchLight', 0.55, 1, 0.06);
+        this.fire('punchLight', 0.55, x, 1, 0.06);
         break;
     }
   }
 
   /** Guard impact / perfect-parry deflection (same steel-block recording). */
-  public playParry() {
-    this.playSample('block', 0.6, 1, 0.05);
+  public playParry(x?: number) {
+    this.fire('block', 0.6, x, 1, 0.05);
   }
 
   /** Ground slide friction. */
@@ -189,10 +366,11 @@ class SoundEngine {
     this.playSample('slide', 0.5, 1, 0.05);
   }
 
-  /** Pistol report: random one of the four real recordings + rate jitter. */
-  public playGunshot() {
+  /** Pistol report: random one of the four real recordings + rate jitter.
+   *  `x` = muzzle position (enemy gunfire passes theirs). */
+  public playGunshot(x?: number) {
     const pick = GUNSHOT_SAMPLES[(Math.random() * GUNSHOT_SAMPLES.length) | 0];
-    this.playSample(pick, 0.5, 1, 0.06);
+    this.fire(pick, 0.5, x, 1, 0.06);
   }
 
   /**
@@ -200,33 +378,33 @@ class SoundEngine {
    * exact shipped signature, so every existing call site is untouched.
    * The four guns are voiced from the same sample bank via rate/volume shaping.
    */
-  public playGunReport(kind: 'PISTOL' | 'SMG' | 'SHOTGUN' | 'RIFLE') {
+  public playGunReport(kind: 'PISTOL' | 'SMG' | 'SHOTGUN' | 'RIFLE', x?: number) {
     const pick = GUNSHOT_SAMPLES[(Math.random() * GUNSHOT_SAMPLES.length) | 0];
     switch (kind) {
       case 'SMG':
         // Crisp, dry and rapid — lighter gain, slight up-pitch
-        this.playSample(pick, 0.36, 1.18, 0.07);
+        this.fire(pick, 0.36, x, 1.18, 0.07);
         break;
       case 'SHOTGUN':
         // Deep boom: down-pitched report + a body thud underneath
-        this.playSample(pick, 0.7, 0.62, 0.05);
-        this.playSample('slam', 0.4, 0.7, 0.05, 0.01);
+        this.fire(pick, 0.7, x, 0.62, 0.05);
+        this.fire('slam', 0.4, x, 0.7, 0.05, 0.01);
         break;
       case 'RIFLE':
         // Long, hard crack — down-pitch with a touch more gain
-        this.playSample(pick, 0.6, 0.82, 0.04);
+        this.fire(pick, 0.6, x, 0.82, 0.04);
         break;
       case 'PISTOL':
       default:
-        this.playGunshot();
+        this.playGunshot(x);
         break;
     }
   }
 
   /** Explosive-barrel detonation (Phase 1 D3/E4): slammed low boom. */
-  public playExplosion() {
-    this.playSample('slam', 0.85, 0.5, 0.08);
-    this.playSample('glass', 0.3, 0.7, 0.1, 0.04);
+  public playExplosion(x?: number) {
+    this.fire('slam', 0.85, x, 0.5, 0.08);
+    this.fire('glass', 0.3, x, 0.7, 0.1, 0.04);
   }
 
   /** Full reload foley, accented by a slide-rack cock near the end. */
@@ -236,13 +414,13 @@ class SoundEngine {
   }
 
   /** Manual slide-rack click (empty chamber / gun-fu accents). */
-  public playGunCock() {
-    this.playSample('gunCock', 0.5, 1, 0.04);
+  public playGunCock(x?: number) {
+    this.fire('gunCock', 0.5, x, 1, 0.04);
   }
 
   /** Katana / blade arc. */
-  public playBladeSlash() {
-    this.playSample('katana', 0.5, 1, 0.05);
+  public playBladeSlash(x?: number) {
+    this.fire('katana', 0.5, x, 1, 0.05);
   }
 
   /** Thrown knife leaving the hand. */
@@ -251,13 +429,13 @@ class SoundEngine {
   }
 
   /** Knife burying itself in a target (impale). */
-  public playKnifeStab() {
-    this.playSample('knifeStab', 0.55, 1, 0.05);
+  public playKnifeStab(x?: number) {
+    this.fire('knifeStab', 0.55, x, 1, 0.05);
   }
 
-  /** Glass display / bottle shatter. */
-  public playGlassShatter() {
-    this.playSample('glass', 0.55, 1, 0.05);
+  /** Glass display / bottle shatter — `x` = the prop's world position. */
+  public playGlassShatter(x?: number) {
+    this.fire('glass', 0.55, x, 1, 0.05);
   }
 
   /** Continental gold coin pickup. */
