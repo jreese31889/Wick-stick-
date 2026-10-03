@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { GameLoop } from './engine/GameLoop';
+import { GUNS } from './engine/Weapons';
 import { GameCanvas } from './components/GameCanvas';
 import { VirtualControls } from './components/VirtualControls';
 import {
@@ -539,6 +540,7 @@ export default function App() {
   const physics = gameLoop.player.physics;
   const enemies = gameLoop.enemies;
   const combat = gameLoop.combatDirector;
+  const heldGunName = GUNS[gameLoop.player.currentGun].name;
   const roomConfig = gameLoop.environmentManager.config;
   const isDoorOpen = gameLoop.environmentManager.doorOpen;
   const isNearDoor = isDoorOpen && Math.abs(physics.position.x - gameLoop.environmentManager.doorX) < 80;
@@ -604,10 +606,10 @@ export default function App() {
             />
           </div>
 
-          {/* Tactical 9mm Ammo Indicator */}
+          {/* Held firearm: name, magazine / reserve readout (Phase 1 B6/D5) */}
           <div className="flex items-center justify-between pt-0.5 text-[10px] font-mono">
             <span className="text-neutral-400 flex items-center gap-1">
-              <span className="text-amber-400 font-bold">PISTOL</span>
+              <span className="text-amber-400 font-bold">{heldGunName}</span>
               {physics.isReloading ? (
                 <span className="text-yellow-400 font-bold animate-pulse">RELOADING...</span>
               ) : (
@@ -615,19 +617,31 @@ export default function App() {
                   {physics.ammo} / {physics.maxAmmo}
                 </span>
               )}
+              <span className="text-sky-400/90 font-bold">+{physics.reserveAmmo}</span>
             </span>
-            <div className="flex items-center gap-1">
-              {Array.from({ length: physics.maxAmmo }).map((_, i) => (
-                <span
-                  key={i}
-                  className={`inline-block w-1.5 h-3 rounded-[2px] transition-colors ${
-                    i < physics.ammo
-                      ? 'bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.6)]'
-                      : 'bg-neutral-700'
-                  }`}
+            {physics.maxAmmo <= 12 ? (
+              <div className="flex items-center gap-1">
+                {Array.from({ length: physics.maxAmmo }).map((_, i) => (
+                  <span
+                    key={i}
+                    className={`inline-block w-1.5 h-3 rounded-[2px] transition-colors ${
+                      i < physics.ammo
+                        ? 'bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.6)]'
+                        : 'bg-neutral-700'
+                    }`}
+                  />
+                ))}
+              </div>
+            ) : (
+              /* Big magazines (SMG/RIFLE) read as a fill bar — 30 pips would
+                 blow out the panel width on a phone */
+              <div className="w-16 sm:w-20 h-2.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10">
+                <div
+                  className="h-full bg-gradient-to-r from-amber-500 to-yellow-400 transition-all duration-75"
+                  style={{ width: `${(physics.ammo / physics.maxAmmo) * 100}%` }}
                 />
-              ))}
-            </div>
+              </div>
+            )}
           </div>
           {/* High Table Gold Coins & Equipped Weapon */}
           <div className="flex items-center gap-2 pt-1 border-t border-white/5">
@@ -983,7 +997,8 @@ export default function App() {
                 <div className="text-neutral-300"><span className="text-yellow-300 font-semibold">RB / R1:</span> Grab / Close-Quarters Takedown</div>
                 <div className="text-neutral-300"><span className="text-neutral-400 font-semibold">LT / L2:</span> Tactical Pistol Reload</div>
                 <div className="text-neutral-300"><span className="text-amber-400 font-semibold">RT / R2:</span> Gun-Fu Fire / Shotgun / Throw</div>
-                <div className="text-neutral-300"><span className="text-purple-300 font-semibold">Select / L3 / R3:</span> Bullet-Time Focus</div>
+                <div className="text-neutral-300"><span className="text-purple-300 font-semibold">Select / R3:</span> Bullet-Time Focus</div>
+                <div className="text-neutral-300"><span className="text-sky-300 font-semibold">L3:</span> Cycle Firearms (pistol → SMG → shotgun → rifle)</div>
                 <div className="text-neutral-300"><span className="text-neutral-400 font-semibold">Start / Menu:</span> Tactical Pause Menu</div>
               </div>
 

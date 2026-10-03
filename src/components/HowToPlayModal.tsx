@@ -21,7 +21,8 @@ const BINDINGS: { action: string; touch: string; gamepad: string }[] = [
   { action: 'Grab / takedown', touch: 'GRAB button', gamepad: 'RB (R1)' },
   { action: 'Jump', touch: 'JUMP button', gamepad: 'A (Cross)' },
   { action: 'Reload', touch: 'RELOAD button', gamepad: 'LT (L2)' },
-  { action: 'Bullet-time focus', touch: 'FOCUS button', gamepad: 'Select / L3 / R3' },
+  { action: 'Swap firearm', touch: 'SWAP button', gamepad: 'L3 (left stick click)' },
+  { action: 'Bullet-time focus', touch: 'FOCUS button', gamepad: 'Select / R3' },
   { action: 'Action / enter door', touch: 'ACTION / ENTER button', gamepad: 'A or RT (contextual)' },
   { action: 'Pause', touch: 'Pause button (top right)', gamepad: 'Start / Menu' },
 ];

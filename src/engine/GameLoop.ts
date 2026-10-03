@@ -6,6 +6,7 @@ import { Camera } from './Camera';
 import { Renderer } from './Renderer';
 import { SoundFX } from './SoundFX';
 import { EnvironmentManager } from './EnvironmentManager';
+import { GUNS } from './Weapons';
 import { ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
 
@@ -211,14 +212,28 @@ export class GameLoop {
       );
     }
 
+    // Phase 1 C5: elite promotion — later waves mint violet/gold variants of
+    // the normal archetypes (bosses and the ELITE rank are exempt inside).
+    const eliteChance = this.waveNumber >= 7 ? 0.4 : this.waveNumber >= 3 ? 0.2 : 0;
+    if (eliteChance > 0) {
+      for (const e of this.enemies) {
+        if (Math.random() < eliteChance) e.promoteToElite();
+      }
+    }
+
     // Endless-mode difficulty scaling beyond the authored milestones (wave 7+)
     if (this.waveNumber >= 7) {
       const over = this.waveNumber - 6;
       const hpMult = 1 + over * 0.15;
       const dmgMult = 1 + over * 0.08;
+      const speedMult = 1 + over * 0.05; // Phase 1 C7: the speed leg
       for (const e of this.enemies) {
-        e.applyWaveScaling(hpMult, dmgMult);
+        e.applyWaveScaling(hpMult, dmgMult, speedMult);
       }
+    }
+
+    if (isBoss || size === 4) {
+      this.combatDirector.announceMove('⚔️ HIGH TABLE MASTER DESCENDS', 2.4);
     }
 
     this.markWaveSpawn();
@@ -280,6 +295,7 @@ export class GameLoop {
       this.player.finisherArmed = false;
       this.combatDirector.resetTransientState();
       this.player.pendingPistolShot = false;
+      this.player.pendingSalvoShot = false;
       this.combatDirector.hitStopFrames = 0;
 
     this.environmentManager.reset();
@@ -456,9 +472,24 @@ export class GameLoop {
       if (allEnemiesDefeated && !this.waveClearMarked) {
         this.waveClearMarked = true;
         this.markWaveClear();
+        this.player.restockAmmo();
       }
       this.environmentManager.setDoorOpen(allEnemiesDefeated);
       this.environmentManager.update(effectiveDt, this.player.physics);
+
+      // 3b. Phase-1 inventory pickups queued by the environment (guns + ammo)
+      const queuedGun = this.player.physics.pendingGunPickup;
+      if (queuedGun) {
+        this.player.physics.pendingGunPickup = null;
+        this.player.pickupGun(queuedGun);
+        this.combatDirector.announceMove(`${GUNS[queuedGun].name} ACQUIRED`);
+      }
+      const queuedAmmo = this.player.physics.pendingAmmo;
+      if (queuedAmmo && queuedAmmo > 0) {
+        this.player.physics.pendingAmmo = 0;
+        this.player.pickupAmmo(queuedAmmo);
+        this.combatDirector.addAmmoPopup(this.player.physics.position.x, this.player.physics.position.y - 120, queuedAmmo);
+      }
 
       // Check door transition to next chamber
       const enteredDoor = this.environmentManager.checkDoorInteraction(

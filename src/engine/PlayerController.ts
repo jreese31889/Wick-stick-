@@ -4,6 +4,7 @@ import { AnimationController } from './AnimationController';
 import { StickRig } from './StickRig';
 import { SoundFX } from './SoundFX';
 import { Ragdoll } from './Ragdoll';
+import { GUNS, GUN_ORDER, GunId, isGun } from './Weapons';
 
 /** Rate-limited step toward a target: reaches it exactly, at any frame rate. */
 function moveToward(current: number, target: number, maxDelta: number): number {
@@ -60,6 +61,26 @@ export class PlayerController {
    */
   public pendingPistolShot = false;
   /**
+   * Same deferred-SHOOT edge for the automatics and the shotgun. Only the
+   * director can see live targets, so it decides between a point-blank whip
+   * and a real shot (ammo spend, recoil, tracers) and resolves it here.
+   */
+  public pendingSalvoShot = false;
+  /** One salvo per trigger pull — the director clears it once a shot commits. */
+  public hasFiredSalvoThisShot = false;
+
+  // ---- Phase 1 firearm arsenal (stats live in engine/Weapons.ts) ----
+  /** The held gun. Never written into `physics.equippedWeapon` — that stays melee. */
+  public currentGun: GunId = 'PISTOL';
+  public gunState: Record<GunId, { owned: boolean; ammo: number; reserve: number; magSize: number }> = {
+    PISTOL: { owned: true, ammo: GUNS.PISTOL.magSize, reserve: GUNS.PISTOL.reserveMax, magSize: GUNS.PISTOL.magSize },
+    SMG: { owned: false, ammo: 0, reserve: 0, magSize: GUNS.SMG.magSize },
+    SHOTGUN: { owned: false, ammo: 0, reserve: 0, magSize: GUNS.SHOTGUN.magSize },
+    RIFLE: { owned: false, ammo: 0, reserve: 0, magSize: GUNS.RIFLE.magSize },
+  };
+  /** Seconds until the held gun may fire again (automatics only need this). */
+  private gunCooldown = 0;
+  /**
    * Seconds spent at (nearly) full run speed with the stick held — the KICK
    * button turns into a FLYING KICK once this crosses FLYING_KICK_SUSTAIN.
    */
@@ -100,8 +121,9 @@ export class PlayerController {
       maxHealth: 100,
       stamina: 100,
       maxStamina: 100,
-      ammo: 7,
-      maxAmmo: 7,
+      ammo: GUNS.PISTOL.magSize,
+      maxAmmo: GUNS.PISTOL.magSize,
+      reserveAmmo: GUNS.PISTOL.reserveMax,
       isReloading: false,
       reloadTimer: 0,
       equippedWeapon: 'UNARMED',
@@ -141,6 +163,8 @@ export class PlayerController {
       focusJustPressed: false,
       special: false,
       specialJustPressed: false,
+      swap: false,
+      swapJustPressed: false,
     };
 
     this.currentPose = this.animController.generatePose(
@@ -158,6 +182,117 @@ export class PlayerController {
     } else {
       this.physics.weaponDurability = 4;
     }
+  }
+
+  // ---- Phase 1 arsenal: reload / swap / pickups (stats from engine/Weapons.ts) ----
+
+  /**
+   * Starts a reload for the held gun: tactical timer when rounds remain in the
+   * magazine, empty-chamber timer when it is dry. No-op when already reloading
+   * or when there is nothing to move out of the reserve.
+   */
+  public beginReload(): void {
+    if (this.physics.isReloading) return;
+    const gun = this.gunState[this.currentGun];
+    if (this.physics.ammo >= gun.magSize || this.physics.reserveAmmo <= 0) return;
+    const stats = GUNS[this.currentGun];
+    this.physics.isReloading = true;
+    this.physics.reloadTimer = this.physics.ammo > 0 ? stats.reloadTactical : stats.reloadEmpty;
+    SoundFX.playReload();
+  }
+
+  /** Moves rounds from reserve into the magazine when the reload timer lapses. */
+  private finishReload(): void {
+    const gun = this.gunState[this.currentGun];
+    const need = this.physics.maxAmmo - this.physics.ammo;
+    const take = Math.min(need, this.physics.reserveAmmo);
+    this.physics.ammo += take;
+    this.physics.reserveAmmo -= take;
+    gun.ammo = this.physics.ammo;
+    gun.reserve = this.physics.reserveAmmo;
+    this.physics.isReloading = false;
+    this.physics.reloadTimer = 0;
+  }
+
+  /** Cycles to the next owned firearm in roster order (wraps around). */
+  public cycleGun(): void {
+    const start = Math.max(0, GUN_ORDER.indexOf(this.currentGun));
+    for (let i = 1; i <= GUN_ORDER.length; i++) {
+      const id = GUN_ORDER[(start + i) % GUN_ORDER.length];
+      if (id !== this.currentGun && this.gunState[id].owned) {
+        this.equipGun(id);
+        return;
+      }
+    }
+    SoundFX.playGunCock(); // single gun — rack the slide as feedback
+  }
+
+  /** Stashes the held magazine, loads the new gun's and mirrors it into physics. */
+  private equipGun(id: GunId): void {
+    const cur = this.gunState[this.currentGun];
+    cur.ammo = this.physics.ammo;
+    cur.reserve = this.physics.reserveAmmo;
+    cur.magSize = this.physics.maxAmmo;
+
+    this.currentGun = id;
+    const next = this.gunState[id];
+    this.physics.ammo = next.ammo;
+    this.physics.maxAmmo = next.magSize;
+    this.physics.reserveAmmo = next.reserve;
+    this.physics.isReloading = false;
+    this.physics.reloadTimer = 0;
+    this.gunCooldown = 0;
+
+    // A picked-up melee SHOTGUN would otherwise shadow the arsenal shotgun
+    if (id === 'SHOTGUN' && this.physics.equippedWeapon === 'SHOTGUN') {
+      this.physics.equippedWeapon = 'UNARMED';
+    }
+    SoundFX.playGunCock();
+  }
+
+  /** Weapon-pickup entry point (GameLoop drains `physics.pendingGunPickup`). */
+  public pickupGun(weapon: WeaponType): void {
+    if (!isGun(weapon)) return;
+    const id = weapon as GunId;
+    const stats = GUNS[id];
+    const gun = this.gunState[id];
+    const magSize = id === 'PISTOL' && this.physics.perks['EXTENDED_MAG'] ? 12 : stats.magSize;
+
+    if (!gun.owned) {
+      gun.owned = true;
+      gun.magSize = magSize;
+      gun.ammo = magSize;
+      gun.reserve = stats.reserveMax;
+      this.equipGun(id);
+      // Brand new gun: it comes out of the case loaded, reserve full
+      this.physics.ammo = magSize;
+      this.physics.maxAmmo = magSize;
+      this.physics.reserveAmmo = stats.reserveMax;
+      gun.ammo = magSize;
+      gun.reserve = stats.reserveMax;
+    } else {
+      gun.reserve = Math.min(stats.reserveMax, gun.reserve + Math.ceil(stats.reserveMax / 2));
+      this.equipGun(id);
+    }
+  }
+
+  /** Ammo-pack pickup: tops up the held gun's reserve (GameLoop drains pendingAmmo). */
+  public pickupAmmo(rounds: number): void {
+    const stats = GUNS[this.currentGun];
+    const gun = this.gunState[this.currentGun];
+    gun.reserve = Math.min(stats.reserveMax, gun.reserve + rounds);
+    this.physics.reserveAmmo = gun.reserve;
+  }
+
+  /** Wave-clear restock: half a reserve pouch for every owned gun. */
+  public restockAmmo(): void {
+    for (let i = 0; i < GUN_ORDER.length; i++) {
+      const id = GUN_ORDER[i];
+      const gun = this.gunState[id];
+      if (!gun.owned) continue;
+      gun.reserve = Math.min(GUNS[id].reserveMax, gun.reserve + Math.ceil(GUNS[id].reserveMax / 2));
+    }
+    this.physics.reserveAmmo = this.gunState[this.currentGun].reserve;
   }
 
   public triggerFocus(): boolean {
@@ -178,6 +313,8 @@ export class PlayerController {
     } else if (perkId === 'EXTENDED_MAG') {
       this.physics.maxAmmo = 12;
       this.physics.ammo = 12;
+      this.gunState.PISTOL.magSize = 12;
+      this.gunState.PISTOL.ammo = Math.min(12, this.gunState.PISTOL.ammo + 5);
     } else if (perkId === 'LETHAL_BLADE' && this.physics.equippedWeapon === 'KATANA') {
       this.physics.weaponDurability += 8;
     }
@@ -240,14 +377,16 @@ export class PlayerController {
       this.physics.stamina = Math.min(this.physics.maxStamina, this.physics.stamina + regenRate * dt);
     }
 
-    // Reload progress countdown
+    // Reload progress countdown — tactical (round stays chambered) vs empty
     if (this.physics.isReloading) {
       this.physics.reloadTimer -= dt;
       if (this.physics.reloadTimer <= 0) {
-        this.physics.isReloading = false;
-        this.physics.ammo = this.physics.maxAmmo;
+        this.finishReload();
       }
     }
+
+    // Per-gun inter-shot cooldown (automatics, shotgun, rifle)
+    if (this.gunCooldown > 0) this.gunCooldown = Math.max(0, this.gunCooldown - dt);
 
     // Bullet-Time Focus timer countdown
     if (this.physics.isFocusActive) {
@@ -381,11 +520,15 @@ export class PlayerController {
       this.triggerFocus();
     }
 
-    // RELOAD TRIGGER
-    if (input.reloadJustPressed && this.physics.ammo < this.physics.maxAmmo && !this.physics.isReloading && !this.physics.isDodging) {
-      this.physics.isReloading = true;
-      this.physics.reloadTimer = 0.95;
-      SoundFX.playReload();
+    // SWAP — cycle the owned firearms (keyboard X / pad L3 / touch SWAP)
+    if (input.swapJustPressed && !this.physics.isDodging) {
+      this.cycleGun();
+      return;
+    }
+
+    // RELOAD TRIGGER — tactical timer when a round is chambered, empty timer otherwise
+    if (input.reloadJustPressed && !this.physics.isReloading && !this.physics.isDodging) {
+      this.beginReload();
     }
 
     // TACTICAL GUN-FU / SHOTGUN / KNIFE THROW TRIGGER
@@ -414,11 +557,45 @@ export class PlayerController {
         }
       }
 
+      // Non-pistol firearms defer to the salvo path (pellets / per-gun stats)
+      if (this.currentGun !== 'PISTOL') {
+        if (this.physics.isReloading || this.gunCooldown > 0) return;
+        if (this.physics.ammo <= 0) {
+          SoundFX.playGunCock();
+          this.beginReload();
+          return;
+        }
+        this.gunCooldown = GUNS[this.currentGun].fireInterval;
+        this.pendingSalvoShot = true;
+        return;
+      }
+
       // Pistol: defer the whole resolution (point-blank PISTOL WHIP, real
       // shot, or empty-chamber click) to CombatDirector — it is the only
       // system with a view of live enemy range. No ammo is spent here.
       this.pendingPistolShot = true;
       return;
+    }
+
+    // Arsenal automatics (SMG): holding SHOOT keeps firing while the cooldown lapses
+    const autoStats = GUNS[this.currentGun];
+    if (
+      autoStats.auto &&
+      this.currentGun !== 'PISTOL' &&
+      input.shoot &&
+      !this.physics.isBlocking &&
+      !this.physics.isDodging &&
+      !this.physics.isSliding &&
+      !this.physics.isReloading &&
+      this.gunCooldown <= 0
+    ) {
+      if (this.physics.ammo <= 0) {
+        SoundFX.playGunCock();
+        this.beginReload();
+      } else {
+        this.gunCooldown = autoStats.fireInterval;
+        this.pendingSalvoShot = true;
+      }
     }
 
     // COMBO SPECIAL / SUPER — spends the combo meter (5 / 15 points)

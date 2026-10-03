@@ -4,8 +4,32 @@ import { Camera } from './Camera';
 import { SoundFX } from './SoundFX';
 import { ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
-import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc, EnemyBullet } from '../types/game';
+import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc, EnemyBullet, DestructibleObject } from '../types/game';
 import { EnvironmentManager } from './EnvironmentManager';
+import { GUNS, falloffMultiplier } from './Weapons';
+
+/**
+ * Distance along a ray to a vertical target segment (x = targetX, y within
+ * [minY, maxY]). Returns -1 on a miss. Allocation-free so it can run per
+ * pellet inside the fixed step.
+ */
+function rayToVertical(
+  ox: number,
+  oy: number,
+  dx: number,
+  dy: number,
+  targetX: number,
+  minY: number,
+  maxY: number,
+  maxT: number
+): number {
+  if (dx === 0) return -1;
+  const t = (targetX - ox) / dx;
+  if (t <= 0 || t > maxT) return -1;
+  const y = oy + dy * t;
+  if (y < minY || y > maxY) return -1;
+  return t;
+}
 
 /**
  * Recycles the oldest `count` entries of a capped FX array back into its pool
@@ -211,6 +235,11 @@ export class CombatDirector {
     this.bannerChanged = true;
   }
 
+  /** Reserve-ammunition pickup callout (Phase 1 D5). */
+  public addAmmoPopup(x: number, y: number, amount: number): void {
+    this.addPopup(x, y, `+${amount} ROUNDS`, '#7dd3fc', 16);
+  }
+
   /**
    * Clears everything transient — grapple, thrown bodies, riposte window and
    * HUD banner — so a wave reset can never resume a half-finished sequence.
@@ -301,6 +330,17 @@ export class CombatDirector {
       environmentManager.throwKnife(player.physics.position.x, player.physics.position.y, dir);
     }
 
+    // Phase 1 D3: queued explosive-barrel detonations (chained blasts drain here)
+    if (environmentManager) {
+      while (environmentManager.pendingExplosions.length > 0) {
+        const pending = environmentManager.pendingExplosions[environmentManager.pendingExplosions.length - 1];
+        const blastX = pending.x;
+        const blastY = pending.y;
+        environmentManager.releaseExplosion();
+        this.detonateBarrel(blastX, blastY, player, enemies, camera, environmentManager);
+      }
+    }
+
     // Check Projectiles hitting enemies
     if (environmentManager) {
       environmentManager.checkProjectilesAgainstEnemies(enemies, (enemy, damage, px, py) => {
@@ -325,6 +365,23 @@ export class CombatDirector {
 
     // Check Wall Bounce / Splat for any knocked enemies
     for (const enemy of enemies) {
+      // Phase 1 C6: a threshold just crossed — banner, shockwave, slow-mo
+      if (enemy.phaseChanged) {
+        enemy.phaseChanged = false;
+        this.announceMove(
+          enemy.type === 'MARQUIS'
+            ? `⚜️ PHASE ${enemy.bossPhase} — SOVEREIGN WRATH`
+            : `🔥 PHASE ${enemy.bossPhase} — ENRAGED`,
+          2.2
+        );
+        camera.addTrauma(0.45);
+        this.slowMoFactor = 0.4;
+        this.slowMoTimer = 0.35;
+        this.speedLinesTimer = 0.3;
+        this.spawnShockwave(enemy.position.x, enemy.position.y - 55, 85, '#f59e0b');
+        SoundFX.playGunCock();
+      }
+
       if (enemy.wallImpact) {
         enemy.wallImpact = false;
         SoundFX.playPunch('heavy');
@@ -369,6 +426,18 @@ export class CombatDirector {
           camera.addTrauma(0.4);
         }
 
+        // Phase 1 C6: the boss death cinematic — longer slow-mo, the wide
+        // shockwave and a score windfall on top of the kill payout
+        if (enemy.type === 'BOSS' || enemy.type === 'MARQUIS') {
+          this.slowMoFactor = 0.22;
+          this.slowMoTimer = 0.9;
+          this.speedLinesTimer = 0.8;
+          camera.addTrauma(0.75);
+          this.stats.score += 1000;
+          this.addPopup(enemy.position.x, enemy.position.y - 130, 'HIGH TABLE FALLS +1000', '#f59e0b', 24);
+          this.spawnShockwave(enemy.position.x, enemy.position.y - 60, 150, '#f59e0b');
+        }
+
         // Continental field medic kits: heavies often carry them, others rarely
         const medkitChance = enemy.type === 'BOSS' || enemy.type === 'MARQUIS' ? 1.0
           : enemy.type === 'HEAVY' ? 0.5
@@ -376,6 +445,14 @@ export class CombatDirector {
           : 0.12;
         if (Math.random() < medkitChance) {
           environmentManager.dropHealthPack(enemy.position.x, enemy.position.y - 20, 35);
+        }
+
+        // Field ammo pouches keep the reserve fed (Phase 1 D5)
+        const ammoChance = enemy.type === 'BOSS' || enemy.type === 'MARQUIS'
+          ? 1.0
+          : enemy.type === 'HEAVY' || enemy.type === 'ELITE' ? 0.5 : 0.22;
+        if (Math.random() < ammoChance) {
+          environmentManager.dropAmmoPack(enemy.position.x, enemy.position.y - 24, 16);
         }
       }
     }
@@ -407,7 +484,7 @@ export class CombatDirector {
     this.checkPlayerAttacks(player, enemies, camera, environmentManager);
 
     // 8. Check Player Tactical Gunfire (Gun-Fu)
-    this.checkPlayerGunfire(player, enemies, camera);
+    this.checkPlayerGunfire(player, enemies, camera, environmentManager);
 
     // 9. Check Enemy Attacks hitting Player
     this.checkEnemyAttacks(player, enemies, camera);
@@ -424,7 +501,8 @@ export class CombatDirector {
   private checkPlayerGunfire(
     player: PlayerController,
     enemies: EnemyController[],
-    camera: Camera
+    camera: Camera,
+    environmentManager?: EnvironmentManager
   ) {
     // Deferred SHOOT trigger: decide between a point-blank PISTOL WHIP and a
     // real round *before* any ammo is spent (see PlayerController.pendingPistolShot).
@@ -436,11 +514,7 @@ export class CombatDirector {
       if (player.physics.ammo <= 0) {
         // Empty chamber click + auto reload (never fires a phantom round)
         SoundFX.playGunCock();
-        if (!player.physics.isReloading) {
-          player.physics.isReloading = true;
-          player.physics.reloadTimer = 0.95;
-          SoundFX.playReload();
-        }
+        player.beginReload();
         return;
       }
 
@@ -453,6 +527,14 @@ export class CombatDirector {
       player.hasFiredBulletThisShot = true;
     }
 
+    // Phase 1 arsenal: SMG / SHOTGUN / RIFLE salvo (its own stats, pellets,
+    // falloff, recoil and hit-stop — the pistol path below is untouched).
+    if (player.pendingSalvoShot) {
+      player.pendingSalvoShot = false;
+      this.resolveSalvoShot(player, enemies, camera, environmentManager);
+      return;
+    }
+
     if (!player.hasFiredBulletThisShot) return;
     player.hasFiredBulletThisShot = false;
 
@@ -462,16 +544,7 @@ export class CombatDirector {
     const originY = player.physics.position.y - 62; // Tactical pistol muzzle height
 
     // 1. Eject spent brass casing with realistic tumbling physics
-    trimOldest(this.casings, this.casings.length + 1 - CombatDirector.MAX_CASINGS, this.casingPool);
-    const casing = this.casingPool.acquire();
-    casing.x = originX - dir * 10;
-    casing.y = originY + 2;
-    casing.vx = -dir * (90 + Math.random() * 60);
-    casing.vy = -(120 + Math.random() * 80);
-    casing.rot = Math.random() * Math.PI * 2;
-    casing.vRot = (Math.random() - 0.5) * 24;
-    casing.life = 1.4;
-    this.casings.push(casing);
+    this.ejectCasing(originX, originY, dir);
 
     // 2. Raycast against active enemies along bullet trajectory
     let closestEnemy: EnemyController | null = null;
@@ -489,6 +562,29 @@ export class CombatDirector {
           closestDist = enemyDistX;
           closestEnemy = enemy;
         }
+      }
+    }
+
+    // Phase 1 D2: props standing in the muzzle line take the round instead
+    if (environmentManager) {
+      let propDist = closestDist;
+      let propHit: DestructibleObject | null = null;
+      for (const obj of environmentManager.destructibles) {
+        if (obj.isBroken) continue;
+        const ahead = (obj.x - originX) * dir;
+        if (ahead <= 0 || ahead >= propDist) continue;
+        if (originY >= obj.y - obj.height && originY <= obj.y) {
+          propDist = ahead;
+          propHit = obj;
+        }
+      }
+      if (propHit) {
+        const impactX = originX + dir * propDist;
+        this.pushTracer(originX, originY, impactX, originY, 0.12, 3.5);
+        environmentManager.damageObject(propHit, 28, dir * 160, -60);
+        this.spawnSparks(impactX, originY, -dir, 8, this.surfaceColor(propHit.type));
+        camera.addTrauma(0.1);
+        return;
       }
     }
 
@@ -555,6 +651,245 @@ export class CombatDirector {
       // Wall ricochet sparks
       this.spawnSparks(endX, originY, -dir, 10, '#fef08a');
       camera.addTrauma(0.12);
+    }
+  }
+
+  /** Spent brass tumbling out of the ejection port (pooled, capped). */
+  private ejectCasing(originX: number, originY: number, dir: number): void {
+    trimOldest(this.casings, this.casings.length + 1 - CombatDirector.MAX_CASINGS, this.casingPool);
+    const casing = this.casingPool.acquire();
+    casing.x = originX - dir * 10;
+    casing.y = originY + 2;
+    casing.vx = -dir * (90 + Math.random() * 60);
+    casing.vy = -(120 + Math.random() * 80);
+    casing.rot = Math.random() * Math.PI * 2;
+    casing.vRot = (Math.random() - 0.5) * 24;
+    casing.life = 1.4;
+    this.casings.push(casing);
+  }
+
+  /** Phase 1 E3: impact colour by the surface the round actually struck. */
+  private surfaceColor(type: DestructibleObject['type'] | 'WALL'): string {
+    switch (type) {
+      case 'GLASS_DISPLAY':
+      case 'GLASS_PANEL':
+        return '#a5f3fc';
+      case 'CRATE':
+        return '#d97706';
+      case 'EXPLOSIVE_BARREL':
+        return '#fb923c';
+      case 'CHAMPAGNE_TABLE':
+        return '#94a3b8';
+      case 'WEAPON_RACK':
+        return '#64748b';
+      case 'WALL':
+      default:
+        return '#fef08a';
+    }
+  }
+
+  /**
+   * Phase 1 B6: the automatics' shot. One ray per pellet with weapon spread
+   * and distance falloff, resolved against the squad and any prop in the
+   * line; hit-stop / trauma come from the firing weapon's own stat row.
+   */
+  private resolveSalvoShot(
+    player: PlayerController,
+    enemies: EnemyController[],
+    camera: Camera,
+    environmentManager?: EnvironmentManager
+  ): void {
+    const stats = GUNS[player.currentGun];
+    if (player.physics.ammo <= 0) return;
+
+    player.physics.ammo--;
+    player.physics.isReloading = false;
+    player.forceState('ATTACK_GUN_SHOT');
+    SoundFX.playGunReport(stats.id);
+    const recoilDir = player.physics.facingRight ? -1 : 1;
+    player.physics.velocity.x = recoilDir * stats.recoil;
+
+    const dir = player.physics.facingRight ? 1 : -1;
+    const originX = player.physics.position.x + dir * 34;
+    const originY = player.physics.position.y - 62;
+    this.ejectCasing(originX, originY, dir);
+
+    const MAX_RANGE = 1500;
+    const comboMult = this.comboDamageMultiplier();
+    let totalDamage = 0;
+    let anchorX = originX + dir * 320;
+    let anchorY = originY;
+    let hitEnemyOnce = false;
+
+    for (let pellet = 0; pellet < stats.pellets; pellet++) {
+      const spread = stats.spread > 0 ? (Math.random() * 2 - 1) * stats.spread : 0;
+      const dx = Math.cos(spread) * dir;
+      const dy = Math.sin(spread);
+
+      // Nearest live enemy along this ray
+      let enemy: EnemyController | null = null;
+      let enemyT = MAX_RANGE;
+      for (const e of enemies) {
+        if (e.health <= 0 && e.state === 'DOWNED') continue;
+        const t = rayToVertical(
+          originX, originY, dx, dy,
+          e.position.x, e.position.y - 110, e.position.y + 10, MAX_RANGE
+        );
+        if (t >= 0 && t < enemyT) {
+          enemyT = t;
+          enemy = e;
+        }
+      }
+
+      // Nearest live prop along this ray
+      let prop: DestructibleObject | null = null;
+      let propT = MAX_RANGE;
+      if (environmentManager) {
+        for (const obj of environmentManager.destructibles) {
+          if (obj.isBroken) continue;
+          const t = rayToVertical(
+            originX, originY, dx, dy,
+            obj.x, obj.y - obj.height, obj.y, MAX_RANGE
+          );
+          if (t >= 0 && t < propT) {
+            propT = t;
+            prop = obj;
+          }
+        }
+      }
+
+      if (enemy && (!prop || enemyT <= propT)) {
+        const impactX = enemy.position.x - dir * 12;
+        const impactY = originY + dy * enemyT;
+        this.pushTracer(originX, originY, impactX, impactY, stats.tracerLife, stats.tracerWidth);
+
+        if (enemy.evading) {
+          this.spawnSparks(impactX, impactY, -dir, 4, '#94a3b8');
+          continue;
+        }
+
+        const falloff = falloffMultiplier(stats, enemyT);
+        if (enemy.state === 'BLOCK') {
+          const chip = Math.max(2, Math.round(stats.damage * 0.3 * falloff));
+          const landed = enemy.takeDamage(chip, dir * 140, -50, false);
+          if (landed > 0) totalDamage += landed;
+          this.spawnSparks(impactX, impactY, -dir, 6, '#94a3b8');
+          if (!hitEnemyOnce && landed > 0) {
+            anchorX = impactX;
+            anchorY = impactY;
+            hitEnemyOnce = true;
+          }
+          continue;
+        }
+
+        const raw = Math.max(1, Math.round(stats.damage * falloff * comboMult));
+        const landed = enemy.takeDamage(raw, dir * stats.recoil, -90 - stats.recoil * 0.15, false);
+        if (landed > 0) {
+          totalDamage += landed;
+          this.spawnBlood(impactX, impactY, dir, 5);
+          this.spawnSparks(impactX, impactY, dir, 6, '#fbbf24');
+          if (!hitEnemyOnce) {
+            anchorX = impactX;
+            anchorY = impactY;
+            hitEnemyOnce = true;
+          }
+        } else {
+          this.spawnSparks(impactX, impactY, -dir, 4, '#94a3b8');
+        }
+      } else if (prop && environmentManager) {
+        const impactX = originX + dx * propT;
+        const impactY = originY + dy * propT;
+        this.pushTracer(originX, originY, impactX, impactY, stats.tracerLife, stats.tracerWidth);
+        const falloff = falloffMultiplier(stats, propT);
+        const dmg = Math.max(1, Math.round(stats.damage * falloff));
+        environmentManager.damageObject(prop, dmg, dir * 150, -60);
+        this.spawnSparks(impactX, impactY, -dir, 8, this.surfaceColor(prop.type));
+        anchorX = impactX;
+        anchorY = impactY;
+      } else {
+        // Miss: the round flies to the arena wall
+        const endX = dir > 0 ? 840 : -840;
+        const tWall = Math.abs((endX - originX) / dx);
+        const endY = originY + dy * tWall;
+        this.pushTracer(originX, originY, endX, endY, stats.tracerLife, stats.tracerWidth);
+        if (pellet === 0) {
+          this.spawnSparks(endX, endY, -dir, 6, this.surfaceColor('WALL'));
+        }
+      }
+    }
+
+    if (totalDamage > 0) {
+      this.hitStopFrames = stats.hitStop;
+      camera.addTrauma(stats.trauma);
+      this.addPopup(anchorX, anchorY - 20, `-${totalDamage}`, '#fde047', stats.pellets > 1 ? 19 : 17);
+      this.addCombo(1, 3.0);
+    } else {
+      camera.addTrauma(stats.trauma * 0.35);
+    }
+  }
+
+  /**
+   * Phase 1 D3: explosive-barrel detonation — radial blast on the squad and
+   * the player, plus a chain cook-off on any barrel caught in the radius.
+   * Queued by EnvironmentManager.shatterObject, drained in update().
+   */
+  private detonateBarrel(
+    x: number,
+    y: number,
+    player: PlayerController,
+    enemies: EnemyController[],
+    camera: Camera,
+    environmentManager: EnvironmentManager
+  ): void {
+    const RADIUS = 205;
+    SoundFX.playExplosion();
+    this.spawnShockwave(x, y, RADIUS, '#fb923c');
+    this.spawnSparks(x, y, 1, 24, '#fdba74');
+    this.spawnSparks(x, y, -1, 18, '#fef08a');
+    this.addPopup(x, y - 70, 'BOOM!', '#fb923c', 22);
+    camera.addTrauma(0.6);
+    this.speedLinesTimer = 0.3;
+    this.slowMoFactor = 0.45;
+    this.slowMoTimer = 0.22;
+
+    for (const enemy of enemies) {
+      if (enemy.health <= 0) continue;
+      const dx = enemy.position.x - x;
+      const dy = enemy.position.y - 50 - y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > RADIUS) continue;
+      const scale = 1 - dist / RADIUS;
+      const dirE = dx >= 0 ? 1 : -1;
+      const dmg = Math.max(1, Math.round(55 * scale));
+      const landed = enemy.takeDamage(dmg, dirE * 540 * scale, -270 * scale, false);
+      if (landed > 0) {
+        this.addCombo(1, 3.0);
+        this.spawnBlood(enemy.position.x, enemy.position.y - 50, dirE, 6);
+        this.spawnSparks(enemy.position.x, enemy.position.y - 50, dirE, 10, '#fdba74');
+      }
+    }
+
+    // The player feels it too — dodge i-frames still ghost the blast
+    const pdx = player.physics.position.x - x;
+    const pdy = player.physics.position.y - 50 - y;
+    const pdist = Math.sqrt(pdx * pdx + pdy * pdy);
+    if (pdist < RADIUS && !player.physics.isDodging) {
+      const scale = 1 - pdist / RADIUS;
+      const dmg = Math.max(1, Math.round(30 * scale));
+      player.takeDamage(dmg, (pdx >= 0 ? 1 : -1) * 340 * scale, -190 * scale);
+      this.breakCombo();
+      this.addPopup(player.physics.position.x, player.physics.position.y - 90, `-${dmg}`, '#ef4444', 18);
+      this.spawnSparks(player.physics.position.x, player.physics.position.y - 50, pdx >= 0 ? 1 : -1, 12, '#fb923c');
+    }
+
+    // Chain cook-off: barrels inside the blast go off next (drained next frame)
+    for (const obj of environmentManager.destructibles) {
+      if (obj.isBroken || obj.type !== 'EXPLOSIVE_BARREL') continue;
+      const cdx = obj.x - x;
+      const cdy = obj.y - obj.height * 0.5 - y;
+      if (Math.sqrt(cdx * cdx + cdy * cdy) <= RADIUS * 0.95) {
+        environmentManager.damageObject(obj, 999, 0, -60);
+      }
     }
   }
 

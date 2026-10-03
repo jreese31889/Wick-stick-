@@ -127,6 +127,7 @@ export class Renderer {
   private beamGradH = 0;
   private healthGlowGrad: CanvasGradient | null = null;
   private weaponGlowGrad: CanvasGradient | null = null;
+  private ammoGlowGrad: CanvasGradient | null = null;
 
   // P1-05: HUD labels are string-built only when their inputs actually change
   // (the label itself is drawn twice per frame — stroke + fill).
@@ -336,6 +337,7 @@ export class Renderer {
       this.beamGrad = null;
       this.healthGlowGrad = null;
       this.weaponGlowGrad = null;
+      this.ammoGlowGrad = null;
       this.vignetteGradient = null;
     }
 
@@ -389,6 +391,7 @@ export class Renderer {
       this.renderGoldCoins(ctx, environmentManager);
       this.renderProjectiles(ctx, environmentManager);
       this.renderHealthPacks(ctx, environmentManager);
+      this.renderAmmoPacks(ctx, environmentManager);
     }
 
     // 5. DUST & MOTION PARTICLES
@@ -1267,6 +1270,43 @@ export class Renderer {
     ctx.restore();
   }
 
+  /** Phase 1 D5: field ammo pouch (feeds the held firearm's reserve). */
+  private renderAmmoPacks(ctx: CanvasRenderingContext2D, env: EnvironmentManager): void {
+    if (env.ammoPacks.length === 0 || !this.batchBase) return;
+    const t = performance.now() * 0.001;
+    ctx.save();
+    for (const pack of env.ammoPacks) {
+      if (!this.inView(pack.x, pack.y, 48)) continue;
+      if (pack.life > 22 && Math.floor(t * 6) % 2 === 0) continue;
+      const bob = Math.sin(t * 3.4 + pack.id) * 4;
+      this.setItemTransform(ctx, this.batchBase, pack.x, pack.y - 14 + bob, 0);
+
+      if (!this.ammoGlowGrad) {
+        const glow = ctx.createRadialGradient(0, 0, 2, 0, 0, 30);
+        glow.addColorStop(0, 'rgba(125, 211, 252, 0.55)');
+        glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        this.ammoGlowGrad = glow;
+      }
+      ctx.fillStyle = this.ammoGlowGrad;
+      ctx.fillRect(-30, -30, 60, 60);
+
+      // Pouch body
+      ctx.fillStyle = '#0c4a6e';
+      ctx.fillRect(-12, -9, 24, 18);
+      ctx.strokeStyle = '#7dd3fc';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-12, -9, 24, 18);
+
+      // Three visible rounds
+      ctx.fillStyle = '#fbbf24';
+      for (let i = -1; i <= 1; i++) {
+        ctx.fillRect(i * 6 - 1.5, -6, 3, 12);
+      }
+    }
+    this.resetItemTransform(ctx, this.batchBase);
+    ctx.restore();
+  }
+
   private renderVignette(ctx: CanvasRenderingContext2D, width: number, height: number): void {
     // M14: the gradient is identical every frame — build it once per canvas
     // size instead of re-parsing its colour stops on every single frame.
@@ -1324,8 +1364,8 @@ export class Renderer {
     }
     ctx.fillText(
       isMarquis
-        ? '⚜️ HIGH TABLE GRANDMASTER: MARQUIS DE GRAMONT [SOVEREIGN] ⚜️'
-        : '⚔️ HIGH TABLE MASTER ENVOY: ZERO [BOSS] ⚔️',
+        ? `⚜️ HIGH TABLE GRANDMASTER: MARQUIS DE GRAMONT [PHASE ${boss.bossPhase}/3] ⚜️`
+        : `⚔️ HIGH TABLE MASTER ENVOY: ZERO [PHASE ${boss.bossPhase}/3] ⚔️`,
       centerX,
       y - 6
     );
@@ -1354,6 +1394,12 @@ export class Renderer {
     // Subtle glass gloss highlight
     ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
     ctx.fillRect(x, y, barWidth * hpRatio, barHeight * 0.45);
+
+    // Phase threshold ticks at 66% / 33% (Phase 1 C6 — the bar reads the
+    // three-phase contract at a glance even before a threshold is crossed)
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+    ctx.fillRect(x + barWidth * 0.66 - 1, y - 2, 2, barHeight + 4);
+    ctx.fillRect(x + barWidth * 0.33 - 1, y - 2, 2, barHeight + 4);
 
     // Stagger / Guard sub-bar
     const stWidth = barWidth;
@@ -1546,6 +1592,74 @@ export class Renderer {
         ctx.fillRect(obj.x - 2, top - 22, 4, 10);
         ctx.fillStyle = '#fbbf24'; // Gold foil
         ctx.fillRect(obj.x - 2, top - 24, 4, 3);
+      } else if (obj.type === 'EXPLOSIVE_BARREL') {
+        // Volatile fuel drum — hazard stripe + a crack as it takes damage
+        const hurt = obj.health / obj.maxHealth;
+        ctx.fillStyle = hurt > 0.5 ? '#b91c1c' : '#7f1d1d';
+        ctx.fillRect(left, top + 6, obj.width, obj.height - 6);
+        ctx.fillStyle = '#450a0a';
+        ctx.fillRect(left, top, obj.width, 8);
+        ctx.fillRect(left, obj.y - 8, obj.width, 8);
+        // Hazard band
+        ctx.fillStyle = '#facc15';
+        ctx.fillRect(left, obj.y - obj.height * 0.55, obj.width, 7);
+        ctx.fillStyle = '#1c1917';
+        for (let s = 0; s < obj.width; s += 10) {
+          ctx.fillRect(left + s, obj.y - obj.height * 0.55, 5, 7);
+        }
+        // Pressure valve
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillRect(obj.x - 3, top - 5, 6, 6);
+        // Damage cracks
+        if (hurt < 0.7) {
+          ctx.strokeStyle = '#fef08a';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(obj.x - 6, top + 14);
+          ctx.lineTo(obj.x + 3, top + 26);
+          ctx.lineTo(obj.x - 4, top + 38);
+          ctx.stroke();
+        }
+      } else if (obj.type === 'CRATE') {
+        // Ammunition crate — wood planks with a steel band
+        ctx.fillStyle = '#78350f';
+        ctx.fillRect(left, top, obj.width, obj.height);
+        ctx.strokeStyle = '#a16207';
+        ctx.lineWidth = 2;
+        for (let p = 1; p < 3; p++) {
+          ctx.beginPath();
+          ctx.moveTo(left, top + (obj.height / 3) * p);
+          ctx.lineTo(left + obj.width, top + (obj.height / 3) * p);
+          ctx.stroke();
+        }
+        ctx.strokeRect(left, top, obj.width, obj.height);
+        ctx.fillStyle = '#3f3f46';
+        ctx.fillRect(left, top + obj.height * 0.4, obj.width, 5);
+        // Ammo stencil
+        ctx.fillStyle = '#fbbf24';
+        ctx.fillRect(obj.x - 7, top + 8, 14, 4);
+        ctx.fillRect(obj.x - 3, top + 4, 6, 12);
+      } else if (obj.type === 'GLASS_PANEL') {
+        // Breakable window — translucent pane in a thin frame
+        ctx.fillStyle = 'rgba(186, 230, 253, 0.12)';
+        ctx.fillRect(left, top, obj.width, obj.height);
+        ctx.strokeStyle = 'rgba(224, 242, 254, 0.55)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(left, top, obj.width, obj.height);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.28)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(left + 8, top + 12);
+        ctx.lineTo(left + obj.width - 14, top + obj.height - 20);
+        ctx.stroke();
+        if (obj.health < obj.maxHealth) {
+          ctx.beginPath();
+          ctx.moveTo(obj.x, top + obj.height * 0.3);
+          ctx.lineTo(obj.x - 12, top + obj.height * 0.55);
+          ctx.moveTo(obj.x, top + obj.height * 0.3);
+          ctx.lineTo(obj.x + 14, top + obj.height * 0.62);
+          ctx.stroke();
+        }
       } else {
         // Weapon Rack
         ctx.fillStyle = '#0f172a';
@@ -1627,6 +1741,27 @@ export class Renderer {
         ctx.moveTo(-7, -4);
         ctx.lineTo(24, -7);
         ctx.stroke();
+      } else if (
+        w.type === 'PISTOL' ||
+        w.type === 'SMG' ||
+        w.type === 'SHOTGUN' ||
+        w.type === 'RIFLE'
+      ) {
+        // Phase 1 B6: firearm pickups read as guns, not blades
+        const long = w.type === 'RIFLE' || w.type === 'SHOTGUN';
+        const barrelLen = w.type === 'RIFLE' ? 34 : w.type === 'SHOTGUN' ? 30 : w.type === 'SMG' ? 22 : 16;
+        ctx.fillStyle = '#18181b';
+        ctx.fillRect(-12, -11, barrelLen, 7); // slide / barrel
+        ctx.fillRect(-8, -5, 9, 11);          // grip
+        if (w.type === 'SMG') ctx.fillRect(-3, -4, 8, 4); // box magazine
+        if (w.type === 'SHOTGUN') ctx.fillRect(10, -8, 12, 4); // pump
+        if (w.type === 'RIFLE') ctx.fillRect(-16, -9, 6, 5);   // stock
+        ctx.fillStyle = '#7dd3fc';
+        ctx.fillRect(-12, -11, 5, 2);
+        if (long) {
+          ctx.fillStyle = '#fbbf24';
+          ctx.fillRect(4, -13, 10, 2);
+        }
       } else {
         // Dropped Knife
         ctx.strokeStyle = '#27272a';

@@ -12,6 +12,7 @@ import {
   Sword,
   LogIn,
   Flame,
+  Repeat,
 } from 'lucide-react';
 import { WeaponType } from '../types/game';
 
@@ -31,7 +32,8 @@ type TouchButton =
   | 'shoot'
   | 'reload'
   | 'interact'
-  | 'focus';
+  | 'focus'
+  | 'swap';
 
 // Shared shell: thumb-sized circular button with press feedback.
 const BTN =
@@ -312,6 +314,19 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
             )}
             <span className={UTILITY_LABEL}>
               {equippedWeapon === 'KNIFE' ? 'Throw' : nearDoor ? 'Enter' : 'Action'}
+            </span>
+          </button>
+
+          <button
+            id="btn-swap"
+            {...bindTouchButton('swap')}
+            aria-label="Swap gun"
+            className={`${BTN} ${UTILITY} bg-sky-900/70 border border-sky-400/50 text-sky-200 active:bg-sky-700/70`}
+          >
+            <Repeat className={UTILITY_ICON} />
+            <span className={UTILITY_LABEL}>Swap</span>
+            <span className="absolute -top-1.5 -right-1 text-[7px] font-mono px-1 rounded bg-black/80 border border-sky-400/40 text-sky-300">
+              L3
             </span>
           </button>
 

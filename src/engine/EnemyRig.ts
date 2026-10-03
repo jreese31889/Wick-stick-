@@ -469,8 +469,13 @@ export class EnemyRig {
       ctx.fillText('⚠️ ATTACK!', enemy.position.x, y - 5);
     } else {
       const [typeLabel, tagColor] = ARCHETYPE_TAGS[enemy.type] ?? ARCHETYPE_TAGS.BASIC;
-      ctx.fillStyle = tagColor;
-      ctx.fillText(typeLabel, enemy.position.x, y - 5);
+      // Phase 1 C5: promoted elites carry a violet ★ in front of their rank
+      ctx.fillStyle = enemy.eliteVariant ? '#f472b6' : tagColor;
+      ctx.fillText(
+        enemy.eliteVariant ? `★ ${typeLabel}` : typeLabel,
+        enemy.position.x,
+        y - 5
+      );
     }
 
     ctx.restore();

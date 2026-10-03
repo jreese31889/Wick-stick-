@@ -133,6 +133,19 @@ export class EnemyController {
   // Endless-mode difficulty scaling (applied by GameLoop.spawnSquad)
   public damageScale: number = 1;
 
+  /**
+   * Phase 1 C6: multi-phase boss. Shifts at the 66 % / 33 % thresholds —
+   * CombatDirector reads the flip to announce the phase banner.
+   */
+  public bossPhase: number = 1;
+  /** Set for exactly one frame when `bossPhase` advances. */
+  public phaseChanged: boolean = false;
+  /**
+   * Phase 1 C5: promoted elite variant of a normal archetype — ×1.8 HP,
+   * violet/gold livery, flank slot, better reactions, ★ overhead tag.
+   */
+  public eliteVariant: boolean = false;
+
   // GUNNER ranged kit: fired shots queue here and are drained by
   // CombatDirector into combat.enemyBullets (muzzle FX play on drain)
   public pendingShots: EnemyBullet[] = [];
@@ -327,14 +340,66 @@ export class EnemyController {
   }
 
   /**
-   * Endless-mode wave scaling: multiplies health pool and outgoing damage.
+   * Endless-mode wave scaling: multiplies health pool, outgoing damage and
+   * (Phase 1 C7) movement speed, so late waves feel faster, not just tankier.
    * Called by GameLoop.spawnSquad for waves beyond the authored milestones.
    */
-  public applyWaveScaling(hpMult: number, dmgMult: number): void {
+  public applyWaveScaling(hpMult: number, dmgMult: number, speedMult: number = 1): void {
     this.maxHealth = Math.round(this.maxHealth * hpMult);
     this.health = this.maxHealth;
     this.ghostHealth = this.maxHealth;
     this.damageScale = dmgMult;
+    if (speedMult !== 1) {
+      this.moveSpeed = Math.round(this.moveSpeed * speedMult);
+    }
+  }
+
+  /**
+   * Phase 1 C5: promote this spawn to an elite variant of its archetype.
+   * Bosses and the dedicated ELITE archetype are already the top tier.
+   */
+  public promoteToElite(): void {
+    if (this.eliteVariant || this.type === 'ELITE' || this.type === 'BOSS' || this.type === 'MARQUIS') return;
+    this.eliteVariant = true;
+    this.maxHealth = Math.round(this.maxHealth * 1.8);
+    this.health = this.maxHealth;
+    this.ghostHealth = this.maxHealth;
+    this.moveSpeed = Math.round(this.moveSpeed * 1.1);
+    this.blockChance = Math.min(0.75, this.blockChance + 0.15);
+    this.dodgeChance = Math.min(0.6, this.dodgeChance + 0.15);
+    this.counterChance = Math.min(0.75, this.counterChance + 0.15);
+    this.maxStagger = Math.round(this.maxStagger * 1.15);
+    // Flank from the opposite shoulder so elites pressure both sides
+    this.targetOffset = this.targetOffset >= 0 ? -95 : 95;
+    // Violet + gold High Table livery
+    this.suitColor = '#4c1d95';
+    this.shirtColor = '#facc15';
+    this.tieColor = '#f5f3ff';
+  }
+
+  /**
+   * Phase 1 C6: advances the boss to the next phase once an HP threshold is
+   * crossed — faster gait, tighter telegraphs, meaner hits.
+   */
+  private checkBossPhase(): void {
+    if (this.type !== 'BOSS' && this.type !== 'MARQUIS') return;
+    const ratio = this.health / this.maxHealth;
+    const target = ratio > 0.66 ? 1 : ratio > 0.33 ? 2 : 3;
+    if (target <= this.bossPhase) return;
+
+    this.bossPhase = target;
+    this.phaseChanged = true;
+    this.moveSpeed = Math.round(this.moveSpeed * (target === 2 ? 1.12 : 1.22));
+    this.blockChance = Math.min(0.9, this.blockChance + 0.1);
+    this.dodgeChance = Math.min(0.65, this.dodgeChance + 0.1);
+    this.damageScale *= target === 2 ? 1.12 : 1.25;
+    this.maxStagger = Math.round(this.maxStagger * 1.1);
+    this.attackCooldown = Math.min(this.attackCooldown, 0.4);
+    // Shed the hurt state so the phase shift reads as a deliberate power-up
+    if (this.state === 'HURT' || this.state === 'KNOCKBACK') {
+      this.state = 'IDLE';
+      this.stateTimer = 0;
+    }
   }
 
   public update(
@@ -989,6 +1054,9 @@ export class EnemyController {
     this.health = Math.max(0, this.health - applied);
     this.hpVisibleTimer = 3.2; // Show health bar only upon taking damage
     this.lastHitTime = performance.now();
+
+    // Phase 1 C6: threshold check on the new health total
+    if (this.health > 0) this.checkBossPhase();
 
     // Lethal blow: detach into a full ragdoll seeded from the current pose
     // with the killing impulse, so the body tumbles instead of vanishing

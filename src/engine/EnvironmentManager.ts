@@ -1,4 +1,5 @@
 import {
+  AmmoPack,
   DestructibleObject,
   DroppedWeapon,
   GlassShard,
@@ -77,6 +78,14 @@ export class EnvironmentManager {
   public coins: GoldCoin[] = [];
   public projectiles: ThrownProjectile[] = [];
   public healthPacks: HealthPack[] = [];
+  /** Field ammo pouches feeding the Phase-1 reserve (D5). */
+  public ammoPacks: AmmoPack[] = [];
+  /**
+   * Explosive-barrel detonations waiting to be resolved (D3). The environment
+   * only owns props; CombatDirector drains this queue each frame because it
+   * is the one system holding the player, the squad and the camera.
+   */
+  public pendingExplosions: { x: number; y: number }[] = [];
   public doorOpen: boolean = false;
   public doorX: number = 740;
   public doorWidth: number = 70;
@@ -95,6 +104,9 @@ export class EnvironmentManager {
   /** P3-03: loot caps — bounded worst case in loot-heavy runs. */
   public static readonly MAX_HEALTH_PACKS = 8;
   public static readonly MAX_DROPPED_WEAPONS = 12;
+  public static readonly MAX_AMMO_PACKS = 8;
+  /** Queued barrel detonations (rare — a room holds 1-3 barrels). */
+  public static readonly MAX_PENDING_EXPLOSIONS = 8;
 
   // M14: free lists so shattered glass, coins and thrown knives are recycled
   // instead of allocated fresh on every spawn (GC churn on mid-range Android).
@@ -124,6 +136,14 @@ export class EnvironmentManager {
       rot: 0, vRot: 0, durability: 0, grounded: false,
     }),
     EnvironmentManager.MAX_DROPPED_WEAPONS + 8
+  );
+  private ammoPackPool = new ObjectPool<AmmoPack>(
+    () => ({ id: 0, x: 0, y: 0, vx: 0, vy: 0, rot: 0, vRot: 0, life: 0, amount: 12 }),
+    EnvironmentManager.MAX_AMMO_PACKS + 8
+  );
+  private explosionPool = new ObjectPool<{ x: number; y: number }>(
+    () => ({ x: 0, y: 0 }),
+    EnvironmentManager.MAX_PENDING_EXPLOSIONS + 4
   );
 
   constructor() {
@@ -196,6 +216,30 @@ export class EnvironmentManager {
           maxHealth: 35,
           isBroken: false,
           droppedWeapon: 'KNIFE',
+        },
+        // Phase 1: breakable crate cache + a barrel that chains explosions
+        {
+          id: 4,
+          type: 'CRATE',
+          x: 140,
+          y: 0,
+          width: 48,
+          height: 48,
+          health: 26,
+          maxHealth: 26,
+          isBroken: false,
+          droppedWeapon: 'SMG',
+        },
+        {
+          id: 5,
+          type: 'EXPLOSIVE_BARREL',
+          x: -140,
+          y: 0,
+          width: 34,
+          height: 58,
+          health: 20,
+          maxHealth: 20,
+          isBroken: false,
         }
       );
     } else if (this.currentTheme === 'NEON_GALLERY') {
@@ -223,6 +267,40 @@ export class EnvironmentManager {
           maxHealth: 40,
           isBroken: false,
           droppedWeapon: 'KNIFE',
+        },
+        {
+          id: 3,
+          type: 'WEAPON_RACK',
+          x: -60,
+          y: 0,
+          width: 46,
+          height: 88,
+          health: 32,
+          maxHealth: 32,
+          isBroken: false,
+          droppedWeapon: 'SHOTGUN',
+        },
+        {
+          id: 4,
+          type: 'EXPLOSIVE_BARREL',
+          x: 200,
+          y: 0,
+          width: 34,
+          height: 58,
+          health: 20,
+          maxHealth: 20,
+          isBroken: false,
+        },
+        {
+          id: 5,
+          type: 'GLASS_PANEL',
+          x: -460,
+          y: 0,
+          width: 70,
+          height: 150,
+          health: 16,
+          maxHealth: 16,
+          isBroken: false,
         }
       );
     } else if (this.currentTheme === 'RAINY_ALLEY') {
@@ -250,6 +328,40 @@ export class EnvironmentManager {
           maxHealth: 25,
           isBroken: false,
           droppedWeapon: 'KATANA',
+        },
+        {
+          id: 3,
+          type: 'CRATE',
+          x: 60,
+          y: 0,
+          width: 48,
+          height: 48,
+          health: 26,
+          maxHealth: 26,
+          isBroken: false,
+          droppedWeapon: 'RIFLE',
+        },
+        {
+          id: 4,
+          type: 'EXPLOSIVE_BARREL',
+          x: -180,
+          y: 0,
+          width: 34,
+          height: 58,
+          health: 20,
+          maxHealth: 20,
+          isBroken: false,
+        },
+        {
+          id: 5,
+          type: 'EXPLOSIVE_BARREL',
+          x: 470,
+          y: 0,
+          width: 34,
+          height: 58,
+          health: 20,
+          maxHealth: 20,
+          isBroken: false,
         }
       );
     } else {
@@ -276,6 +388,39 @@ export class EnvironmentManager {
           height: 55,
           health: 40,
           maxHealth: 40,
+          isBroken: false,
+        },
+        {
+          id: 3,
+          type: 'EXPLOSIVE_BARREL',
+          x: -480,
+          y: 0,
+          width: 34,
+          height: 58,
+          health: 20,
+          maxHealth: 20,
+          isBroken: false,
+        },
+        {
+          id: 4,
+          type: 'EXPLOSIVE_BARREL',
+          x: 160,
+          y: 0,
+          width: 34,
+          height: 58,
+          health: 20,
+          maxHealth: 20,
+          isBroken: false,
+        },
+        {
+          id: 5,
+          type: 'CRATE',
+          x: 620,
+          y: 0,
+          width: 48,
+          height: 48,
+          health: 26,
+          maxHealth: 26,
           isBroken: false,
         }
       );
@@ -322,16 +467,32 @@ export class EnvironmentManager {
     this.glassShards = [];
     this.healthPackPool.releaseAll(this.healthPacks);
     this.healthPacks = [];
+    this.ammoPackPool.releaseAll(this.ammoPacks);
+    this.ammoPacks = [];
+    this.explosionPool.releaseAll(this.pendingExplosions);
+    this.pendingExplosions = [];
   }
 
   public shatterObject(obj: DestructibleObject, impactForceX: number = 0, impactForceY: number = -120) {
     if (obj.isBroken) return;
     obj.isBroken = true;
-    SoundFX.playGlassShatter();
 
-    // Spawn 28+ physics-simulated glass shards
-    const colors =
-      this.currentTheme === 'NEON_GALLERY'
+    // Explosive barrel: the blast is resolved by CombatDirector (only that
+    // system holds the player, the squad and the camera).
+    if (obj.type === 'EXPLOSIVE_BARREL') {
+      this.queueExplosion(obj.x, obj.y - obj.height * 0.5);
+      this.dropCoin(obj.x, obj.y - 26, 1);
+      return;
+    }
+
+    const isCrate = obj.type === 'CRATE';
+    if (isCrate) SoundFX.playPunch('slam');
+    else SoundFX.playGlassShatter();
+
+    // Shard palette by surface (wood splinters for crates, glass otherwise)
+    const colors = isCrate
+      ? ['#a16207', '#78350f', '#d97706', '#e7d7b0']
+      : this.currentTheme === 'NEON_GALLERY'
         ? ['#a5f3fc', '#38bdf8', '#c084fc', '#ffffff']
         : ['#fef08a', '#fde047', '#ffffff', '#e2e8f0'];
 
@@ -362,11 +523,46 @@ export class EnvironmentManager {
       this.dropWeapon(obj.droppedWeapon, obj.x, obj.y - 30, (Math.random() - 0.5) * 80, -180);
     }
 
-    // Drop 1-2 Continental Gold Coins
+    // Caches pay out in field ammo; every prop still scatters Continental gold
+    if (isCrate) {
+      this.dropAmmoPack(obj.x, obj.y - 46, 18);
+    }
     this.dropCoin(obj.x, obj.y - 40, 1);
     if (Math.random() > 0.4) {
       this.dropCoin(obj.x + (Math.random() - 0.5) * 30, obj.y - 50, 1);
     }
+  }
+
+  /** Queues a barrel detonation for CombatDirector to resolve. */
+  public queueExplosion(x: number, y: number): void {
+    this.trimOldest(
+      this.pendingExplosions,
+      this.pendingExplosions.length + 1 - EnvironmentManager.MAX_PENDING_EXPLOSIONS,
+      this.explosionPool
+    );
+    const e = this.explosionPool.acquire();
+    e.x = x;
+    e.y = y;
+    this.pendingExplosions.push(e);
+  }
+
+  /** Pops the oldest queued detonation back into its pool (CombatDirector). */
+  public releaseExplosion(): void {
+    const e = this.pendingExplosions.pop();
+    if (e) this.explosionPool.release(e);
+  }
+
+  /**
+   * Bullet / blast damage against a live prop (Phase 1 D2/D3).
+   * Returns true when the round actually connected with something.
+   */
+  public damageObject(obj: DestructibleObject, damage: number, forceX: number = 0, forceY: number = -80): boolean {
+    if (obj.isBroken || damage <= 0) return false;
+    obj.health -= damage;
+    if (obj.health <= 0) {
+      this.shatterObject(obj, forceX, forceY);
+    }
+    return true;
   }
 
   public dropWeapon(type: WeaponType, x: number, y: number, vx: number = 0, vy: number = -160) {
@@ -425,6 +621,26 @@ export class EnvironmentManager {
     this.healthPacks.push(pack);
   }
 
+  /** Field ammo pouch — feeds the held firearm's reserve (Phase 1 D5). */
+  public dropAmmoPack(x: number, y: number, amount: number = 14) {
+    this.trimOldest(
+      this.ammoPacks,
+      this.ammoPacks.length + 1 - EnvironmentManager.MAX_AMMO_PACKS,
+      this.ammoPackPool
+    );
+    const pack = this.ammoPackPool.acquire();
+    pack.id = Date.now() + Math.random();
+    pack.x = x;
+    pack.y = y - 24;
+    pack.vx = (Math.random() - 0.5) * 130;
+    pack.vy = -190 - Math.random() * 90;
+    pack.rot = 0;
+    pack.vRot = (Math.random() - 0.5) * 6;
+    pack.life = 0;
+    pack.amount = amount;
+    this.ammoPacks.push(pack);
+  }
+
   public throwKnife(x: number, y: number, dir: number) {
     SoundFX.playKnifeThrow();
     this.trimOldest(
@@ -447,7 +663,17 @@ export class EnvironmentManager {
 
   public update(
     dt: number,
-    player: { position: Vector2; coins?: number; equippedWeapon?: WeaponType; weaponDurability?: number; perks?: Record<string, boolean>; health?: number; maxHealth?: number },
+    player: {
+      position: Vector2;
+      coins?: number;
+      equippedWeapon?: WeaponType;
+      weaponDurability?: number;
+      perks?: Record<string, boolean>;
+      health?: number;
+      maxHealth?: number;
+      pendingGunPickup?: WeaponType | null;
+      pendingAmmo?: number;
+    },
     onPickupCoin?: (val: number) => void,
     onPickupWeapon?: (weapon: WeaponType) => void
   ) {
@@ -509,13 +735,21 @@ export class EnvironmentManager {
       const dy = playerPos.y - w.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist < 55) {
-        if (player.equippedWeapon !== undefined) {
-          player.equippedWeapon = w.type;
-          const bonusDurability = player.perks?.['LETHAL_BLADE'] ? 6 : 0;
-          player.weaponDurability = w.type === 'KATANA' ? 14 + bonusDurability : 4;
+        const isFirearm =
+          w.type === 'PISTOL' || w.type === 'SMG' || w.type === 'SHOTGUN' || w.type === 'RIFLE';
+        if (isFirearm) {
+          // Phase 1 arsenal: hand the gun to GameLoop, which loads the inventory
+          if (player.pendingGunPickup !== undefined) player.pendingGunPickup = w.type;
+          SoundFX.playGunCock();
+        } else {
+          if (player.equippedWeapon !== undefined) {
+            player.equippedWeapon = w.type;
+            const bonusDurability = player.perks?.['LETHAL_BLADE'] ? 6 : 0;
+            player.weaponDurability = w.type === 'KATANA' ? 14 + bonusDurability : 4;
+          }
+          SoundFX.playBladeSlash();
         }
         if (onPickupWeapon) onPickupWeapon(w.type);
-        SoundFX.playBladeSlash();
         this.droppedWeapons.splice(i, 1);
         this.weaponPool.release(w);
       }
@@ -598,6 +832,39 @@ export class EnvironmentManager {
         SoundFX.playHeal();
         this.healthPacks.splice(i, 1);
         this.healthPackPool.release(pack);
+      }
+    }
+
+    // 5b. Ammo pouches (Phase 1 D5) — physics + always-on pickup
+    for (let i = this.ammoPacks.length - 1; i >= 0; i--) {
+      const pack = this.ammoPacks[i];
+      pack.life += dt;
+      pack.vy += GRAVITY * dt;
+      pack.x += pack.vx * dt;
+      pack.y += pack.vy * dt;
+      pack.rot += pack.vRot * dt;
+
+      if (pack.y >= 0) {
+        pack.y = 0;
+        pack.vy = -pack.vy * 0.4;
+        pack.vx *= 0.75;
+        pack.vRot *= 0.6;
+      }
+
+      // Despawn after 25s so the arena doesn't fill up
+      if (pack.life > 25) {
+        this.ammoPacks.splice(i, 1);
+        this.ammoPackPool.release(pack);
+        continue;
+      }
+
+      const pdx = playerPos.x - pack.x;
+      const pdy = (playerPos.y - 45) - pack.y;
+      if (Math.sqrt(pdx * pdx + pdy * pdy) < 46) {
+        if (player.pendingAmmo !== undefined) player.pendingAmmo = pack.amount;
+        SoundFX.playGunCock();
+        this.ammoPacks.splice(i, 1);
+        this.ammoPackPool.release(pack);
       }
     }
 

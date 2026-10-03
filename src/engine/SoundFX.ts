@@ -195,6 +195,40 @@ class SoundEngine {
     this.playSample(pick, 0.5, 1, 0.06);
   }
 
+  /**
+   * Per-weapon report (Phase 1 E4). New method — `playGunshot()` keeps its
+   * exact shipped signature, so every existing call site is untouched.
+   * The four guns are voiced from the same sample bank via rate/volume shaping.
+   */
+  public playGunReport(kind: 'PISTOL' | 'SMG' | 'SHOTGUN' | 'RIFLE') {
+    const pick = GUNSHOT_SAMPLES[(Math.random() * GUNSHOT_SAMPLES.length) | 0];
+    switch (kind) {
+      case 'SMG':
+        // Crisp, dry and rapid — lighter gain, slight up-pitch
+        this.playSample(pick, 0.36, 1.18, 0.07);
+        break;
+      case 'SHOTGUN':
+        // Deep boom: down-pitched report + a body thud underneath
+        this.playSample(pick, 0.7, 0.62, 0.05);
+        this.playSample('slam', 0.4, 0.7, 0.05, 0.01);
+        break;
+      case 'RIFLE':
+        // Long, hard crack — down-pitch with a touch more gain
+        this.playSample(pick, 0.6, 0.82, 0.04);
+        break;
+      case 'PISTOL':
+      default:
+        this.playGunshot();
+        break;
+    }
+  }
+
+  /** Explosive-barrel detonation (Phase 1 D3/E4): slammed low boom. */
+  public playExplosion() {
+    this.playSample('slam', 0.85, 0.5, 0.08);
+    this.playSample('glass', 0.3, 0.7, 0.1, 0.04);
+  }
+
   /** Full reload foley, accented by a slide-rack cock near the end. */
   public playReload() {
     this.playSample('reload', 0.5, 1, 0.03);

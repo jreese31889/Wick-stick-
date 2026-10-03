@@ -89,6 +89,9 @@ export interface InputState {
   /** Combo-meter special / super move (keyboard chord, PUNCH+KICK chord, pad chord) */
   special: boolean;
   specialJustPressed: boolean;
+  /** Cycle the owned firearms (keyboard X / pad L3 / touch SWAP). */
+  swap: boolean;
+  swapJustPressed: boolean;
 }
 
 export interface PlayerPhysics {
@@ -110,8 +113,14 @@ export interface PlayerPhysics {
   maxStamina: number;
   ammo: number;
   maxAmmo: number;
+  /** Rounds in reserve for the current firearm (Phase 1 arsenal). */
+  reserveAmmo: number;
   isReloading: boolean;
   reloadTimer: number;
+  /** Set by EnvironmentManager when a firearm is walked over; consumed by GameLoop. */
+  pendingGunPickup?: WeaponType | null;
+  /** Set by EnvironmentManager on an ammo-pack pickup; consumed by GameLoop. */
+  pendingAmmo?: number;
   equippedWeapon: WeaponType;
   weaponDurability: number;
   coins: number;
@@ -241,7 +250,8 @@ export interface CasingParticle {
   life: number;
 }
 
-export type WeaponType = 'UNARMED' | 'KATANA' | 'KNIFE' | 'SHOTGUN';
+/** Melee + thrown kit plus the Phase 1 firearm roster (see engine/Weapons.ts). */
+export type WeaponType = 'UNARMED' | 'KATANA' | 'KNIFE' | 'PISTOL' | 'SMG' | 'SHOTGUN' | 'RIFLE';
 
 export interface DroppedWeapon {
   id: number;
@@ -283,7 +293,12 @@ export interface GlassShard {
 
 export interface DestructibleObject {
   id: number;
-  type: 'GLASS_DISPLAY' | 'CHAMPAGNE_TABLE' | 'WEAPON_RACK';
+  /**
+   * GLASS_DISPLAY / CHAMPAGNE_TABLE / WEAPON_RACK ship with the rooms.
+   * Phase 1 adds CRATE and EXPLOSIVE_BARREL (solid for enemies, walk-through
+   * for the player) and GLASS_PANEL (a breakable, non-solid window).
+   */
+  type: 'GLASS_DISPLAY' | 'CHAMPAGNE_TABLE' | 'WEAPON_RACK' | 'CRATE' | 'EXPLOSIVE_BARREL' | 'GLASS_PANEL';
   x: number;
   y: number;
   width: number;
@@ -292,6 +307,8 @@ export interface DestructibleObject {
   maxHealth: number;
   isBroken: boolean;
   droppedWeapon?: WeaponType;
+  /** Seconds an enemy has been nose-to-prop this frame streak (cover breaking). */
+  blockedTimer?: number;
 }
 
 export interface GoldCoin {
@@ -316,6 +333,19 @@ export interface HealthPack {
   vRot: number;
   life: number;
   healAmount: number;
+}
+
+/** Field ammo pouch — refills reserve rounds for the held firearm (Phase 1). */
+export interface AmmoPack {
+  id: number;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  rot: number;
+  vRot: number;
+  life: number;
+  amount: number;
 }
 
 export interface EnemyBullet {
