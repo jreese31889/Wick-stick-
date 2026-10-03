@@ -542,7 +542,7 @@ export default function App() {
     commitProfile();
   };
 
-  /** Applies a selected loadout / suit / tint (only ever on unlocked ids). */
+  /** Applies a selected loadout / figure colourway / tint (unlocked ids only). */
   const selectCosmetic = (kind: 'loadout' | 'skin' | 'tint', id: string) => {
     const p = profileRef.current;
     if (!p || !p.unlocks.includes(id)) return;
@@ -1041,7 +1041,7 @@ export default function App() {
 
       {/* 2. TOP HUD LAYER (hidden while the layout editor owns the screen) */}
       <header
-        className="absolute top-0 left-0 right-0 p-3 sm:p-5 pointer-events-none z-30 grid grid-cols-[1fr_auto] gap-x-2 gap-y-2 sm:flex sm:items-start sm:justify-between sm:gap-0"
+        className="safe-top safe-left safe-right absolute top-0 left-0 right-0 p-3 sm:p-5 pointer-events-none z-30 grid grid-cols-[1fr_auto] gap-x-2 gap-y-2 sm:flex sm:items-start sm:justify-between sm:gap-0"
         style={{
           display: layoutEditorOpen ? 'none' : undefined,
           opacity: settings.hudOpacity !== 100 ? settings.hudOpacity / 100 : undefined,
@@ -1067,12 +1067,24 @@ export default function App() {
             />
           </div>
 
-          {/* Stamina Bar */}
-          <div className="w-32 sm:w-48 h-1.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10">
-            <div
-              className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-75"
-              style={{ width: `${(physics.stamina / physics.maxStamina) * 100}%` }}
-            />
+          {/* Stamina Bar — labelled (P4 colour-blind cue) so the read never
+              depends on green alone; it pulses when nearly spent */}
+          <div className="w-32 sm:w-48 flex items-center gap-1.5">
+            <span
+              className={`text-[9px] font-mono uppercase tracking-wider leading-none ${
+                physics.stamina <= physics.maxStamina * 0.2
+                  ? 'text-amber-400 animate-pulse'
+                  : 'text-neutral-500'
+              }`}
+            >
+              STA
+            </span>
+            <div className="flex-1 h-1.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10">
+              <div
+                className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-75"
+                style={{ width: `${(physics.stamina / physics.maxStamina) * 100}%` }}
+              />
+            </div>
           </div>
 
           {/* Held firearm: name, magazine / reserve readout (Phase 1 B6/D5) */}
@@ -1924,7 +1936,7 @@ export default function App() {
         onClose={() => setShowUpgrades(false)}
       />
 
-      {/* 8d. PHASE 2 — loadout / suit colourway / weapon tint */}
+      {/* 8d. PHASE 2 — loadout / figure colourway / weapon tint */}
       <AppearanceModal
         isOpen={showAppearance}
         profile={profile}

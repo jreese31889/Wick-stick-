@@ -40,7 +40,7 @@ export const ProfileStatsModal: React.FC<ProfileStatsModalProps> = ({ isOpen, pr
 
   return (
     <div
-      className="fixed inset-0 z-[75] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[75] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -125,7 +125,7 @@ export const ProfileStatsModal: React.FC<ProfileStatsModalProps> = ({ isOpen, pr
             >
               <tile.icon className={`w-3.5 h-3.5 mx-auto mb-1 ${tile.tone}`} />
               <div className="text-sm font-black font-mono text-neutral-100">{tile.value}</div>
-              <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">
+              <div className="text-micro font-mono uppercase text-neutral-500">
                 {tile.label}
               </div>
             </div>
@@ -138,7 +138,7 @@ export const ProfileStatsModal: React.FC<ProfileStatsModalProps> = ({ isOpen, pr
             [
               ['loadout', 'Loadouts'],
               ['move', 'Moves'],
-              ['skin', 'Suits'],
+              ['skin', 'Colourways'],
               ['tint', 'Tints'],
             ] as const
           ).map(([kind, label]) => (

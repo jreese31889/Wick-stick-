@@ -31,7 +31,7 @@ export const UpgradesModal: React.FC<UpgradesModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[75] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[75] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}

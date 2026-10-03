@@ -91,7 +91,7 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[75] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[75] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}

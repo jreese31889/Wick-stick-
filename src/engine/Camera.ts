@@ -89,6 +89,14 @@ export class Camera {
   }
 
   /**
+   * P1 — read-only trauma level for the Renderer's dynamic vignette (the
+   * frame darkens at the edges as impacts land). Never mutated from outside.
+   */
+  public get traumaLevel(): number {
+    return this.trauma;
+  }
+
+  /**
    * PHASE 1B takedown camera: a timed push-in layered over the aim/zoom
    * stack. `scale` multiplies BASE_ZOOM (1.45 = 45% tighter); the hold
    * expires on its own so nothing has to release it when the move ends.

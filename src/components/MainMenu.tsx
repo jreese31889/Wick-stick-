@@ -71,7 +71,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
       <div className="absolute inset-0 bg-gradient-to-t from-black via-black/55 to-black/25" />
       <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,transparent_0%,rgba(0,0,0,0.6)_100%)]" />
 
-      <div className="relative z-10 min-h-full w-full max-w-6xl mx-auto px-5 py-6 sm:px-8 grid gap-6 lg:gap-10 lg:grid-cols-[1.05fr_0.95fr] items-center">
+      <div className="safe-top safe-bottom relative z-10 min-h-full w-full max-w-6xl mx-auto px-5 py-6 sm:px-8 grid gap-6 lg:gap-10 lg:grid-cols-[1.05fr_0.95fr] items-center">
         {/* LEFT — branding */}
         <div className="text-center lg:text-left">
           <div className="text-[10px] font-mono tracking-[0.5em] text-amber-400/90 uppercase mb-3">
@@ -102,7 +102,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
                   <div className="text-lg font-black font-mono text-emerald-300 leading-none">
                     LV {profile.level}
                   </div>
-                  <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">
+                  <div className="text-micro font-mono uppercase text-neutral-500">
                     Rank:{' '}
                     {STYLE_RANKS[Math.min(5, profile.stats.bestStyleRank)]} style •{' '}
                     {unlockedCount}/{ACHIEVEMENTS.length} medals
@@ -133,26 +133,26 @@ export const MainMenu: React.FC<MainMenuProps> = ({
             <div className="rounded-xl bg-black/60 border border-white/10 px-3 py-2 text-center">
               <Trophy className="w-3.5 h-3.5 text-amber-400 mx-auto mb-1" />
               <div className="text-sm font-black font-mono text-amber-300">{progress.victories}</div>
-              <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">Victories</div>
+              <div className="text-micro font-mono uppercase text-neutral-500">Victories</div>
             </div>
             <div className="rounded-xl bg-black/60 border border-white/10 px-3 py-2 text-center">
               <Target className="w-3.5 h-3.5 text-sky-400 mx-auto mb-1" />
               <div className="text-sm font-black font-mono text-sky-300">
                 {progress.bestScore.toLocaleString()}
               </div>
-              <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">Best Score</div>
+              <div className="text-micro font-mono uppercase text-neutral-500">Best Score</div>
             </div>
             <div className="rounded-xl bg-black/60 border border-white/10 px-3 py-2 text-center">
               <Flame className="w-3.5 h-3.5 text-orange-400 mx-auto mb-1" />
               <div className="text-sm font-black font-mono text-orange-300">{progress.bestMaxCombo}x</div>
-              <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">Max Combo</div>
+              <div className="text-micro font-mono uppercase text-neutral-500">Max Combo</div>
             </div>
             <div className="rounded-xl bg-black/60 border border-white/10 px-3 py-2 text-center">
               <Clock className="w-3.5 h-3.5 text-emerald-400 mx-auto mb-1" />
               <div className="text-sm font-black font-mono text-emerald-300">
                 {progress.bestTimeSec > 0 ? formatDuration(progress.bestTimeSec) : '—'}
               </div>
-              <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">Best Run</div>
+              <div className="text-micro font-mono uppercase text-neutral-500">Best Run</div>
             </div>
           </div>
         </div>
@@ -163,7 +163,7 @@ export const MainMenu: React.FC<MainMenuProps> = ({
             <Play className="w-5 h-5 fill-current" />
             Play
           </button>
-          <div className="text-center text-[10px] font-mono uppercase tracking-widest text-amber-300/90 -mt-1">
+          <div className="text-center text-eyebrow font-mono uppercase text-amber-300/90 -mt-1">
             Next: Stage {nextStage.id} — {nextStage.name}
           </div>
 

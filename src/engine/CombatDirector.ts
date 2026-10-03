@@ -105,6 +105,12 @@ export class CombatDirector {
   
   public hitStopFrames: number = 0;
   public slowMoFactor: number = 1.0;
+  /**
+   * P1 — additive impact bloom for the big cinematic beats (chain finisher,
+   * boss phase break). One pooled record, so the hot path never allocates;
+   * Renderer draws it once under 'lighter' while life > 0.
+   */
+  public impactBloom = { x: 0, y: 0, life: 0, maxLife: 0.5, radius: 280, rgb: '255, 196, 84' };
   public slowMoTimer: number = 0;
   public speedLinesTimer: number = 0; // Cinematic radial speed lines on heavy impacts
   /**
@@ -376,6 +382,11 @@ export class CombatDirector {
       this.speedLinesTimer = Math.max(0, this.speedLinesTimer - dt);
     }
 
+    // 1d. P1 impact bloom decay (finisher / boss-phase break flash)
+    if (this.impactBloom.life > 0) {
+      this.impactBloom.life = Math.max(0, this.impactBloom.life - dt);
+    }
+
     // 1c. Signature-move banner + parry-riposte window decay (both run on the
     // effective dt, so hit-stop freezes them and slow-mo stretches them)
     if (this.moveBannerTimer > 0) {
@@ -505,6 +516,13 @@ export class CombatDirector {
         this.slowMoTimer = 0.35;
         this.speedLinesTimer = 0.3;
         this.spawnShockwave(enemy.position.x, enemy.position.y - 55, 85, '#f59e0b');
+        this.triggerImpactBloom(
+          enemy.position.x,
+          enemy.position.y - 55,
+          420,
+          enemy.type === 'MARQUIS' ? '192, 132, 252' : '251, 191, 36',
+          0.7
+        );
         SoundFX.playGunCock(enemy.position.x); // PHASE 4: boss flourish, from the boss
       }
 
@@ -1642,6 +1660,7 @@ export class CombatDirector {
           this.speedLinesTimer = 0.4;
           SoundFX.playPunch('slam');
           this.spawnShockwave(impactX, impactY, 90, '#f59e0b');
+          this.triggerImpactBloom(impactX, impactY, 300, '255, 196, 84', 0.55);
         }
 
         // Standard clean unblocked hit (chain-escalated damage)
@@ -2536,6 +2555,21 @@ export class CombatDirector {
       s.size = 2 + Math.random() * 2.5;
       this.sparks.push(s);
     }
+  }
+
+  /**
+   * P1 — arms the pooled additive impact bloom at a world point. Callers pick
+   * radius/rgb; life decays in update(). Used by the chain finisher and the
+   * boss phase break so those beats get a light burst, not just a shockwave.
+   */
+  public triggerImpactBloom(x: number, y: number, radius: number, rgb: string, duration: number): void {
+    const b = this.impactBloom;
+    b.x = x;
+    b.y = y;
+    b.radius = radius;
+    b.rgb = rgb;
+    b.maxLife = duration;
+    b.life = duration;
   }
 
   public spawnShockwave(x: number, y: number, maxRadius: number, color: string) {

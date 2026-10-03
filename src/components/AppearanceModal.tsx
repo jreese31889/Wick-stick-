@@ -41,7 +41,7 @@ function requirementText(id: string): string {
   return 'LOCKED';
 }
 
-/** PHASE 2: loadout + suit + weapon-tint picker with live colour swatches. */
+/** PHASE 2: loadout + figure colourway + weapon-tint picker with live swatches. */
 export const AppearanceModal: React.FC<AppearanceModalProps> = ({
   isOpen,
   profile,
@@ -105,7 +105,7 @@ export const AppearanceModal: React.FC<AppearanceModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[75] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[75] bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -121,7 +121,7 @@ export const AppearanceModal: React.FC<AppearanceModalProps> = ({
               <h2 className="text-base sm:text-lg font-black tracking-wider text-sky-300 uppercase font-mono">
                 Wardrobe & Loadout
               </h2>
-              <p className="text-xs text-neutral-400">Suit colourways, blade tints and sidearm</p>
+              <p className="text-xs text-neutral-400">Figure colourways, blade tints and sidearm</p>
             </div>
           </div>
           <button
@@ -157,7 +157,7 @@ export const AppearanceModal: React.FC<AppearanceModalProps> = ({
           {/* Skins */}
           <section>
             <div className="text-[10px] font-mono uppercase tracking-[0.25em] text-neutral-500 mb-2">
-              Suit Colourway
+              Figure Colourway
             </div>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {SKIN_IDS.map((id) => {
@@ -169,7 +169,7 @@ export const AppearanceModal: React.FC<AppearanceModalProps> = ({
                   def?.description ?? '',
                   profile.selectedSkin === id,
                   () => onSelectSkin(id),
-                  [skin.ivory, skin.shirt, skin.tie],
+                  [skin.ivory, skin.ivoryBack, skin.tie],
                   <span className="flex items-center gap-0.5">
                     <span
                       className="w-4 h-8 rounded-l-md border border-black/60"
@@ -177,7 +177,7 @@ export const AppearanceModal: React.FC<AppearanceModalProps> = ({
                     />
                     <span
                       className="w-4 h-8 border-y border-r border-black/60"
-                      style={{ backgroundColor: skin.shirt }}
+                      style={{ backgroundColor: skin.ivoryBack }}
                     />
                     <span
                       className="w-4 h-8 rounded-r-md border border-black/60"

@@ -344,7 +344,8 @@ export class Ragdoll {
     ctx: CanvasRenderingContext2D,
     limbColor: string,
     headColor: string,
-    accentColor?: string
+    accentColor?: string,
+    scale: number = 1
   ): void {
     let alpha = 1;
     if (this.age > this.fadeStart) {
@@ -374,9 +375,18 @@ export class Ragdoll {
       ctx.globalAlpha = alpha * 0.4 * near;
       ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
       ctx.beginPath();
-      ctx.ellipse(lowX, 0, 34 * (0.55 + near * 0.45), 7, 0, 0, Math.PI * 2);
+      ctx.ellipse(lowX, 0, 34 * (0.55 + near * 0.45) * scale, 7, 0, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalAlpha = alpha;
+    }
+
+    // Owner silhouette scale (player corpse only — enemies pass 1): grow the
+    // body about its lowest point so the kill-cam matches the live rig's
+    // FIGURE_SCALE instead of popping smaller on the killing blow.
+    if (scale !== 1) {
+      ctx.translate(lowX, lowY);
+      ctx.scale(scale, scale);
+      ctx.translate(-lowX, -lowY);
     }
 
     const seg = (a: number, b: number) => {

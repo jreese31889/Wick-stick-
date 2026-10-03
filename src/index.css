@@ -1,5 +1,55 @@
 @import "tailwindcss";
 
+/* ============================================================
+   DESIGN TOKENS (P4) — shared type scale + safe-area helpers.
+   `--text-*--letter-spacing` makes `text-eyebrow` / `text-micro`
+   emit font-size + tracking together, so micro-labels no longer
+   hand-roll `text-[9px] ... tracking-wider` in a dozen files.
+   ============================================================ */
+
+@theme {
+  --text-micro: 0.5625rem; /* 9px — stat captions, bar legends */
+  --text-micro--letter-spacing: 0.05em;
+  --text-eyebrow: 0.625rem; /* 10px — section eyebrows, badge labels */
+  --text-eyebrow--letter-spacing: 0.1em;
+}
+
+/* ============================================================
+   SAFE-AREA — viewport-fit=cover means notch/home-indicator
+   insets overlay real UI. Unlayered, so these outrank Tailwind's
+   margin utilities without !important (same trick the quality-tier
+   rules below rely on).
+   ============================================================ */
+
+/* Margins, not padding: every target already carries its own `p-*`, and an
+   inset must ADD to that padding rather than replace it (env() is 0 on
+   desktop, which would silently swallow `p-3`). */
+.safe-top {
+  margin-top: env(safe-area-inset-top, 0px);
+}
+
+.safe-bottom {
+  margin-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.safe-left {
+  margin-left: env(safe-area-inset-left, 0px);
+}
+
+.safe-right {
+  margin-right: env(safe-area-inset-right, 0px);
+}
+
+/* ============================================================
+   FOCUS VISIBILITY — menus are reachable by keyboard and D-pad;
+   the amber ring matches the house accent.
+   ============================================================ */
+
+:focus-visible {
+  outline: 2px solid #f59e0b;
+  outline-offset: 2px;
+}
+
 /* Landscape-first "rotate your device" phone rock */
 @keyframes rotateHint {
   0%, 100% { transform: rotate(0deg); }

@@ -125,7 +125,7 @@ export const StageSelectModal: React.FC<StageSelectModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[75] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[75] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -171,7 +171,7 @@ export const StageSelectModal: React.FC<StageSelectModalProps> = ({
                 }`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-mono uppercase tracking-widest text-neutral-500">
+                  <span className="text-eyebrow font-mono uppercase text-neutral-500">
                     Stage {String(stage.id).padStart(2, '0')}
                   </span>
                   {cleared ? (

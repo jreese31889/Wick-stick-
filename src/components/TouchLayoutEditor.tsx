@@ -54,7 +54,7 @@ export const TouchLayoutEditor: React.FC<TouchLayoutEditorProps> = ({
       : `${BTN} bg-black/70 border-white/20 text-neutral-300 hover:border-white/40`;
 
   return (
-    <div className="fixed inset-x-0 top-0 z-[66] p-2 sm:p-3 pointer-events-none">
+    <div className="safe-top safe-left safe-right fixed inset-x-0 top-0 z-[66] p-2 sm:p-3 pointer-events-none">
       <div className="mx-auto max-w-3xl bg-black/85 backdrop-blur-md border border-amber-500/40 rounded-2xl px-3 py-2.5 shadow-[0_0_30px_rgba(245,158,11,0.25)] flex flex-col gap-2 pointer-events-auto">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">

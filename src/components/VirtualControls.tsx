@@ -560,7 +560,7 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
       {/* ============================================================
           LEFT — MOVEMENT: floating 360° thumb joystick, bottom-left
       ============================================================ */}
-      <div className="absolute left-0 bottom-0 flex items-end p-3 sm:p-4">
+      <div className="safe-left safe-bottom absolute left-0 bottom-0 flex items-end p-3 sm:p-4">
         <div
           id="virtual-joystick"
           data-control="joystick"
@@ -604,7 +604,7 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
         data-control="aimpad"
         {...dragHandlers('aimpad')}
         style={ctlStyle('aimpad', '-50%')}
-        className="absolute left-1/2 bottom-3 sm:bottom-4"
+        className="safe-bottom absolute left-1/2 bottom-3 sm:bottom-4"
       >
         <div
           id="virtual-aim"
@@ -652,7 +652,7 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
           Row 3 (utility): FOCUS / ACTION / SWAP / RELOAD / GRAB
       ============================================================ */}
       <div
-        className="absolute right-0 bottom-0 flex flex-col items-end gap-2 landscape:gap-2.5 p-3 sm:p-4 pointer-events-auto"
+        className="safe-right safe-bottom absolute right-0 bottom-0 flex flex-col items-end gap-2 landscape:gap-2.5 p-3 sm:p-4 pointer-events-auto"
         style={gapStyle(8)}
       >
         {/* HERO ROW — impossible to miss */}

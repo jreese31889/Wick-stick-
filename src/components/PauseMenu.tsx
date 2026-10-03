@@ -73,7 +73,7 @@ export const PauseMenu: React.FC<PauseMenuProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 overflow-y-auto"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 overflow-y-auto"
       onClick={(e) => {
         if (e.target === e.currentTarget) onResume();
       }}
@@ -166,7 +166,7 @@ export const PauseMenu: React.FC<PauseMenuProps> = ({
         </div>
 
         {/* Operations */}
-        <div className="text-[10px] font-mono uppercase tracking-widest text-neutral-500 border-t border-white/10 pt-2">
+        <div className="text-eyebrow font-mono uppercase text-neutral-500 border-t border-white/10 pt-2">
           Operations
         </div>
         <div className="grid grid-cols-2 gap-2 -mt-2">

@@ -21,7 +21,7 @@ export const RotateDeviceOverlay: React.FC<RotateDeviceOverlayProps> = ({
   if (!visible) return null;
 
   return (
-    <div className="fixed inset-0 z-[65] flex flex-col items-center justify-center gap-5 bg-black/92 backdrop-blur-md px-6 text-center pointer-events-auto">
+    <div className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[65] flex flex-col items-center justify-center gap-5 bg-black/92 backdrop-blur-md px-6 text-center pointer-events-auto">
       <div className="relative">
         <Smartphone className="w-16 h-16 text-amber-400 animate-[rotateHint_2.4s_ease-in-out_infinite]" />
         <RotateCw className="w-7 h-7 text-amber-300 absolute -right-3 -top-1 animate-spin" />

@@ -3,11 +3,24 @@ import { TieRope } from './TieRope';
 import { PLAYER_STYLE, WEAPON_TINT } from './Palettes';
 
 /**
- * JOB 1 (visibility): the player is authored as a bright ivory silhouette so
- * he reads on any stage (nightclub, rooftop night, rainy alley). Every limb is
- * drawn twice — a WIDER dark outline stroke first, the bright body stroke on
- * top — which both separates him from the background and keeps the crisp
- * stick-figure edge. A faint warm rim/glow sits behind the whole figure.
+ * JOB 1 (visibility) + OWNER CHARACTER DESIGN (2026-10-03):
+ * John Stick is a CLEAN PLAIN STICK FIGURE — thin limbs, round head, no suit,
+ * no jacket, no lapels, no shirt, no shoes. Exactly ONE garment: the red
+ * cloth-physics necktie, which keeps its verlet swing (movement, attacks,
+ * landings) and reads as the signature against the ivory body.
+ *
+ * Readability contract (why the figure is still big on screen):
+ *   - bright ivory silhouette + dark under-stroke (outline pass) on any stage
+ *   - warm rim/halo behind the figure
+ *   - larger round head (16 px) so the head/shoulders mass reads at a glance
+ *   - bold spine + shoulder bar carry the silhouette now that the suit slab is
+ *     gone, while limbs stay deliberately THIN
+ *   - FIGURE_SCALE grows the whole rig about its ground-contact point, so the
+ *     character owns more of the frame without touching any hitbox (combat
+ *     reads physics/pose joints, never this transform)
+ *
+ * Enemies keep their suited, bulky silhouette (EnemyRig) — friend/foe still
+ * separates at a glance: lean ivory stick vs. mid-tone suited bodies.
  *
  * PHASE 2: the live palette + weapon tint live in ./Palettes as module state,
  * so a skin/tint swap repaints on the next frame with no render-code edits.
@@ -16,24 +29,34 @@ import { PLAYER_STYLE, WEAPON_TINT } from './Palettes';
 /** Dark under-stroke growth applied in the outline pass (half = rim width). */
 const OUTLINE_GROW = 3.6;
 
+/**
+ * Owner mandate: bigger, more readable silhouette. Uniform visual scale about
+ * the ground-contact point (feet), so the head/torso extend upward while the
+ * feet stay planted. Purely presentational — no combat value reads this.
+ */
+export const FIGURE_SCALE = 1.07;
+
+/** Plain-stick body weights — thin limbs, bold spine, big round head. */
+const SPINE_W = 8.5;
+const SHOULDER_W = 6.5;
+const UPPER_ARM_W = 5;
+const FOREARM_W = 4.4;
+const THIGH_W = 6;
+const SHIN_W = 5;
+const HAND_R = 3.8;
+const HEAD_R = 16;
+const FOOT_TOE = 8;
+const FOOT_HEEL = 3;
+const FOOT_W = 4.5;
+
 export class StickRig {
   private tieRope = new TieRope();
-  // Jacket coat tails: one short verlet rope per hip, driven by the same
-  // wind/flutter as the tie but with higher damping so the jacket reads
-  // heavier than the tie
-  private coatRopeL = new TieRope(4, 5.5, 0.993);
-  private coatRopeR = new TieRope(4, 5.5, 0.993);
-  // Coat pins captured from the live player render. updatePhysics runs before
-  // the fresh pose is generated, so pins lag one frame — exactly like the tie
-  // pin. The armed flag gates capture to the first render() after an update:
-  // afterimage ghosts render later in the same frame and must not steal pins.
-  private coatPinL = { x: 0, y: 0 };
-  private coatPinR = { x: 0, y: 0 };
-  private coatPinArmed = false;
-  private hasCoatPins = false;
 
   /**
-   * Updates dynamic secondary physics: verlet necktie rope + verlet coat tails
+   * Updates the cloth-physics necktie: verlet rope pinned at the collar,
+   * swinging with momentum, lagging sudden movement, fluttering on attacks.
+   * (The jacket coat tails are gone with the suit — the tie is the only
+   * secondary cloth left.)
    */
   public updatePhysics(
     vx: number,
@@ -44,27 +67,13 @@ export class StickRig {
     pinY: number,
     flutter: number
   ): void {
-    // Verlet necktie pinned at the collar — swings with momentum,
-    // lags sudden movement, flutters during fast attacks
     this.tieRope.update(pinX, pinY, vx, vy, facingRight, dt, flutter);
-
-    // Jacket coat tails pinned at the hip joints — same wind/flutter inputs
-    // as the tie; heavier damping makes the jacket read weightier
-    const pinLx = this.hasCoatPins ? this.coatPinL.x : pinX;
-    const pinLy = this.hasCoatPins ? this.coatPinL.y : pinY + 48;
-    const pinRx = this.hasCoatPins ? this.coatPinR.x : pinX;
-    const pinRy = this.hasCoatPins ? this.coatPinR.y : pinY + 48;
-    this.coatRopeL.update(pinLx, pinLy, vx, vy, facingRight, dt, flutter);
-    this.coatRopeR.update(pinRx, pinRy, vx, vy, facingRight, dt, flutter);
-
-    // Arm coat-pin capture: the first render() after this update is the live
-    // player render (afterimage ghosts come later)
-    this.coatPinArmed = true;
   }
 
   /**
-   * Renders the stylized stick figure as a bright ivory silhouette in a fitted
-   * suit: rim glow → dark outline pass → bright body pass.
+   * Renders the plain stick figure: rim glow → dark outline pass → bright body
+   * pass (spine, thin limbs, red tie, round head), all uniformly scaled about
+   * the ground-contact point for the owner's bigger silhouette.
    *
    * @param ghost afterimage trail frames skip the (relatively pricey) glow so
    *              a full dash trail stays cheap on mobile.
@@ -75,33 +84,30 @@ export class StickRig {
     facingRight: boolean,
     debugMode: boolean = false,
     weaponType: WeaponType = 'UNARMED',
-    ghost: boolean = false
+    ghost: boolean = false,
+    deformX: number = 1,
+    deformY: number = 1
   ): void {
-    // Capture coat pins from the live player render only (first render per
-    // frame). Afterimage ghosts render after this and must not overwrite them.
-    if (this.coatPinArmed) {
-      this.coatPinArmed = false;
-      const lh = pose.leftHip;
-      const rh = pose.rightHip;
-      if (
-        Number.isFinite(lh.x) &&
-        Number.isFinite(lh.y) &&
-        Number.isFinite(rh.x) &&
-        Number.isFinite(rh.y)
-      ) {
-        this.coatPinL.x = lh.x;
-        this.coatPinL.y = lh.y;
-        this.coatPinR.x = rh.x;
-        this.coatPinR.y = rh.y;
-        this.hasCoatPins = true;
-      }
-    }
-
     ctx.save();
 
     // Line caps and joins for pristine limb aesthetic
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
+
+    // Bigger readable silhouette: scale about the ground-contact point so the
+    // feet never lift off the floor. Everything drawn after this (tie included)
+    // shares the transform, so the figure stays internally consistent.
+    // deformX/Y layer P2 squash-and-stretch (landing / hit) on top of it.
+    const pivotX = pose.hips.x;
+    const feetY = Math.max(pose.leftFoot.y, pose.rightFoot.y);
+    const pivotY = Number.isFinite(feetY) ? feetY : pose.hips.y;
+    const sx = FIGURE_SCALE * deformX;
+    const sy = FIGURE_SCALE * deformY;
+    if (Number.isFinite(pivotX) && Number.isFinite(pivotY)) {
+      ctx.translate(pivotX, pivotY);
+      ctx.scale(sx, sy);
+      ctx.translate(-pivotX, -pivotY);
+    }
 
     // 0. Faint rim/glow so the silhouette pops off dark backdrops
     if (!ghost) this.renderRimGlow(ctx, pose);
@@ -112,7 +118,11 @@ export class StickRig {
     // 2. BRIGHT IVORY BODY PASS on top — leaves the dark rim around every limb
     this.renderBody(ctx, pose, facingRight, weaponType, false);
 
-    // 3. OPTIONAL DEBUG SKELETAL OVERLAY
+    // 3. RIM-LIGHT PASS — one warm key-light edge so the figure reads as lit,
+    //    not flat. Skipped on afterimage ghosts (they pay for the glow already).
+    if (!ghost) this.renderRimLight(ctx, pose);
+
+    // 4. OPTIONAL DEBUG SKELETAL OVERLAY
     if (debugMode) {
       this.renderDebugSkeleton(ctx, pose);
     }
@@ -121,9 +131,46 @@ export class StickRig {
   }
 
   /**
+   * P2 rim light — a thin warm stroke offset toward the scene key light
+   * (upper right), tracing spine, head and the lead arm. Three strokes per
+   * frame: the cheapest possible "lit from the front" read on a stick figure.
+   */
+  private renderRimLight(ctx: CanvasRenderingContext2D, pose: StickFigurePose): void {
+    ctx.save();
+    ctx.translate(2.6, -2.6);
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = `rgba(${PLAYER_STYLE.glow}, 1)`;
+    ctx.lineWidth = 1.8;
+    ctx.lineCap = 'round';
+
+    // Spine edge
+    ctx.beginPath();
+    ctx.moveTo(pose.neck.x, pose.neck.y);
+    ctx.lineTo(pose.torso.x, pose.torso.y);
+    ctx.lineTo(pose.hips.x, pose.hips.y);
+    ctx.stroke();
+
+    // Head crown arc (right half — matches the global key light)
+    ctx.beginPath();
+    ctx.arc(pose.head.x, pose.head.y, HEAD_R - 1, -1.15, 1.15);
+    ctx.stroke();
+
+    // Lead arm + lead thigh edges
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(pose.rightShoulder.x, pose.rightShoulder.y);
+    ctx.lineTo(pose.rightElbow.x, pose.rightElbow.y);
+    ctx.moveTo(pose.rightHip.x, pose.rightHip.y);
+    ctx.lineTo(pose.rightKnee.x, pose.rightKnee.y);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  /**
    * One full figure pass. `outline === true` draws every shape a few pixels
-   * wider in near-black (no interior detail); `false` draws the bright body
-   * with its shirt, tie, cuffs and shoe highlights.
+   * wider in near-black (no interior detail — the tie skips it too); `false`
+   * draws the bright body: thin limbs, bold spine, red tie, round head.
    */
   private renderBody(
     ctx: CanvasRenderingContext2D,
@@ -136,22 +183,23 @@ export class StickRig {
     const frontColor = outline ? PLAYER_STYLE.outline : PLAYER_STYLE.ivory;
     const grow = outline ? OUTLINE_GROW : 0;
 
-    // 1. BACK LEG (Drawn behind body for proper depth)
+    // 1. BACK LEG (behind the body for proper depth)
     this.renderLeg(ctx, pose.leftHip, pose.leftKnee, pose.leftFoot, facingRight, backColor, outline, grow);
 
-    // 2. BACK ARM (Drawn behind body)
+    // 2. BACK ARM (behind the torso)
     this.renderArm(ctx, pose.leftShoulder, pose.leftElbow, pose.leftHand, backColor, outline, grow);
 
-    // 3. SUIT JACKET LOWER COAT TAILS (Flaring behind legs)
-    this.renderCoatTails(ctx, outline);
+    // 3. TORSO — plain spine + shoulder bar (the suit slab is gone)
+    this.renderTorso(ctx, pose, frontColor, outline, grow);
 
-    // 4. TORSO & FITTED SUIT WITH SHIRT AND TIE
-    this.renderTorsoAndSuit(ctx, pose, outline);
+    // 4. THE RED TIE (verlet cloth, body pass only — the outline pass leaves
+    //    the chest dark so the tie keeps its edge without a second render)
+    if (!outline) this.renderTie(ctx, PLAYER_STYLE.tie);
 
-    // 5. FRONT LEG (In front of torso)
+    // 5. FRONT LEG (in front of the torso)
     this.renderLeg(ctx, pose.rightHip, pose.rightKnee, pose.rightFoot, facingRight, frontColor, outline, grow);
 
-    // 6. FRONT ARM (In front of torso)
+    // 6. FRONT ARM (in front of the torso + tie)
     this.renderArm(ctx, pose.rightShoulder, pose.rightElbow, pose.rightHand, frontColor, outline, grow);
 
     // 7. WEAPON IN HAND (Katana or Knife)
@@ -300,19 +348,17 @@ export class StickRig {
     facingRight: boolean,
     outline: boolean
   ): void {
-    const headRadius = 14;
-
     if (outline) {
       ctx.beginPath();
-      ctx.arc(head.x, head.y, headRadius + 2, 0, Math.PI * 2);
+      ctx.arc(head.x, head.y, HEAD_R + 2, 0, Math.PI * 2);
       ctx.fillStyle = PLAYER_STYLE.outline;
       ctx.fill();
       return;
     }
 
-    // Bright ivory skull
+    // Bright ivory skull — big enough to read as a head at phone size
     ctx.beginPath();
-    ctx.arc(head.x, head.y, headRadius, 0, Math.PI * 2);
+    ctx.arc(head.x, head.y, HEAD_R, 0, Math.PI * 2);
     ctx.fillStyle = PLAYER_STYLE.ivory;
     ctx.fill();
     ctx.lineWidth = 1.6;
@@ -323,128 +369,57 @@ export class StickRig {
     const f = facingRight ? 1 : -1;
     ctx.beginPath();
     ctx.moveTo(head.x + f * 3, head.y - 3);
-    ctx.lineTo(head.x + f * 8, head.y - 2);
+    ctx.lineTo(head.x + f * 9, head.y - 2);
     ctx.strokeStyle = PLAYER_STYLE.detail;
     ctx.lineWidth = 2;
     ctx.stroke();
   }
 
-  private renderTorsoAndSuit(
+  /**
+   * Plain stick torso: a bold spine (neck → torso → hips) plus a shoulder bar
+   * through the shoulder joints. No jacket, no shirt, no lapels — the tie and
+   * the outline do the rest of the talking.
+   */
+  private renderTorso(
     ctx: CanvasRenderingContext2D,
     pose: StickFigurePose,
-    outline: boolean
+    color: string,
+    outline: boolean,
+    grow: number
   ): void {
-    const { neck, torso, hips } = pose;
+    const { neck, torso, hips, leftShoulder, rightShoulder } = pose;
 
-    // Torso angle & orientation
-    const dx = torso.x - neck.x;
-    const dy = torso.y - neck.y;
-    const torsoLen = Math.sqrt(dx * dx + dy * dy) || 1;
-    const nx = -dy / torsoLen; // Normal vector perpendicular to spine
-    const ny = dx / torsoLen;
-
-    const shoulderWidth = 14;
-    const waistWidth = 11;
-    const hipWidth = 12;
-
-    // Points for fitted suit jacket silhouette
-    const leftShoulder = { x: neck.x - nx * shoulderWidth, y: neck.y - ny * shoulderWidth };
-    const rightShoulder = { x: neck.x + nx * shoulderWidth, y: neck.y + ny * shoulderWidth };
-    const leftWaist = { x: torso.x - nx * waistWidth, y: torso.y - ny * waistWidth };
-    const rightWaist = { x: torso.x + nx * waistWidth, y: torso.y + ny * waistWidth };
-    const leftHip = { x: hips.x - nx * hipWidth, y: hips.y - ny * hipWidth };
-    const rightHip = { x: hips.x + nx * hipWidth, y: hips.y + ny * hipWidth };
-
-    // Draw tailored Suit Jacket Body
+    // Shoulder bar — gives the silhouette width where the jacket used to
+    ctx.strokeStyle = color;
+    ctx.lineWidth = SHOULDER_W + grow;
     ctx.beginPath();
     ctx.moveTo(leftShoulder.x, leftShoulder.y);
     ctx.lineTo(rightShoulder.x, rightShoulder.y);
-    ctx.lineTo(rightWaist.x, rightWaist.y);
-    ctx.lineTo(rightHip.x, rightHip.y);
-    ctx.lineTo(leftHip.x, leftHip.y);
-    ctx.lineTo(leftWaist.x, leftWaist.y);
-    ctx.closePath();
-
-    if (outline) {
-      // Wide dark slab + stroke: the silhouette's dark rim comes from this
-      ctx.fillStyle = PLAYER_STYLE.outline;
-      ctx.fill();
-      ctx.lineWidth = OUTLINE_GROW;
-      ctx.strokeStyle = PLAYER_STYLE.outline;
-      ctx.stroke();
-      return;
-    }
-
-    ctx.fillStyle = PLAYER_STYLE.ivory;
-    ctx.fill();
-    ctx.lineWidth = 1.4;
-    ctx.strokeStyle = PLAYER_STYLE.outline;
     ctx.stroke();
 
-    // Draw Crisp White Shirt V-Neck Collar
-    const shirtWidth = 7;
-    const shirtBase = {
-      x: neck.x + (torso.x - neck.x) * 0.45,
-      y: neck.y + (torso.y - neck.y) * 0.45,
-    };
-
+    // Spine: neck → mid-chest → hips, one continuous bold stroke
+    ctx.lineWidth = SPINE_W + grow;
     ctx.beginPath();
-    ctx.moveTo(neck.x - nx * shirtWidth, neck.y - ny * shirtWidth);
-    ctx.lineTo(neck.x + nx * shirtWidth, neck.y + ny * shirtWidth);
-    ctx.lineTo(shirtBase.x, shirtBase.y);
-    ctx.closePath();
-    ctx.fillStyle = PLAYER_STYLE.shirt;
-    ctx.fill();
-    // Dark edge so the white shirt still reads against the ivory jacket
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = PLAYER_STYLE.shirtEdge;
-    ctx.stroke();
-
-    // Draw Dynamic Black Necktie (verlet rope simulation)
-    this.renderTie(ctx, PLAYER_STYLE.tie);
-
-    // Suit Lapel Lines
-    ctx.beginPath();
-    ctx.moveTo(neck.x - nx * (shirtWidth + 1), neck.y - ny * (shirtWidth + 1));
-    ctx.lineTo(shirtBase.x - nx * 2, shirtBase.y);
+    ctx.moveTo(neck.x, neck.y);
     ctx.lineTo(torso.x, torso.y);
-    ctx.strokeStyle = PLAYER_STYLE.detail;
-    ctx.lineWidth = 1.5;
+    ctx.lineTo(hips.x, hips.y);
     ctx.stroke();
 
+    if (outline) return;
+
+    // Neck knob so head/spine seam doesn't read as a break
+    ctx.fillStyle = color;
     ctx.beginPath();
-    ctx.moveTo(neck.x + nx * (shirtWidth + 1), neck.y + ny * (shirtWidth + 1));
-    ctx.lineTo(shirtBase.x + nx * 2, shirtBase.y);
-    ctx.lineTo(torso.x, torso.y);
-    ctx.strokeStyle = PLAYER_STYLE.detail;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
+    ctx.arc(neck.x, neck.y, SHOULDER_W * 0.5, 0, Math.PI * 2);
+    ctx.fill();
   }
 
+  /** The ONE garment: verlet-simulated red necktie through the rope points. */
   private renderTie(
     ctx: CanvasRenderingContext2D,
     tieColor: string
   ): void {
-    // Verlet-simulated necktie: tapered strip through the rope points
     this.tieRope.render(ctx, tieColor);
-  }
-
-  private renderCoatTails(
-    ctx: CanvasRenderingContext2D,
-    outline: boolean
-  ): void {
-    // Two verlet coat tails pinned at the hips, drawn as tapered cloth
-    // strips: narrow at the hip, flaring toward the hem. Widths match the old
-    // quad's proportions (18px at the hip tapering to 12px at the hem) with
-    // the same dark suit fill and edge stroke. Back-hip tail draws first so
-    // the front-hip tail overlaps it correctly.
-    if (outline) {
-      this.coatRopeL.renderCloth(ctx, PLAYER_STYLE.outline, 9 + 3, 6 + 3, PLAYER_STYLE.outline, 3);
-      this.coatRopeR.renderCloth(ctx, PLAYER_STYLE.outline, 9 + 3, 6 + 3, PLAYER_STYLE.outline, 3);
-      return;
-    }
-    this.coatRopeL.renderCloth(ctx, PLAYER_STYLE.ivoryBack, 9, 6, PLAYER_STYLE.outline, 1.2);
-    this.coatRopeR.renderCloth(ctx, PLAYER_STYLE.ivory, 9, 6, PLAYER_STYLE.outline, 1.2);
   }
 
   private renderArm(
@@ -459,52 +434,43 @@ export class StickRig {
     if (outline) {
       // Dark under-stroke: whole arm in one wide pass
       ctx.strokeStyle = limbColor;
-      ctx.lineWidth = 6 + grow;
+      ctx.lineWidth = UPPER_ARM_W + grow;
       ctx.beginPath();
       ctx.moveTo(shoulder.x, shoulder.y);
       ctx.lineTo(elbow.x, elbow.y);
       ctx.stroke();
-      ctx.lineWidth = 5.2 + grow;
+      ctx.lineWidth = FOREARM_W + grow;
       ctx.beginPath();
       ctx.moveTo(elbow.x, elbow.y);
       ctx.lineTo(hand.x, hand.y);
       ctx.stroke();
       ctx.beginPath();
-      ctx.arc(hand.x, hand.y, 4 + grow * 0.7, 0, Math.PI * 2);
+      ctx.arc(hand.x, hand.y, HAND_R + grow * 0.7, 0, Math.PI * 2);
       ctx.fillStyle = limbColor;
       ctx.fill();
       return;
     }
 
-    // Upper Arm (Jacket sleeve)
+    // Upper arm
     ctx.beginPath();
     ctx.moveTo(shoulder.x, shoulder.y);
     ctx.lineTo(elbow.x, elbow.y);
     ctx.strokeStyle = limbColor;
-    ctx.lineWidth = 6;
+    ctx.lineWidth = UPPER_ARM_W;
     ctx.stroke();
 
-    // Forearm (Jacket sleeve)
+    // Forearm
     ctx.beginPath();
     ctx.moveTo(elbow.x, elbow.y);
     ctx.lineTo(hand.x, hand.y);
     ctx.strokeStyle = limbColor;
-    ctx.lineWidth = 5.2;
+    ctx.lineWidth = FOREARM_W;
     ctx.stroke();
 
-    // White Shirt Cuff at wrist
-    const armAngle = Math.atan2(hand.y - elbow.y, hand.x - elbow.x);
-    const cuffX = hand.x - Math.cos(armAngle) * 3;
-    const cuffY = hand.y - Math.sin(armAngle) * 3;
+    // Hand / fist knob
     ctx.beginPath();
-    ctx.arc(cuffX, cuffY, 2.8, 0, Math.PI * 2);
-    ctx.fillStyle = PLAYER_STYLE.cuff;
-    ctx.fill();
-
-    // Hand / Fist
-    ctx.beginPath();
-    ctx.arc(hand.x, hand.y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = PLAYER_STYLE.shoe;
+    ctx.arc(hand.x, hand.y, HAND_R, 0, Math.PI * 2);
+    ctx.fillStyle = limbColor;
     ctx.fill();
     ctx.strokeStyle = PLAYER_STYLE.outline;
     ctx.lineWidth = 1;
@@ -523,73 +489,59 @@ export class StickRig {
   ): void {
     if (outline) {
       ctx.strokeStyle = limbColor;
-      ctx.lineWidth = 7 + grow;
+      ctx.lineWidth = THIGH_W + grow;
       ctx.beginPath();
       ctx.moveTo(hip.x, hip.y);
       ctx.lineTo(knee.x, knee.y);
       ctx.stroke();
-      ctx.lineWidth = 5.8 + grow;
+      ctx.lineWidth = SHIN_W + grow;
       ctx.beginPath();
       ctx.moveTo(knee.x, knee.y);
       ctx.lineTo(foot.x, foot.y);
       ctx.stroke();
-      // Shoe halo
-      const f0 = facingRight ? 1 : -1;
+      // Foot halo (plain foot stroke, no dress shoe)
       ctx.beginPath();
-      this.shoePath(ctx, foot.x, foot.y, f0, 1.4);
-      ctx.fillStyle = limbColor;
-      ctx.fill();
-      ctx.lineWidth = 3;
+      this.footPath(ctx, foot.x, foot.y, facingRight ? 1 : -1, grow);
+      ctx.lineWidth = FOOT_W + grow;
       ctx.strokeStyle = limbColor;
       ctx.stroke();
       return;
     }
 
-    // Thigh (Suit Trousers)
+    // Thigh
     ctx.beginPath();
     ctx.moveTo(hip.x, hip.y);
     ctx.lineTo(knee.x, knee.y);
     ctx.strokeStyle = limbColor;
-    ctx.lineWidth = 7;
+    ctx.lineWidth = THIGH_W;
     ctx.stroke();
 
-    // Shin (Suit Trousers)
+    // Shin
     ctx.beginPath();
     ctx.moveTo(knee.x, knee.y);
     ctx.lineTo(foot.x, foot.y);
     ctx.strokeStyle = limbColor;
-    ctx.lineWidth = 5.8;
+    ctx.lineWidth = SHIN_W;
     ctx.stroke();
 
-    // Tapered Dress Shoe
+    // Plain foot: a short heel→toe stroke (no shoe silhouette)
     ctx.beginPath();
-    this.shoePath(ctx, foot.x, foot.y, facingRight ? 1 : -1, 0);
-    ctx.fillStyle = PLAYER_STYLE.shoe;
-    ctx.fill();
-
-    // Polished shoe rim highlight
-    ctx.strokeStyle = PLAYER_STYLE.outline;
-    ctx.lineWidth = 1;
+    this.footPath(ctx, foot.x, foot.y, facingRight ? 1 : -1, 0);
+    ctx.strokeStyle = limbColor;
+    ctx.lineWidth = FOOT_W;
     ctx.stroke();
   }
 
-  /** Shared shoe silhouette (grow expands the outline pass outward). */
-  private shoePath(
+  /** Plain foot stroke (heel → toe) — grow expands the outline pass outward. */
+  private footPath(
     ctx: CanvasRenderingContext2D,
     footX: number,
     footY: number,
     facingSign: number,
     grow: number
   ): void {
-    const toeX = footX + facingSign * (11 + grow);
-    const heelX = footX - facingSign * (4 + grow);
-    const top = footY - 2 - grow;
-    const bottom = footY + 4.5 + grow;
-    ctx.moveTo(heelX, top);
-    ctx.lineTo(toeX, footY);
-    ctx.lineTo(toeX, bottom);
-    ctx.lineTo(heelX, bottom);
-    ctx.closePath();
+    ctx.moveTo(footX - facingSign * (FOOT_HEEL + grow * 0.4), footY);
+    ctx.lineTo(footX + facingSign * (FOOT_TOE + grow * 0.4), footY - 1.5);
   }
 
   private renderDebugSkeleton(ctx: CanvasRenderingContext2D, pose: StickFigurePose): void {

@@ -79,7 +79,20 @@ export class PlayerController {
   // every frame and make the legs stutter).
   private locomotionState: 'IDLE' | 'WALK' | 'RUN' = 'IDLE';
   /** How long the hurt flinch owns the pose before locomotion resumes. */
-  private static readonly HURT_HOLD = 0.35;
+  public static readonly HURT_HOLD = 0.35;
+  /**
+   * Landing compression hold (also the LAND pose's duration). Public because
+   * the renderer keys the landing squash-and-stretch and the tie's landing
+   * flutter off the same number the state machine uses.
+   */
+  public static readonly LAND_HOLD = 0.12;
+  /**
+   * Damage-flash clock for the screen-space hurt edge (0 → decays in update).
+   * Starts at 1 on every landed hit; the renderer draws an edge-only radial
+   * whose centre stays clear, so the player is never hidden behind his own
+   * damage feedback (owner brief 3: "damage flash that never hides the player").
+   */
+  public hurtFlash = 0;
 
   // Combat combo tracking (string step) + CombatDirector chain finisher flag
   private comboStep = 0;
@@ -438,6 +451,7 @@ export class PlayerController {
     const taken = healthBefore - this.physics.health;
     if (taken > 0) {
       this.waveDamageTaken += taken;
+      this.hurtFlash = 1;
       emitProgress(PROGRESS_EVENTS.PLAYER_DAMAGED, { amount: taken });
     }
     this.physics.velocity.x = knockbackX;
@@ -450,6 +464,8 @@ export class PlayerController {
     this.input = input;
     this.physics.stateTimer += dt;
     this.comboTimer = Math.max(0, this.comboTimer - dt);
+    // Damage-flash decay (screen-space hurt edge; see `hurtFlash`)
+    if (this.hurtFlash > 0) this.hurtFlash = Math.max(0, this.hurtFlash - dt * 3.4);
     this.hasThrownKnifeThisFrame = false;
     this.specialDenied = false;
     if (this.specialInvulnTimer > 0) this.specialInvulnTimer = Math.max(0, this.specialInvulnTimer - dt);
@@ -556,11 +572,20 @@ export class PlayerController {
     this.handleMovement(input, dt);
 
     // 3. SECONDARY RIG PHYSICS (Verlet necktie pinned at collar + coat flutter)
+    // Owner brief (2026-10-03): the tie must read on movement, attacks AND
+    // landings. Landing zeroes velocity.y on the contact frame (step 2), so
+    // the compression phase supplies the kick itself — a decaying spike over
+    // the 0.12 s LAND hold that whips the cloth and settles with the body.
     const moveSpeed = Math.hypot(this.physics.velocity.x, this.physics.velocity.y);
+    const landFlutter =
+      this.physics.state === 'LAND'
+        ? 0.7 * Math.max(0, 1 - this.physics.stateTimer / PlayerController.LAND_HOLD)
+        : 0;
     const tieFlutter = Math.min(
       1,
       (this.isAttackState(this.physics.state) ? 0.65 : 0) +
         (this.physics.isDodging ? 0.85 : 0) +
+        landFlutter +
         Math.min(0.5, moveSpeed / 700)
     );
     this.rig.updatePhysics(
@@ -1065,7 +1090,7 @@ export class PlayerController {
     if (inHurtFlinch) {
       // Hold the flinch; locomotion takes back over the frame it decays.
     } else if (this.physics.grounded && !this.physics.isDodging && !this.physics.isSliding && !this.physics.isBlocking && !isAttacking) {
-      if (this.physics.state === 'LAND' && this.physics.stateTimer < 0.12) {
+      if (this.physics.state === 'LAND' && this.physics.stateTimer < PlayerController.LAND_HOLD) {
         // Stay in land compression briefly
       } else {
         this.locomotionState = this.pickGait(Math.abs(this.physics.velocity.x));

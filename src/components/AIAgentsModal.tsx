@@ -242,7 +242,7 @@ export const AIAgentsModal: React.FC<AIAgentsModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[56] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto animate-in fade-in duration-150"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[56] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto animate-in fade-in duration-150"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}

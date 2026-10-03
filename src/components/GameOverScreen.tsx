@@ -42,7 +42,7 @@ function StatTile({
     <div className="rounded-xl bg-black/50 border border-white/10 px-2.5 py-2 flex flex-col items-center justify-center gap-0.5 min-h-[64px]">
       <Icon className={`w-3.5 h-3.5 ${accent}`} />
       <div className="text-sm font-black font-mono text-white leading-none">{value}</div>
-      <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500 leading-none">
+      <div className="text-micro font-mono uppercase text-neutral-500 leading-none">
         {label}
       </div>
     </div>
@@ -67,7 +67,7 @@ export const GameOverScreen: React.FC<EndScreenProps> = ({
   const victory = variant === 'victory';
 
   return (
-    <div className="fixed inset-0 z-[60] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 overflow-y-auto">
+    <div className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[60] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 overflow-y-auto">
       <div
         className={`menu-in w-full max-w-lg rounded-2xl p-4 sm:p-5 flex flex-col gap-4 text-neutral-200 max-h-[92vh] overflow-y-auto ${
           victory

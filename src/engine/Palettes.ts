@@ -9,27 +9,35 @@
  * Phase 1B.
  */
 
-/** Suit / tie / accent colourway for the player rig (StickRig). */
+/**
+ * Body / tie / accent colourway for the player rig (StickRig).
+ *
+ * OWNER 2026-10-03: the player has NO suit — a plain stick figure whose only
+ * garment is the red tie, so `tie` ships red and is not skin-overridable
+ * (the signature stays constant across colourways).
+ */
 export interface PlayerPalette {
   /** Bright body stroke — front limbs and torso fill */
   ivory: string;
   /** Back limbs sit one shade deeper for depth without going dark */
   ivoryBack: string;
-  /** Dress shoes / fist shade */
+  /** Legacy foot/fist shade kept for saved colourway data */
   shoe: string;
   /** Dark outline pass drawn underneath everything */
   outline: string;
+  /** Legacy shirt fields kept so saved skins stay valid (no suit is drawn) */
   shirt: string;
   shirtEdge: string;
+  /** The one garment: the red necktie (signature, constant across skins) */
   tie: string;
   cuff: string;
   /** Rim glow rgb prefix (alpha appended per draw) */
   glow: string;
-  /** Soft interior edge for the shirt / lapel work */
+  /** Brow / interior detail mark */
   detail: string;
 }
 
-/** Shipped John Stick colourway — the exact Phase 1B values. */
+/** Shipped John Stick colourway — plain ivory figure, signature red tie. */
 export const DEFAULT_PLAYER_PALETTE: PlayerPalette = {
   ivory: '#f6efdf',
   ivoryBack: '#e3dbc7',
@@ -37,7 +45,7 @@ export const DEFAULT_PLAYER_PALETTE: PlayerPalette = {
   outline: '#08090e',
   shirt: '#ffffff',
   shirtEdge: '#14151c',
-  tie: '#0b0c11',
+  tie: '#d92626',
   cuff: '#ffffff',
   glow: '255, 240, 206',
   detail: '#1b1c24',
@@ -49,6 +57,9 @@ export const PLAYER_STYLE: PlayerPalette = { ...DEFAULT_PLAYER_PALETTE };
 /** Paints a skin onto the live palette (defaults fill any missing field). */
 export function applyPlayerPalette(palette: Partial<PlayerPalette>): void {
   Object.assign(PLAYER_STYLE, DEFAULT_PLAYER_PALETTE, palette);
+  // Owner mandate: the necktie is the player's one garment and its colour is
+  // part of the character read — colourways repaint the body, never the tie.
+  PLAYER_STYLE.tie = DEFAULT_PLAYER_PALETTE.tie;
 }
 
 /** Accent colours for blades and firearms (StickRig + Renderer pickups). */

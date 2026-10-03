@@ -67,6 +67,10 @@ export class EnemyRig {
     // 2. Mid-tone body pass on top
     this.renderBody(ctx, enemy, false);
 
+    // 2b. RIM-LIGHT PASS — a thin cool stroke on the shared key-light edge
+    // (upper right) so the suited body reads as lit instead of flat.
+    this.renderRimLight(ctx, pose);
+
     // 3. Overhead Health & Stun Bar
     this.renderStatusOverhead(ctx, enemy);
 
@@ -122,6 +126,43 @@ export class EnemyRig {
 
     // 7. Head with Syndicate Enforcer red glint
     this.renderHead(ctx, pose.head, enemy.isStaggered, enemy.skinColor, outline, grow);
+  }
+
+  /**
+   * P2 rim light — same key-light direction as the player (upper right) but
+   * cool white, so the warm player rim and the cool enemy rim never blur
+   * together. Three strokes, no gradient, no state beyond one save.
+   */
+  private renderRimLight(ctx: CanvasRenderingContext2D, pose: StickFigurePose): void {
+    ctx.save();
+    ctx.translate(2.4, -2.4);
+    ctx.globalAlpha = 0.42;
+    ctx.strokeStyle = 'rgba(226, 240, 255, 1)';
+    ctx.lineWidth = 1.6;
+    ctx.lineCap = 'round';
+
+    // Spine edge
+    ctx.beginPath();
+    ctx.moveTo(pose.neck.x, pose.neck.y);
+    ctx.lineTo(pose.torso.x, pose.torso.y);
+    ctx.lineTo(pose.hips.x, pose.hips.y);
+    ctx.stroke();
+
+    // Head crown arc (right half — matches the key light)
+    ctx.beginPath();
+    ctx.arc(pose.head.x, pose.head.y, 13, -1.15, 1.15);
+    ctx.stroke();
+
+    // Lead arm + lead thigh edges
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    ctx.moveTo(pose.rightShoulder.x, pose.rightShoulder.y);
+    ctx.lineTo(pose.rightElbow.x, pose.rightElbow.y);
+    ctx.moveTo(pose.rightHip.x, pose.rightHip.y);
+    ctx.lineTo(pose.rightKnee.x, pose.rightKnee.y);
+    ctx.stroke();
+
+    ctx.restore();
   }
 
   /** Soft crimson halo behind the figure — reads as a hostile tell on dark stages. */
@@ -448,6 +489,11 @@ export class EnemyRig {
     ctx.fillStyle = hpRatio > 0.3 ? '#ef4444' : '#f87171';
     ctx.fillRect(x, y, barWidth * hpRatio, barHeight);
 
+    // P4 colour-blind cue: a hard 50% notch across the bar reads as a shape
+    // landmark, so remaining health never depends on the red fill alone.
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+    ctx.fillRect(x + barWidth * 0.5 - 0.5, y, 1, barHeight);
+
     // Stagger / Stun bar underneath
     const stWidth = barWidth;
     const stHeight = 2.5;
@@ -459,6 +505,13 @@ export class EnemyRig {
     const stRatio = Math.min(1, enemy.staggerMeter / enemy.maxStagger);
     ctx.fillStyle = enemy.isStaggered ? '#fbbf24' : '#38bdf8';
     ctx.fillRect(x, stY, stWidth * stRatio, stHeight);
+
+    // P4 colour-blind cue: numeric HP so the red/amber fills are never the
+    // only signal. Sits clear of the status tag above the bar.
+    ctx.font = 'bold 8px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#e5e7eb';
+    ctx.fillText(`${Math.ceil(hpRatio * 100)}%`, x + barWidth + 3, y + barHeight);
 
     // Tag label
     ctx.font = 'bold 9px monospace';

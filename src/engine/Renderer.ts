@@ -8,6 +8,7 @@ import { ObjectPool } from './ObjectPool';
 import { POSE_JOINTS } from './AnimationController';
 import { StickFigurePose, EnemyBullet } from '../types/game';
 import { PLAYER_STYLE, WEAPON_TINT } from './Palettes';
+import { FIGURE_SCALE } from './StickRig';
 
 export interface DustParticle {
   x: number;
@@ -61,6 +62,14 @@ for (let i = 0; i <= 300; i++) {
   SPEED_FADE_ALPHA.push(`rgba(255, 255, 255, ${(i / 1000).toFixed(3)})`);
 }
 
+/** #rrggbb → rgba() string for the stage grade passes (one small parse/frame). */
+function withAlpha(hex: string, alpha: number): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
+  if (!m) return `rgba(0, 0, 0, ${alpha})`;
+  const n = parseInt(m[1], 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
+}
+
 /** Fresh pose with every joint allocated — pool shells are filled in place. */
 function makeEmptyPose(): StickFigurePose {
   const pose = {} as StickFigurePose;
@@ -103,6 +112,55 @@ export class Renderer {
   private vignetteGradient: CanvasGradient | null = null;
   private vignetteW = 0;
   private vignetteH = 0;
+
+  // ---- P1 cinematic post stack (every layer quality-scaled + cached) ----
+  /**
+   * Parallax rates — apparent screen motion relative to the world plane (1.0).
+   * Ordered far → mid → near so the depth actually reads: the key art drifts
+   * slowest, the architecture sits behind the fighters, the foreground hangings
+   * sweep fastest in front of them.
+   */
+  private static readonly PARALLAX_FAR = 0.2;
+  private static readonly PARALLAX_MID = 0.5;
+  private static readonly PARALLAX_FIXTURE = 0.72;
+  private static readonly PARALLAX_NEAR = 1.25;
+
+  /** Stage LUT grade — two gradients rebuilt only when the stage/size changes. */
+  private gradeKey = '';
+  private gradeMultiply: CanvasGradient | null = null;
+  private gradeScreen: CanvasGradient | null = null;
+
+  /** Dynamic vignette: one gradient per intensity bucket, rebuilt on change. */
+  private vignetteBuckets = new Map<number, CanvasGradient>();
+  private vignetteFlashBuckets = new Map<number, CanvasGradient>();
+  private vignetteBucketW = 0;
+  private vignetteBucketH = 0;
+
+  /** Film grain: one noise tile + pattern (per ctx), cycled offsets, no alloc. */
+  private grainTile: HTMLCanvasElement | null = null;
+  private grainPattern: CanvasPattern | null = null;
+  private grainPatternCtx: CanvasRenderingContext2D | null = null;
+  private grainFrame = 0;
+  private static readonly GRAIN_OFFSETS: readonly (readonly [number, number])[] = (() => {
+    const out: [number, number][] = [];
+    let seed = 0x1a2b3c;
+    for (let i = 0; i < 16; i++) {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      out.push([seed % 128, (seed >> 7) % 128]);
+    }
+    return out;
+  })();
+
+  /** Player damage edge-flash — screen edge only, never over the fighter. */
+  private damageFlash = 0;
+  private prevPlayerHealth = -1;
+
+  /** Foreground lamp glow (near parallax layer) — constant coords, cached. */
+  private lampGlow: CanvasGradient | null = null;
+  private lampGlowAccent = '';
+  /** Mid-layer fixture underglow — constant coords, cached. */
+  private fixtureGlow: CanvasGradient | null = null;
+  private fixtureGlowAccent = '';
 
   // P1-02: gradients whose inputs only change per room (or never) are built
   // once. Per the canvas spec a gradient is transformed by the CTM at render
@@ -262,6 +320,11 @@ export class Renderer {
         bloom.life -= dt;
       }
     }
+
+    // P3: player damage edge-flash decay (set in render() on a health drop)
+    if (this.damageFlash > 0) {
+      this.damageFlash = Math.max(0, this.damageFlash - dt * 3.4);
+    }
   }
 
   /**
@@ -345,6 +408,15 @@ export class Renderer {
       this.weaponGlowGrad = null;
       this.ammoGlowGrad = null;
       this.vignetteGradient = null;
+      this.vignetteBuckets.clear();
+      this.vignetteFlashBuckets.clear();
+      this.gradeKey = '';
+      this.gradeMultiply = null;
+      this.gradeScreen = null;
+      this.grainPattern = null;
+      this.grainPatternCtx = null;
+      this.lampGlow = null;
+      this.fixtureGlow = null;
     }
 
     ctx.clearRect(0, 0, width, height);
@@ -408,7 +480,7 @@ export class Renderer {
     // P1-04: one save for the whole shadow family — each shadow only swaps
     // fillStyle and builds its own ellipse path.
     ctx.save();
-    this.renderShadow(ctx, player.physics.position.x, player.physics.position.y);
+    this.renderShadow(ctx, player.physics.position.x, player.physics.position.y, FIGURE_SCALE);
     for (const enemy of enemies) {
       if (!this.inView(enemy.position.x, enemy.position.y, 96)) continue;
       this.renderShadow(ctx, enemy.position.x, enemy.position.y);
@@ -431,8 +503,13 @@ export class Renderer {
     // 8b. AFTERIMAGE MOTION TRAILS (Dodge / Heavy Attack ghosts)
     this.renderAfterimages(ctx, player);
 
-    // 9. PLAYER STICK FIGURE (With equipped Katana/Knife)
+    // 8c. NEAR PARALLAX LAYER — foreground hangings drawn OVER the fighters
+    this.renderNearLayer(ctx, camera.x, environmentManager);
+
+    // 9. PLAYER STICK FIGURE (plain stick + red tie, equipped Katana/Knife)
     //    or tumbling ragdoll during the death kill-cam
+    // P2: squash-and-stretch deform on LAND / hit reactions (visual only)
+    const deform = this.playerDeform(player);
     if (player.ragdoll && !player.ragdoll.dead) {
       // Same ivory silhouette + dark under-stroke as the live rig (JOB 1),
       // with the warm rim accent so the kill-cam body keeps its glow.
@@ -440,7 +517,8 @@ export class Renderer {
         ctx,
         PLAYER_STYLE.ivory,
         PLAYER_STYLE.ivory,
-        `rgba(${PLAYER_STYLE.glow}, 0.8)`
+        `rgba(${PLAYER_STYLE.glow}, 0.8)`,
+        FIGURE_SCALE
       );
     } else {
       player.rig.render(
@@ -448,7 +526,10 @@ export class Renderer {
         player.currentPose,
         player.physics.facingRight,
         debugMode,
-        player.physics.equippedWeapon
+        player.physics.equippedWeapon,
+        false,
+        deform.x,
+        deform.y
       );
     }
 
@@ -460,8 +541,23 @@ export class Renderer {
 
     ctx.restore();
 
-    // 11. SCREEN VIGNETTE & CINEMATIC BARS
-    this.renderVignette(ctx, width, height);
+    // P3: health-drop edge flash — armed here (render runs every frame, so a
+    // drop during hit-stop still registers) and decayed in updateParticles().
+    const hp = player.physics.health;
+    if (this.prevPlayerHealth >= 0 && hp < this.prevPlayerHealth) {
+      this.damageFlash = 1;
+    }
+    this.prevPlayerHealth = hp;
+
+    // 10b. STAGE COLOR GRADE (LUT-style: shadows → ambience, lifts → accent)
+    this.renderColorGrade(ctx, width, height, environmentManager);
+
+    // 11. SCREEN VIGNETTE (dynamic: breathes with impact trauma) & DAMAGE EDGE
+    const flash = this.damageFlash;
+    this.renderVignette(ctx, width, height, camera.traumaLevel + flash * 0.9, flash);
+
+    // 11c. FILM GRAIN (cheap cached noise pattern, quality-scaled)
+    this.renderGrain(ctx, width, height);
 
     // 11b. RADIAL SPEED LINES (Heavy impacts & slow-mo)
     this.renderSpeedLines(ctx, width, height, combatDirector);
@@ -558,11 +654,12 @@ export class Renderer {
       ctx.fillRect(camX - 1500, groundY - 600, 3000, 600);
     }
 
-    // Parallax pillars / vertical architectural blinds
+    // Parallax pillars / vertical architectural blinds (MID plane — sits
+    // between the far key art and the world-space fighters)
     ctx.save();
     ctx.fillStyle = '#0f121d';
     const pillarSpacing = 160;
-    const parallaxX = camX * 0.3;
+    const parallaxX = camX * Renderer.PARALLAX_MID;
     const startPillar = Math.floor((camX - 1000) / pillarSpacing) * pillarSpacing;
 
     for (let x = startPillar; x < camX + 1000; x += pillarSpacing) {
@@ -576,6 +673,40 @@ export class Renderer {
     // Mid-ground wall base trim
     ctx.fillStyle = '#1c2032';
     ctx.fillRect(camX - 1500, groundY - 14, 3000, 14);
+
+    // Hanging fixtures — a SECOND mid plane (0.72) so the wall stack has real
+    // depth: cable, lamp housing, accent underglow.
+    const fixtureSpacing = 480;
+    const fixtureParallax = camX * Renderer.PARALLAX_FIXTURE;
+    const startFixture = Math.floor((camX - 1100) / fixtureSpacing) * fixtureSpacing;
+    for (let x = startFixture; x < camX + 1100; x += fixtureSpacing) {
+      const fx = x - fixtureParallax;
+      ctx.strokeStyle = 'rgba(9, 11, 18, 0.92)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(fx, groundY - 540);
+      ctx.lineTo(fx, groundY - 436);
+      ctx.stroke();
+      ctx.fillStyle = '#141927';
+      ctx.fillRect(fx - 14, groundY - 438, 28, 15);
+      ctx.fillStyle = accentColor;
+      ctx.fillRect(fx - 14, groundY - 425, 28, 2);
+      // Underglow: constant-coordinate gradient, translated into place so the
+      // frame never allocates a gradient per fixture.
+      if (!this.fixtureGlow || this.fixtureGlowAccent !== accentColor) {
+        const glow = ctx.createRadialGradient(0, 0, 3, 0, 0, 78);
+        glow.addColorStop(0, `${accentColor}4d`);
+        glow.addColorStop(0.5, `${accentColor}14`);
+        glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        this.fixtureGlow = glow;
+        this.fixtureGlowAccent = accentColor;
+      }
+      ctx.save();
+      ctx.translate(fx, groundY - 420);
+      ctx.fillStyle = this.fixtureGlow;
+      ctx.fillRect(-78, -78, 156, 156);
+      ctx.restore();
+    }
 
     // Atmospheric warm light sconces on wall
     for (let x = startPillar + 80; x < camX + 1000; x += pillarSpacing * 2) {
@@ -626,9 +757,10 @@ export class Renderer {
   ): void {
     const dw = 4800;
     const dh = 620;
-    // Parallax factor: backdrop drifts at ~55% of world speed.
+    // FAR plane: the key art is the deepest layer in the scene, so it drifts
+    // slowest (0.2 of world speed) — slower than the mid pillars (0.5).
     // Rect is oversized so it still covers ultrawide screens at max camera travel.
-    const parallax = 0.45;
+    const parallax = Renderer.PARALLAX_FAR;
     const dx = camX * parallax - dw / 2;
 
     // Sky band above the key art: tall screens (1440p, portrait tablets)
@@ -745,15 +877,23 @@ export class Renderer {
     }
   }
 
-  private renderShadow(ctx: CanvasRenderingContext2D, x: number, y: number): void {
+  private renderShadow(ctx: CanvasRenderingContext2D, x: number, y: number, figureScale: number = 1): void {
     const groundDist = Math.max(0, -y);
     const scale = Math.max(0.2, 1 - groundDist / 200);
     const opacity = Math.max(0.08, 0.45 * (1 - groundDist / 180));
 
-    // P1-04: the old save/translate/scale/arc/restore was exactly this
-    // axis-aligned ellipse — same pixels, no state flips.
+    // P2 soft contact shadow: a wide faint halo ellipse under the core patch
+    // fakes the falloff of a real contact shadow for one extra fill.
+    // figureScale: the player rig is drawn larger (FIGURE_SCALE), so his
+    // contact patch grows with him while enemies keep their own footprint.
+    const rx = 22 * scale * figureScale;
+    const ry = rx * 0.35;
     ctx.beginPath();
-    ctx.ellipse(x, 0, 22 * scale, 22 * scale * 0.35, 0, 0, Math.PI * 2);
+    ctx.ellipse(x, 0, rx * 1.7, ry * 1.7, 0, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0, 0, 0, ${opacity * 0.35})`;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(x, 0, rx, ry, 0, 0, Math.PI * 2);
     ctx.fillStyle = `rgba(0, 0, 0, ${opacity})`;
     ctx.fill();
   }
@@ -812,41 +952,54 @@ export class Renderer {
       // so the next shot's id is correctly detected as new.
       this.lastTracerId = -1;
     }
-    if (combat.tracers.length > 0) ctx.save();
-    for (const tr of combat.tracers) {
-      if (tr.id > this.lastTracerId) {
-        // Newly fired shot: pop a short-lived light bloom at the muzzle origin.
-        // Id-based so hit-stop re-renders of the same frozen tracer don't respawn.
-        this.spawnMuzzleBloom(tr.x1, tr.y1);
-        this.lastTracerId = tr.id;
+    if (combat.tracers.length > 0) {
+      ctx.save();
+      // P1 — glow pass runs ADDITIVE so tracers and muzzle stars bloom like
+      // real light instead of sitting flat on the backdrop.
+      ctx.globalCompositeOperation = 'lighter';
+      for (const tr of combat.tracers) {
+        if (tr.id > this.lastTracerId) {
+          // Newly fired shot: pop a short-lived light bloom at the muzzle origin.
+          // Id-based so hit-stop re-renders of the same frozen tracer don't respawn.
+          this.spawnMuzzleBloom(tr.x1, tr.y1);
+          this.lastTracerId = tr.id;
+        }
+        if (!this.inView(tr.x1, tr.y1, 64) && !this.inView(tr.x2, tr.y2, 64)) continue;
+        const alpha = tr.life / tr.maxLife;
+        // Outer amber glow
+        ctx.globalAlpha = alpha * 0.5;
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = tr.width * 2.5;
+        ctx.beginPath();
+        ctx.moveTo(tr.x1, tr.y1);
+        ctx.lineTo(tr.x2, tr.y2);
+        ctx.stroke();
+
+        // Muzzle flash star at origin
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = '#fde047';
+        ctx.beginPath();
+        ctx.arc(tr.x1, tr.y1, 6 * alpha, 0, Math.PI * 2);
+        ctx.fill();
       }
-      if (!this.inView(tr.x1, tr.y1, 64) && !this.inView(tr.x2, tr.y2, 64)) continue;
-      const alpha = tr.life / tr.maxLife;
-      // Outer amber glow
-      ctx.globalAlpha = alpha * 0.5;
-      ctx.strokeStyle = '#f59e0b';
-      ctx.lineWidth = tr.width * 2.5;
-      ctx.beginPath();
-      ctx.moveTo(tr.x1, tr.y1);
-      ctx.lineTo(tr.x2, tr.y2);
-      ctx.stroke();
-
-      // Sharp white-hot core
-      ctx.globalAlpha = alpha;
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = tr.width;
-      ctx.beginPath();
-      ctx.moveTo(tr.x1, tr.y1);
-      ctx.lineTo(tr.x2, tr.y2);
-      ctx.stroke();
-
-      // Muzzle flash star at origin
-      ctx.fillStyle = '#fde047';
-      ctx.beginPath();
-      ctx.arc(tr.x1, tr.y1, 6 * alpha, 0, Math.PI * 2);
-      ctx.fill();
+      // Core pass back in source-over so the white-hot line stays crisp
+      ctx.globalCompositeOperation = 'source-over';
+      for (const tr of combat.tracers) {
+        if (!this.inView(tr.x1, tr.y1, 64) && !this.inView(tr.x2, tr.y2, 64)) continue;
+        const alpha = tr.life / tr.maxLife;
+        ctx.globalAlpha = alpha;
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = tr.width;
+        ctx.beginPath();
+        ctx.moveTo(tr.x1, tr.y1);
+        ctx.lineTo(tr.x2, tr.y2);
+        ctx.stroke();
+      }
+      ctx.restore();
     }
-    if (combat.tracers.length > 0) ctx.restore();
+
+    // P1 — pooled additive impact bloom (finisher / boss phase break)
+    this.renderImpactBloom(ctx, combat);
 
     // Muzzle-flash light blooms (pooled radial glow at shot origins)
     this.renderMuzzleBlooms(ctx);
@@ -994,7 +1147,9 @@ export class Renderer {
       const alpha = 1 - progress;
       const start = arc.angle - arc.arcLength * 0.5;
       const end = arc.angle + arc.arcLength * 0.5;
-      // Wide low-alpha under-stroke as glow (cheaper than shadowBlur on mobile)
+      // Wide low-alpha under-stroke as glow — additive so the slash blooms
+      // (cheaper than shadowBlur on mobile)
+      ctx.globalCompositeOperation = 'lighter';
       ctx.globalAlpha = alpha * 0.35;
       ctx.strokeStyle = arc.color;
       ctx.lineWidth = 12 * (1 - progress * 0.5);
@@ -1002,12 +1157,34 @@ export class Renderer {
       ctx.arc(arc.x, arc.y, arc.radius, start, end);
       ctx.stroke();
       // Sharp core stroke
+      ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = alpha;
       ctx.lineWidth = 4 * (1 - progress * 0.5);
       ctx.beginPath();
       ctx.arc(arc.x, arc.y, arc.radius, start, end);
       ctx.stroke();
     }
+    ctx.restore();
+  }
+
+  /**
+   * P1 — draws the pooled impact bloom: one radial gradient under 'lighter'
+   * that swells and fades. Single record, so at most one gradient is built
+   * per frame and only while a beat is actually live.
+   */
+  private renderImpactBloom(ctx: CanvasRenderingContext2D, combat: CombatDirector): void {
+    const bloom = combat.impactBloom;
+    if (bloom.life <= 0) return;
+    const p = Math.max(0, bloom.life / bloom.maxLife);
+    const radius = bloom.radius * (0.55 + (1 - p) * 0.75);
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const grad = ctx.createRadialGradient(bloom.x, bloom.y, 4, bloom.x, bloom.y, radius);
+    grad.addColorStop(0, `rgba(${bloom.rgb}, ${(0.5 * p).toFixed(3)})`);
+    grad.addColorStop(0.4, `rgba(${bloom.rgb}, ${(0.22 * p).toFixed(3)})`);
+    grad.addColorStop(1, `rgba(${bloom.rgb}, 0)`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(bloom.x - radius, bloom.y - radius, radius * 2, radius * 2);
     ctx.restore();
   }
 
@@ -1381,25 +1558,239 @@ export class Renderer {
     ctx.restore();
   }
 
-  private renderVignette(ctx: CanvasRenderingContext2D, width: number, height: number): void {
-    // M14: the gradient is identical every frame — build it once per canvas
-    // size instead of re-parsing its colour stops on every single frame.
-    // P1-05: size compared as numbers (was a `${w}x${h}` key per frame).
-    if (!this.vignetteGradient || this.vignetteW !== width || this.vignetteH !== height) {
+  /**
+   * P2: squash-and-stretch on landings and hit reactions — a vertical
+   * compress that eases back to neutral. Purely presentational (the pose
+   * already carries the knee bend), so no combat value reads it.
+   */
+  private playerDeform(player: PlayerController): { x: number; y: number } {
+    const state = player.physics.state;
+    const t = player.physics.stateTimer;
+    if (state === 'LAND' && t < 0.14) {
+      const k = 1 - t / 0.14;
+      return { x: 1 + 0.16 * k, y: 1 - 0.2 * k };
+    }
+    if (state === 'HURT' && t < 0.12) {
+      const k = 1 - t / 0.12;
+      return { x: 1 - 0.1 * k, y: 1 - 0.12 * k };
+    }
+    if (state === 'KNOCKBACK' && t < 0.16) {
+      const k = 1 - t / 0.16;
+      return { x: 1 - 0.08 * k, y: 1 - 0.1 * k };
+    }
+    return { x: 1, y: 1 };
+  }
+
+  /**
+   * NEAR parallax layer — foreground hanging lamps pinned to the top of the
+   * frame, drifting faster than the world so the stage gains a real foreground
+   * plane in front of the fighters. Guarded twice: it never draws on Low, and
+   * it bails whenever the band would reach head height, so it can never cover
+   * a fighter or a wind-up telegraph.
+   */
+  private renderNearLayer(
+    ctx: CanvasRenderingContext2D,
+    camX: number,
+    env?: EnvironmentManager
+  ): void {
+    if (this.quality === 'low') return;
+    const band = 96;
+    // Not enough headroom above the fighters? Skip rather than occlude them.
+    if (this.viewTop + band > -180) return;
+
+    const accent = env ? env.config.accentColor : '#d97706';
+    const spacing = 320;
+    const offset = camX * Renderer.PARALLAX_NEAR;
+    const start = Math.floor((camX - 1200) / spacing) * spacing;
+
+    ctx.save();
+    for (let x = start; x < camX + 1200; x += spacing) {
+      const wx = x - offset;
+      if (wx < this.viewLeft - 90 || wx > this.viewRight + 90) continue;
+
+      // Suspension cable
+      ctx.strokeStyle = 'rgba(5, 7, 12, 0.95)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(wx, this.viewTop - 60);
+      ctx.lineTo(wx, this.viewTop + 36);
+      ctx.stroke();
+
+      // Lamp housing + accent trim
+      ctx.fillStyle = '#090c13';
+      ctx.fillRect(wx - 17, this.viewTop + 36, 34, 18);
+      ctx.fillStyle = accent;
+      ctx.fillRect(wx - 17, this.viewTop + 52, 34, 2);
+
+      // Light cone — cached constant-coordinate gradient, translated into place
+      if (!this.lampGlow || this.lampGlowAccent !== accent) {
+        const glow = ctx.createRadialGradient(0, 0, 4, 0, 0, 96);
+        glow.addColorStop(0, `${accent}40`);
+        glow.addColorStop(0.45, `${accent}12`);
+        glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        this.lampGlow = glow;
+        this.lampGlowAccent = accent;
+      }
+      ctx.save();
+      ctx.translate(wx, this.viewTop + 58);
+      ctx.fillStyle = this.lampGlow;
+      ctx.fillRect(-96, -12, 192, 192);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  /**
+   * P1 — LUT-style stage grade: two full-screen gradient passes that push
+   * shadows toward the stage ambience and lift the highlights with the stage
+   * accent, so all four rooms read as one graded film stock with a per-stage
+   * tint. Cached per stage + canvas size; Medium keeps the shadow pass only,
+   * Low keeps the ungraded look.
+   */
+  private renderColorGrade(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    env?: EnvironmentManager
+  ): void {
+    if (this.quality === 'low' || !env) return;
+    const ambience = env.config.ambienceColor;
+    const accent = env.config.accentColor;
+    const key = `${ambience}|${accent}|${width}x${height}`;
+    if (this.gradeKey !== key) {
+      const shadow = ctx.createLinearGradient(0, 0, 0, height);
+      shadow.addColorStop(0, withAlpha(ambience, 0.2));
+      shadow.addColorStop(0.5, withAlpha(ambience, 0.07));
+      shadow.addColorStop(1, withAlpha(ambience, 0.24));
+      const lift = ctx.createLinearGradient(0, 0, 0, height);
+      lift.addColorStop(0, withAlpha(accent, 0.11));
+      lift.addColorStop(0.45, withAlpha(accent, 0.03));
+      lift.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      this.gradeMultiply = shadow;
+      this.gradeScreen = lift;
+      this.gradeKey = key;
+    }
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.fillStyle = this.gradeMultiply!;
+    ctx.fillRect(0, 0, width, height);
+    if (this.quality === 'high') {
+      ctx.globalCompositeOperation = 'screen';
+      ctx.fillStyle = this.gradeScreen!;
+      ctx.fillRect(0, 0, width, height);
+    }
+    ctx.restore();
+  }
+
+  /**
+   * P1 — dynamic vignette. Intensity breathes with camera trauma (and the
+   * player damage flash), so impacts feel like they touch the frame itself.
+   * One gradient per intensity bucket is cached; the red damage edge is a
+   * second edge-only gradient, drawn only while the flash is alive — it never
+   * reaches the centre of the frame, so the player is never hidden.
+   */
+  private renderVignette(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    intensity: number,
+    flash: number
+  ): void {
+    // M14: gradients are identical for a given size/bucket — rebuild only on change.
+    if (this.vignetteBucketW !== width || this.vignetteBucketH !== height) {
+      this.vignetteGradient = null;
+      this.vignetteBuckets.clear();
+      this.vignetteFlashBuckets.clear();
+      this.vignetteBucketW = width;
+      this.vignetteBucketH = height;
+      this.vignetteW = 0;
+      this.vignetteH = 0;
+    }
+
+    const bucket = Math.max(0, Math.min(14, Math.round(intensity * 14)));
+    let vignette = this.vignetteBuckets.get(bucket);
+    if (!vignette) {
       const radius = Math.max(width, height) * 0.75;
-      const vignette = ctx.createRadialGradient(
+      const edge = 0.5 + (bucket / 14) * 0.28;
+      vignette = ctx.createRadialGradient(
         width * 0.5, height * 0.5, radius * 0.4,
         width * 0.5, height * 0.5, radius
       );
       vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
-      vignette.addColorStop(1, 'rgba(0, 0, 0, 0.65)');
-      this.vignetteGradient = vignette;
-      this.vignetteW = width;
-      this.vignetteH = height;
+      vignette.addColorStop(1, `rgba(0, 0, 0, ${edge.toFixed(3)})`);
+      this.vignetteBuckets.set(bucket, vignette);
+    }
+    this.vignetteGradient = vignette;
+    this.vignetteW = width;
+    this.vignetteH = height;
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, width, height);
+
+    // Red edge flash on damage — outer ring only, centre stays clear.
+    if (flash > 0.02) {
+      const fb = Math.max(1, Math.min(10, Math.round(flash * 10)));
+      let red = this.vignetteFlashBuckets.get(fb);
+      if (!red) {
+        const radius = Math.max(width, height) * 0.62;
+        red = ctx.createRadialGradient(
+          width * 0.5, height * 0.5, radius * 0.55,
+          width * 0.5, height * 0.5, radius
+        );
+        red.addColorStop(0, 'rgba(150, 18, 18, 0)');
+        red.addColorStop(0.7, `rgba(168, 22, 22, ${(fb / 10) * 0.22})`);
+        red.addColorStop(1, `rgba(214, 34, 34, ${(fb / 10) * 0.5})`);
+        this.vignetteFlashBuckets.set(fb, red);
+      }
+      ctx.fillStyle = red;
+      ctx.fillRect(0, 0, width, height);
+    }
+  }
+
+  /**
+   * P1 — film grain: one cached 128px noise tile + pattern, offset from a
+   * fixed 16-entry table (no per-frame allocation, no Math.random churn).
+   * High draws it at full strength, Medium at half, Low skips it.
+   */
+  private renderGrain(ctx: CanvasRenderingContext2D, width: number, height: number): void {
+    if (this.quality === 'low' || typeof document === 'undefined') return;
+
+    if (!this.grainTile) {
+      const tile = document.createElement('canvas');
+      tile.width = 128;
+      tile.height = 128;
+      const tctx = tile.getContext('2d');
+      if (!tctx) return;
+      const img = tctx.createImageData(128, 128);
+      const data = img.data;
+      let seed = 0x51ed270b;
+      for (let i = 0; i < 128 * 128; i++) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        const bright = (seed & 1) === 0;
+        const a = 40 + ((seed >> 8) % 70);
+        data[i * 4] = bright ? 255 : 0;
+        data[i * 4 + 1] = bright ? 255 : 0;
+        data[i * 4 + 2] = bright ? 255 : 0;
+        data[i * 4 + 3] = a;
+      }
+      tctx.putImageData(img, 0, 0);
+      this.grainTile = tile;
     }
 
-    ctx.fillStyle = this.vignetteGradient;
-    ctx.fillRect(0, 0, width, height);
+    if (!this.grainPattern || this.grainPatternCtx !== ctx) {
+      const pattern = ctx.createPattern(this.grainTile, 'repeat');
+      if (!pattern) return;
+      this.grainPattern = pattern;
+      this.grainPatternCtx = ctx;
+    }
+
+    const [ox, oy] = Renderer.GRAIN_OFFSETS[this.grainFrame++ & 15];
+    ctx.save();
+    ctx.globalAlpha = this.quality === 'high' ? 0.085 : 0.05;
+    ctx.translate(-ox, -oy);
+    ctx.fillStyle = this.grainPattern;
+    ctx.fillRect(0, 0, width + 128, height + 128);
+    ctx.restore();
   }
 
   private renderBossHUD(
