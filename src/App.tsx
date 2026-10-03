@@ -30,6 +30,7 @@ import {
   Trophy
 } from 'lucide-react';
 import { SoundFX } from './engine/SoundFX';
+import { Haptics } from './engine/Haptics';
 import { AIAgentsModal } from './components/AIAgentsModal';
 import { HowToPlayModal } from './components/HowToPlayModal';
 import { RotateDeviceOverlay } from './components/RotateDeviceOverlay';
@@ -421,6 +422,8 @@ export default function App() {
     gameLoop.soundMuted = settings.sfxVolume === 0;
     // P5-01 + P5-02: one knob → canvas resolution, blur gates, FX budgets
     gameLoop.quality = settings.quality;
+    // PHASE 1B E6: gameplay haptics gate (pad rumble + phone vibration)
+    Haptics.enabled = settings.haptics;
     setIsMuted(settings.sfxVolume === 0);
     saveSettings(settings);
   }, [settings, gameLoop]);

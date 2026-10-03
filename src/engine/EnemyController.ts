@@ -74,6 +74,18 @@ export class EnemyController {
   private aiAccumulator: number = Math.random() * AI_THROTTLE_INTERVAL;
   public attackCooldown: number = 1.0;
   public blockCooldown: number = 0;
+  /**
+   * PHASE 1B 3: seconds this ranged archetype stays disarmed — its gun was
+   * knocked loose by a heavy blow, so it closes to melee until the timer runs
+   * out. 0 = armed and shooting normally.
+   */
+  public disarmTimer: number = 0;
+  /**
+   * PHASE 1B 11: adaptive-difficulty scalar written by GameLoop every half
+   * second. 1.0 = shipped baseline (byte-identical behaviour); above speeds
+   * the decision cooldowns and sharpens reactions, below softens them.
+   */
+  public adaptive: number = 1;
   public attackPattern: AttackPattern = 'JAB';
 
   // Reactive defense (per-archetype): guard chance, dodge chance and the
@@ -126,6 +138,11 @@ export class EnemyController {
   public targetOffset: number = 75; // Preferred distance offset from player (-75 for left, +75 for right)
   public moveSpeed: number = 140;
   public hasAttackToken: boolean = true;
+  /**
+   * PHASE 1B 6: scratch flag GameLoop uses while handing out attack slots —
+   * set during the distance-ordered grant pass, cleared after update().
+   */
+  public tokenPicked: boolean = false;
 
   // Ragdoll death physics (spawned on lethal blow, rendered instead of the rig)
   public ragdoll: Ragdoll | null = null;
@@ -412,7 +429,12 @@ export class EnemyController {
     this.stateTimer += dt;
     this.animTimer += dt;
     this.hasAttackToken = canAttack;
-    if (this.attackCooldown > 0) this.attackCooldown -= dt;
+    // PHASE 1B: disarm window counts down here (ranged gates read it in AI)
+    if (this.disarmTimer > 0) this.disarmTimer = Math.max(0, this.disarmTimer - dt);
+    // PHASE 1B 11: adaptive scalar scales cooldown *drain* only — the authored
+    // cooldown values themselves never change, so 1.0 matches the shipped AI.
+    const coolScale = this.adaptive;
+    if (this.attackCooldown > 0) this.attackCooldown -= dt * coolScale;
     if (this.blockCooldown > 0) this.blockCooldown -= dt;
     if (this.dodgeCooldown > 0) this.dodgeCooldown -= dt;
 
@@ -497,7 +519,7 @@ export class EnemyController {
           absDistToPlayer < guardReach &&
           this.blockCooldown <= 0 &&
           this.health > 0 &&
-          Math.random() < this.blockChance
+          Math.random() < Math.min(0.9, this.blockChance * this.adaptive)
         ) {
           this.state = 'BLOCK';
           this.stateTimer = 0;
@@ -516,14 +538,15 @@ export class EnemyController {
           this.dodgeCooldown <= 0 &&
           this.grounded &&
           this.health > 0 &&
-          Math.random() < this.dodgeChance * dt * 8
+          Math.random() < this.dodgeChance * this.adaptive * dt * 8
         ) {
           this.startDodge(distToPlayer);
           break;
         }
 
         // SNIPER: hold a long firing lane and charge a block-piercing shot.
-        if (this.type === 'SNIPER') {
+        // PHASE 1B 3: a disarmed sniper drops the scope and closes to melee.
+        if (this.type === 'SNIPER' && this.disarmTimer <= 0) {
           this.activeHitbox = null;
 
           if (absDistToPlayer < 320) {
@@ -548,7 +571,8 @@ export class EnemyController {
 
         // GUNNER: hold a 280-380px firing lane, strafe laterally, shoot on cooldown.
         // Falls back to a weak melee jab if the player closes the gap.
-        if (this.type === 'GUNNER') {
+        // PHASE 1B 3: a disarmed gunner abandons the firing lane for fists
+        if (this.type === 'GUNNER' && this.disarmTimer <= 0) {
           this.activeHitbox = null;
 
           // Strafe direction flips on a timer or at the arena walls
@@ -827,7 +851,8 @@ export class EnemyController {
 
       case 'ATTACK': {
         // Ranged archetypes fire their round on the first frame of the attack
-        if (this.rangedShot && !this.hasHitPlayerThisAttack) {
+        // PHASE 1B 3: a disarm that lands mid-windup guts the shot outright.
+        if (this.rangedShot && this.disarmTimer <= 0 && !this.hasHitPlayerThisAttack) {
           this.hasHitPlayerThisAttack = true;
           if (this.type === 'SNIPER') {
             // Charged round: fast, heavy, and it walks straight through a guard

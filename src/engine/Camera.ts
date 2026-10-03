@@ -20,6 +20,15 @@ export class Camera {
   public zoom = Camera.BASE_ZOOM;
   public targetZoom = Camera.BASE_ZOOM;
 
+  // PHASE 1B: frame modifiers layered on BASE_ZOOM. `aimZoom` is a steady
+  // knob held while the player is in precision aim; `holdScale`/`holdTimer`
+  // is a timed push-in for takedowns that eases back to the base on its own.
+  public aimZoom = false;
+  private holdScale = 1;
+  private holdTimer = 0;
+  /** Precision-aim push-in (DESIGN §16 "slight zoom on big moments"). */
+  private static readonly AIM_ZOOM = 1.12;
+
   // Camera shake / trauma
   private trauma = 0; // 0 to 1
   public shakeOffsetX = 0;
@@ -49,6 +58,15 @@ export class Camera {
     this.targetX = playerX + this.lookFacing + this.lookVelocity;
     this.targetY = playerY - 70; // Keep ground in lower half of screen
 
+    // PHASE 1B: zoom goal = base, nudged by precision aim, overridden by a
+    // timed takedown push-in while one is running.
+    if (this.holdTimer > 0) {
+      this.holdTimer = Math.max(0, this.holdTimer - dt);
+      this.targetZoom = Camera.BASE_ZOOM * this.holdScale;
+    } else {
+      this.targetZoom = Camera.BASE_ZOOM * (this.aimZoom ? Camera.AIM_ZOOM : 1);
+    }
+
     // Smooth camera damping (exponential, never overshoots at low frame rates)
     this.x = damp(this.x, this.targetX, 6, dt);
     this.y = damp(this.y, this.targetY, 6, dt);
@@ -68,5 +86,15 @@ export class Camera {
 
   public addTrauma(amount: number): void {
     this.trauma = Math.min(1.0, this.trauma + amount);
+  }
+
+  /**
+   * PHASE 1B takedown camera: a timed push-in layered over the aim/zoom
+   * stack. `scale` multiplies BASE_ZOOM (1.45 = 45% tighter); the hold
+   * expires on its own so nothing has to release it when the move ends.
+   */
+  public pushIn(scale: number, duration: number): void {
+    this.holdScale = scale;
+    this.holdTimer = Math.max(this.holdTimer, duration);
   }
 }

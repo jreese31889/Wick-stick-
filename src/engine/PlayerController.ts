@@ -40,6 +40,17 @@ export class PlayerController {
   private jumpBufferTimer = 0;
   private coyoteTimer = 0;
 
+  // PHASE 1B A9: buffered attack / dodge presses. A press that lands while
+  // BLOCK, SLIDE, DODGE_ROLL or an attack recovery owns the controller is
+  // held for INPUT_BUFFER seconds and spent the moment the lock clears —
+  // design §6/§17 "input buffering throughout — forgives imperfect timing".
+  // The window is frozen while a dodge/slide owns the controller (those locks
+  // the player cannot end early) and bleeds normally through block/recovery.
+  private static readonly INPUT_BUFFER = 0.3;
+  private punchBufferTimer = 0;
+  private kickBufferTimer = 0;
+  private dodgeBufferTimer = 0;
+
   // Hysteresis for the gait selector so RUN/WALK/IDLE can't flicker as the
   // speed hovers on a boundary (a flicker would restart the pose cross-fade
   // every frame and make the legs stutter).
@@ -52,6 +63,12 @@ export class PlayerController {
   private comboTimer = 0;
   /** Armed by CombatDirector once a chain crosses 5x — next press is the finisher. */
   public finisherArmed = false;
+  /**
+   * PHASE 1B aim model: true while a twin-stick aim input is live (right
+   * stick or the touch aim stick). Drives angled fire, tightened spread and
+   * the camera push-in — hip-fire (false) keeps the shipped straight ray.
+   */
+  public precisionAim = false;
   public hasFiredBulletThisShot = false;
   public hasThrownKnifeThisFrame = false;
   /**
@@ -345,12 +362,14 @@ export class PlayerController {
     // Twin-stick aim calculation (Right Stick / Touch aim)
     if (input.aimActive) {
       this.physics.aimAngle = Math.atan2(input.aimY, input.aimX);
+      this.precisionAim = true;
       // Turn to face aim direction if not actively in an attack animation
       if (!this.isAttackState(this.physics.state) && !this.physics.isDodging && !this.physics.isSliding) {
         this.physics.facingRight = input.aimX >= 0;
       }
     } else {
       this.physics.aimAngle = null;
+      this.precisionAim = false;
     }
 
     // Godot Jump Buffer & Coyote Time timers
@@ -418,6 +437,22 @@ export class PlayerController {
       this.runSustainTimer = 0;
     }
 
+    // PHASE 1B A9: capture the buffered press channels. A fresh press refills
+    // the window, an idle one bleeds out (frozen while dodge/slide hold the
+    // controller); handleActions spends each channel the frame the state that
+    // blocked it clears (see INPUT_BUFFER).
+    const bufferFrozen = this.physics.isDodging || this.physics.isSliding;
+    const bufferBleed = bufferFrozen ? 0 : dt;
+    this.punchBufferTimer = input.attackJustPressed
+      ? PlayerController.INPUT_BUFFER
+      : Math.max(0, this.punchBufferTimer - bufferBleed);
+    this.kickBufferTimer = input.heavyAttackJustPressed
+      ? PlayerController.INPUT_BUFFER
+      : Math.max(0, this.kickBufferTimer - bufferBleed);
+    this.dodgeBufferTimer = input.dodgeJustPressed
+      ? PlayerController.INPUT_BUFFER
+      : Math.max(0, this.dodgeBufferTimer - bufferBleed);
+
     // 1. STATE TRANSITION & INPUT HANDLING
     this.handleActions(input, dt);
 
@@ -473,8 +508,14 @@ export class PlayerController {
       this.setState('IDLE');
     }
 
-    // DODGE / SLIDE TRIGGER
-    if (input.dodgeJustPressed && !this.physics.isDodging && !this.physics.isSliding && this.physics.stamina >= 15) {
+    // DODGE / SLIDE TRIGGER (PHASE 1B: accepts a buffered press too)
+    if (
+      (input.dodgeJustPressed || this.dodgeBufferTimer > 0) &&
+      !this.physics.isDodging &&
+      !this.physics.isSliding &&
+      this.physics.stamina >= 15
+    ) {
+      this.dodgeBufferTimer = 0;
       this.physics.stamina -= 15;
       const isCrouching = input.moveY > 0.4;
       const hasSpeed = Math.abs(this.physics.velocity.x) > 100;
@@ -624,7 +665,13 @@ export class PlayerController {
     }
 
     // PUNCH BUTTON — jab / cross / spinning string (short reach, fast)
-    if (input.attackJustPressed && !this.physics.isBlocking && !this.physics.isDodging) {
+    // PHASE 1B A9: a press buffered through BLOCK / DODGE / SLIDE lands here.
+    if (
+      (input.attackJustPressed || this.punchBufferTimer > 0) &&
+      !this.physics.isBlocking &&
+      !this.physics.isDodging
+    ) {
+      this.punchBufferTimer = 0;
       if (this.finisherArmed) {
         this.triggerFinisher();
       } else {
@@ -634,7 +681,12 @@ export class PlayerController {
     }
 
     // KICK BUTTON — long-reach power kick (heavy damage, guard crush)
-    if (input.heavyAttackJustPressed && !this.physics.isBlocking && !this.physics.isDodging) {
+    if (
+      (input.heavyAttackJustPressed || this.kickBufferTimer > 0) &&
+      !this.physics.isBlocking &&
+      !this.physics.isDodging
+    ) {
+      this.kickBufferTimer = 0;
       if (this.finisherArmed) {
         this.triggerFinisher();
       } else {

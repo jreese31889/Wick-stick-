@@ -415,7 +415,13 @@ export class EnemyRig {
     if (enemy.health <= 0 && enemy.state === 'DOWNED') return;
 
     // Direct User Mandate: Only display health bar when enemy has taken damage recently!
-    const isVisible = enemy.hpVisibleTimer > 0 || enemy.isStaggered || enemy.state === 'BLOCK';
+    // PHASE 1B 3: a disarmed archer/gunner shows its tag for the whole window,
+    // so the player can see the opening (visible even with no recent damage).
+    const isVisible =
+      enemy.hpVisibleTimer > 0 ||
+      enemy.isStaggered ||
+      enemy.state === 'BLOCK' ||
+      enemy.disarmTimer > 0;
     if (!isVisible) return;
 
     ctx.save();
@@ -461,12 +467,17 @@ export class EnemyRig {
     if (enemy.isStaggered) {
       ctx.fillStyle = '#fbbf24';
       ctx.fillText('STAGGERED [GRAB!]', enemy.position.x, y - 5);
-    } else if (enemy.state === 'BLOCK') {
-      ctx.fillStyle = '#38bdf8';
-      ctx.fillText('🛡️ GUARD', enemy.position.x, y - 5);
     } else if (enemy.state === 'WINDUP') {
       ctx.fillStyle = '#ef4444';
       ctx.fillText('⚠️ ATTACK!', enemy.position.x, y - 5);
+    } else if (enemy.disarmTimer > 0) {
+      // PHASE 1B 3: gun gone — its own blinking tag marks the punish window
+      const blink = Math.sin(performance.now() * 0.01) > -0.2;
+      ctx.fillStyle = blink ? '#fb923c' : '#7c2d12';
+      ctx.fillText('💥 DISARMED', enemy.position.x, y - 5);
+    } else if (enemy.state === 'BLOCK') {
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillText('🛡️ GUARD', enemy.position.x, y - 5);
     } else {
       const [typeLabel, tagColor] = ARCHETYPE_TAGS[enemy.type] ?? ARCHETYPE_TAGS.BASIC;
       // Phase 1 C5: promoted elites carry a violet ★ in front of their rank

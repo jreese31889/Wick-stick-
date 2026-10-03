@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Volume2, VolumeX, Gauge, MonitorPlay, RotateCcw } from 'lucide-react';
+import { X, Volume2, VolumeX, Gauge, MonitorPlay, RotateCcw, Vibrate } from 'lucide-react';
 import type { GameSettings } from './settings';
 import { DEFAULT_SETTINGS, QUALITY_OPTIONS } from './settings';
 
@@ -153,6 +153,31 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
               }`}
             >
               {settings.showFps ? 'On' : 'Off'}
+            </button>
+          </div>
+        </div>
+
+        {/* HAPTICS TOGGLE (PHASE 1B E6) */}
+        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5">
+          <div className={ROW}>
+            <div>
+              <div className={LABEL}>
+                <Vibrate className="w-4 h-4 text-rose-400" />
+                Haptic Feedback
+              </div>
+              <div className={BLURB}>
+                Controller rumble on impacts, parries and takedowns — plus phone vibration on mobile.
+              </div>
+            </div>
+            <button
+              onClick={() => onChange({ haptics: !settings.haptics })}
+              className={`min-h-[44px] px-5 rounded-xl border font-black uppercase tracking-widest text-xs transition-all cursor-pointer ${
+                settings.haptics
+                  ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                  : 'bg-neutral-900 border-white/10 text-neutral-400'
+              }`}
+            >
+              {settings.haptics ? 'On' : 'Off'}
             </button>
           </div>
         </div>

@@ -69,6 +69,12 @@ export class GameLoop {
   private renderMsAccum = 0;
   private perfFrames = 0;
 
+  // PHASE 1B 6 — squad pacing: armed while a swing is committed, then held
+  // for one breath so volleys land as staggered beats, not a dogpile.
+  private attackGapTimer = 0;
+  // PHASE 1B 11 — adaptive difficulty scalar; 1.0 = shipped baseline.
+  private adaptiveScale = 1;
+
   // P6B-02: opaque overlays (pause / game-over) repaint at 10 Hz, not 60
   private lastIdleRenderTime = 0;
   private idleRenderDue = true;
@@ -404,6 +410,9 @@ export class GameLoop {
         this.perfFrames = 0;
         this.frameCount = 0;
         this.fpsTimer = 0;
+        // PHASE 1B 11: resample the adaptive scalar on the same half-second
+        // cadence as the perf window (cheap: two scans, no allocation).
+        this.sampleAdaptive();
         this.updatePerfSpan();
         // The HUD only needs React while gameplay can change; behind the
         // opaque pause / game-over overlays it is static (the perf chip is
@@ -559,24 +568,70 @@ export class GameLoop {
         );
       }
 
-      // 4. ENEMIES UPDATE (Coordinated Attack Token Allocation)
-      // Check if any enemy is currently executing an attack
-      // P2-03: plain scan instead of `.some(closure)`
-      let isAnyAttacking = false;
+      // 4. ENEMIES UPDATE (PHASE 1B 6 — group AI coordination)
+      //   • attacker slots: one by default, two once the squad is large
+      //     enough that serialising everyone reads as a queue, not a fight
+      //   • a breathing gap after the last swing lands, so pressure comes
+      //     in beats (design §8) instead of all at once
+      //   • the token goes to the eligible body closest to the player, so
+      //     the same enemy never opens every dance
+      //   • flank slots: alternate shoulders in depth rings, so the squad
+      //     forms a line around John instead of queueing on one side
+      let attacking = 0;
+      let alive = 0;
       for (const e of this.enemies) {
-        if (e.state === 'WINDUP' || e.state === 'ATTACK') {
-          isAnyAttacking = true;
-          break;
+        if (e.state === 'WINDUP' || e.state === 'ATTACK') attacking++;
+        if (e.health > 0 && e.state !== 'DOWNED') alive++;
+      }
+      if (attacking > 0) {
+        this.attackGapTimer = 0.22; // hold the door while anyone is committed
+      } else if (this.attackGapTimer > 0) {
+        this.attackGapTimer -= effectiveDt;
+      }
+      const maxAttackers = alive >= 6 ? 2 : 1;
+      const openSlots =
+        this.attackGapTimer > 0 ? 0 : Math.max(0, maxAttackers - attacking);
+
+      // Distance-ordered grant: pass k picks the (k+1)-th closest candidate.
+      let slotsLeft = openSlots;
+      while (slotsLeft > 0) {
+        let pick: EnemyController | null = null;
+        let pickDist = Infinity;
+        for (const e of this.enemies) {
+          if (e.tokenPicked) continue;
+          if (e.health <= 0 || e.state === 'DOWNED' || e.state === 'STAGGER') continue;
+          const d = Math.abs(e.position.x - this.player.physics.position.x);
+          if (d < pickDist) {
+            pickDist = d;
+            pick = e;
+          }
+        }
+        if (!pick) break;
+        pick.tokenPicked = true;
+        slotsLeft--;
+      }
+
+      // Flank slots: two alternating sides, two depth rings — deterministic
+      // per frame, so nobody flickers between positions.
+      if (alive >= 3) {
+        let flankSlot = 0;
+        for (const e of this.enemies) {
+          if (e.health <= 0 || e.state === 'DOWNED') continue;
+          if (e.type === 'SNIPER') continue; // holds its own long lane
+          const side = flankSlot % 2 === 0 ? 1 : -1;
+          const ring = Math.floor(flankSlot / 2) % 2;
+          e.targetOffset = side * (70 + ring * 55);
+          flankSlot++;
         }
       }
-      let tokenGranted = false;
 
       for (const enemy of this.enemies) {
-        let canAttack = false;
-        if (!isAnyAttacking && !tokenGranted && enemy.health > 0 && enemy.state !== 'DOWNED' && enemy.state !== 'STAGGER') {
-          canAttack = true;
-          tokenGranted = true;
-        }
+        const canAttack =
+          enemy.tokenPicked &&
+          enemy.health > 0 &&
+          enemy.state !== 'DOWNED' &&
+          enemy.state !== 'STAGGER';
+        enemy.adaptive = this.adaptiveScale;
 
         enemy.update(
           effectiveDt,
@@ -585,6 +640,7 @@ export class GameLoop {
           this.player.physics.grounded,
           canAttack
         );
+        enemy.tokenPicked = false;
       }
 
       // 5. COMBAT DIRECTOR RESOLUTION (Hits, Parries, Grabs, Hit-Stop, Projectiles)
@@ -646,6 +702,11 @@ export class GameLoop {
         }
       }
 
+      // PHASE 1B aim model: precision aim (gamepad right stick / touch aim
+      // pad) tightens the framing; mouse aim keeps the shipped behaviour.
+      this.camera.aimZoom =
+        this.player.precisionAim && !this.combatDirector.isGrappling;
+
       this.camera.update(
         targetCameraX,
         this.player.physics.position.y,
@@ -692,6 +753,30 @@ export class GameLoop {
   }
 
   /**
+   * PHASE 1B 11 — adaptive difficulty. Every half second the squad scalar is
+   * re-aimed at where the player actually is: health on the ropes and fresh
+   * bullet wounds pull it toward 0.8 (slower cooldowns, softer reactions),
+   * long combos and unbroken health push it toward 1.3. 1.0 is the shipped
+   * baseline and the spawn anchor — full health, empty combo, no pressure
+   * resolves to exactly 1.0, so a clean run starts untouched.
+   */
+  private sampleAdaptive(): void {
+    const p = this.player.physics;
+    const cd = this.combatDirector;
+    const healthFrac = p.maxHealth > 0 ? p.health / p.maxHealth : 1;
+    const comboSkill = Math.min(1, cd.stats.comboCount / 12);
+    // damage taken since the last sample; 40+ inside 0.5 s = full pressure
+    const pressure = Math.min(1, cd.playerDamageWindow / 40);
+    cd.playerDamageWindow = 0;
+
+    const target = Math.min(
+      1.3,
+      Math.max(0.8, 1 + (healthFrac - 1) * 0.45 + comboSkill * 0.2 - pressure * 0.35)
+    );
+    this.adaptiveScale += (target - this.adaptiveScale) * 0.35;
+  }
+
+  /**
    * P6B-05: paints the perf chip straight into the DOM — fps + the P6-01
    * update/render split (and, in Rig debug, the P6-02 counters) without
    * waking React up twice a second.
@@ -720,7 +805,8 @@ export class GameLoop {
       ` · blood ${cd.bloodDecals.length}/${cd.bloodCap}` +
       ` · bul ${cd.enemyBullets.length} · rag ${ragdolls}` +
       ` · pool ${ObjectPool.hits}/${ObjectPool.misses}` +
-      ` · pose ${poseMs.toFixed(2)}ms`
+      ` · pose ${poseMs.toFixed(2)}ms` +
+      ` · adr ${this.adaptiveScale.toFixed(2)}`
     );
   }
 }

@@ -137,6 +137,11 @@ export class Renderer {
   private dmgLabelKey = NaN;
   private ratingLabel = '';
   private ratingLabelKey = '';
+  // PHASE 1B 8 — style meter (rank glyph rebuilt only on a rank flip; the
+  // flash decays per frame, and no strings are built while it idles)
+  private styleRankKey = '';
+  private styleRankLabel = '';
+  private styleRankFlash = 0;
   private bossPctLabel = '';
   private bossPctValue = -1;
 
@@ -457,6 +462,10 @@ export class Renderer {
 
     // 12. SCREEN-SPACE COMBO & STYLE OVERLAY
     this.renderComboHUD(ctx, width, height, combatDirector);
+
+    // 12b. PHASE 1B 8: style rank meter (left rail — clear of the React HUD
+    // strip, the combo chain and the thumb controls)
+    this.renderStyleMeter(ctx, height, combatDirector);
 
     // 13. HIGH TABLE BOSS HEALTH BAR (When Boss is active)
     this.renderBossHUD(ctx, width, height, enemies);
@@ -1182,6 +1191,65 @@ export class Renderer {
     ctx.fillStyle = ratingColor;
     ctx.fillRect(x - barWidth / 2, y + 52, barWidth * barProgress, 3);
 
+    ctx.restore();
+  }
+
+  /**
+   * PHASE 1B 8 — style meter. The rank letter (D → SS) sits on a fill bar of
+   * the points that earned it; the letter punches in on a rank flip and fades
+   * back out over ~0.6 s. Hidden entirely while the meter is empty so a quiet
+   * fight keeps the screen clean.
+   */
+  private renderStyleMeter(
+    ctx: CanvasRenderingContext2D,
+    height: number,
+    combat: CombatDirector
+  ): void {
+    const points = combat.stylePoints;
+    const rank = combat.styleRank;
+    if (points <= 0 && this.styleRankFlash <= 0) return;
+
+    ctx.save();
+
+    // Rank flip: cache the glyph once, then flash the scale for a beat
+    if (this.styleRankKey !== rank) {
+      this.styleRankKey = rank;
+      this.styleRankLabel = rank;
+      this.styleRankFlash = 1;
+    } else if (this.styleRankFlash > 0) {
+      this.styleRankFlash = Math.max(0, this.styleRankFlash - 0.02);
+    }
+
+    const color =
+      rank === 'SS' ? '#f472b6'
+      : rank === 'S' ? '#fbbf24'
+      : rank === 'A' ? '#a78bfa'
+      : rank === 'B' ? '#38bdf8'
+      : rank === 'C' ? '#10b981'
+      : '#94a3b8';
+
+    const x = 30;
+    const y = height * 0.5;
+    const barW = 96;
+    const barH = 6;
+
+    // Meter well + fill (points are already clamped 0–100 by the director)
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.16)';
+    ctx.fillRect(x, y + 14, barW, barH);
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y + 14, (barW * points) / 100, barH);
+
+    // Rank glyph: flash = 1 → 1.35x scale easing back to 1
+    const scale = 1 + this.styleRankFlash * 0.35;
+    ctx.translate(x + 20, y - 6);
+    ctx.scale(scale, scale);
+    ctx.textAlign = 'center';
+    ctx.font = '900 34px sans-serif';
+    ctx.fillStyle = color;
+    ctx.strokeStyle = '#000000';
+    ctx.lineWidth = 5;
+    ctx.strokeText(this.styleRankLabel, 0, 0);
+    ctx.fillText(this.styleRankLabel, 0, 0);
     ctx.restore();
   }
 

@@ -1,4 +1,5 @@
 import { InputState } from '../types/game';
+import { Haptics } from './Haptics';
 
 export interface GamepadStatus {
   connected: boolean;
@@ -238,39 +239,12 @@ export class InputManager {
   }
 
   /**
-   * Haptic vibration rumble on Type-C controller or mobile device
+   * Haptic vibration rumble on Type-C controller or mobile device.
+   * PHASE 1B: routes through the shared Haptics bus so the settings toggle
+   * (settings.haptics) gates every actuator write in one place.
    */
   public vibrate(durationMs = 120, weakMagnitude = 0.4, strongMagnitude = 0.7): void {
-    if (typeof navigator === 'undefined') return;
-
-    // 1. Try Gamepad vibration actuator (dual-rumble motors in Backbone/Kishi/Xbox)
-    if (navigator.getGamepads) {
-      const gamepads = navigator.getGamepads();
-      for (let i = 0; i < gamepads.length; i++) {
-        const gp = gamepads[i];
-        if (gp && gp.connected && (gp as unknown as { vibrationActuator?: { playEffect: Function } }).vibrationActuator) {
-          const actuator = (gp as unknown as { vibrationActuator: { playEffect: Function } }).vibrationActuator;
-          if (typeof actuator.playEffect === 'function') {
-            actuator.playEffect('dual-rumble', {
-              startDelay: 0,
-              duration: durationMs,
-              weakMagnitude: Math.min(1, Math.max(0, weakMagnitude)),
-              strongMagnitude: Math.min(1, Math.max(0, strongMagnitude)),
-            }).catch(() => {});
-            return;
-          }
-        }
-      }
-    }
-
-    // 2. Fallback to phone hardware vibration
-    if (navigator.vibrate) {
-      try {
-        navigator.vibrate(durationMs);
-      } catch {
-        // Safe ignore
-      }
-    }
+    Haptics.rumble(durationMs, weakMagnitude, strongMagnitude);
   }
 
   // Virtual control hooks from mobile touch UI

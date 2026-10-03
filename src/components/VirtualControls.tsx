@@ -1,5 +1,6 @@
 import React, { useRef, useState, useCallback } from 'react';
 import { InputManager } from '../engine/InputManager';
+import { Haptics } from '../engine/Haptics';
 import {
   Shield,
   Wind,
@@ -60,8 +61,16 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
   const joystickBaseRef = useRef<HTMLDivElement>(null);
   const joystickKnobRef = useRef<HTMLDivElement>(null);
 
+  // PHASE 1B B8: floating twin-stick AIM pad (bottom-centre). Its vector is
+  // fed straight into InputManager.setVirtualAim → player.physics.aimAngle,
+  // which is what switches fire from hip-fire to the precision aim model.
+  const aimBaseRef = useRef<HTMLDivElement>(null);
+  const aimKnobRef = useRef<HTMLDivElement>(null);
+
   const [touchId, setTouchId] = useState<number | null>(null);
   const [knobPos, setKnobPos] = useState({ x: 0, y: 0 });
+  const [aimTouchId, setAimTouchId] = useState<number | null>(null);
+  const [aimKnobPos, setAimKnobPos] = useState({ x: 0, y: 0 });
 
   // Joystick touch handlers (Mobile touch-only)
   const handleJoystickStart = useCallback((e: React.TouchEvent) => {
@@ -119,18 +128,78 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
     inputManager.setVirtualJoystick(normX, normY);
   };
 
+  // PHASE 1B B8: the aim pad drives the twin-stick aim vector. Past ~18% of
+  // the pad radius it counts as a live aim (aimActive), so resting a thumb
+  // on the pad doesn't lock the player into precision aim.
+  const handleAimStart = useCallback(
+    (e: React.TouchEvent) => {
+      e.preventDefault();
+      if (aimTouchId !== null) return;
+      const touch = e.changedTouches[0];
+      setAimTouchId(touch.identifier);
+      updateAim(touch.clientX, touch.clientY);
+    },
+    [aimTouchId]
+  );
+
+  const handleAimMove = useCallback(
+    (e: React.TouchEvent) => {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        const touch = e.changedTouches[i];
+        if (touch.identifier === aimTouchId) {
+          updateAim(touch.clientX, touch.clientY);
+          break;
+        }
+      }
+    },
+    [aimTouchId]
+  );
+
+  const handleAimEnd = useCallback(
+    (e: React.TouchEvent) => {
+      e.preventDefault();
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].identifier === aimTouchId) {
+          setAimTouchId(null);
+          setAimKnobPos({ x: 0, y: 0 });
+          inputManager.setVirtualAim(0, 0, false);
+          break;
+        }
+      }
+    },
+    [aimTouchId, inputManager]
+  );
+
+  const updateAim = (clientX: number, clientY: number) => {
+    if (!aimBaseRef.current) return;
+    const rect = aimBaseRef.current.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+
+    const dx = clientX - centerX;
+    const dy = clientY - centerY;
+    const maxRadius = rect.width * 0.42;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    const clampedDist = Math.min(dist, maxRadius);
+    const angle = Math.atan2(dy, dx);
+    const kx = Math.cos(angle) * clampedDist;
+    const ky = Math.sin(angle) * clampedDist;
+    setAimKnobPos({ x: kx, y: ky });
+
+    const normX = kx / maxRadius;
+    const normY = ky / maxRadius;
+    const active = Math.hypot(normX, normY) > 0.18;
+    inputManager.setVirtualAim(normX, normY, active);
+  };
+
   // Pure mobile touch button binder (No mouse listeners)
   const bindTouchButton = (button: TouchButton) => ({
     onTouchStart: (e: React.TouchEvent) => {
       e.preventDefault();
       inputManager.setVirtualButton(button, true);
-      if (typeof navigator !== 'undefined' && navigator.vibrate) {
-        try {
-          navigator.vibrate(15);
-        } catch {
-          // safe
-        }
-      }
+      Haptics.cue('tick');
     },
     onTouchEnd: (e: React.TouchEvent) => {
       e.preventDefault();
@@ -174,6 +243,46 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
             className="w-14 h-14 sm:w-16 sm:h-16 landscape:w-16 landscape:h-16 rounded-full bg-gradient-to-br from-neutral-200 to-neutral-400 border border-white/60 shadow-lg flex items-center justify-center pointer-events-none"
           >
             <div className="w-5 h-5 rounded-full bg-neutral-900/40 border border-white/40" />
+          </div>
+        </div>
+      </div>
+
+      {/* ============================================================
+          CENTRE — AIM: floating twin-stick aim pad (PHASE 1B B8).
+          Drag past ~18% of the radius to enter precision aim: angled
+          fire, tightened spread, laser + camera push-in.
+      ============================================================ */}
+      <div className="absolute left-1/2 bottom-3 sm:bottom-4 -translate-x-1/2">
+        <div
+          id="virtual-aim"
+          ref={aimBaseRef}
+          onTouchStart={handleAimStart}
+          onTouchMove={handleAimMove}
+          onTouchEnd={handleAimEnd}
+          onTouchCancel={handleAimEnd}
+          className={
+            'w-24 h-24 sm:w-28 sm:h-28 landscape:w-24 landscape:h-28 portrait:w-20 portrait:h-20 ' +
+            'rounded-full border-2 bg-black/45 backdrop-blur-md flex items-center ' +
+            'justify-center pointer-events-auto touch-none select-none relative shadow-2xl transition-colors ' +
+            (aimTouchId !== null
+              ? 'border-amber-400/80 active:border-amber-300'
+              : equippedWeapon && equippedWeapon !== 'UNARMED'
+              ? 'border-amber-400/35'
+              : 'border-white/20')
+          }
+        >
+          <Crosshair
+            className={
+              'w-5 h-5 sm:w-6 sm:h-6 absolute ' +
+              (aimTouchId !== null ? 'text-amber-300' : 'text-white/35')
+            }
+          />
+          <div
+            ref={aimKnobRef}
+            style={{ transform: `translate(${aimKnobPos.x}px, ${aimKnobPos.y}px)` }}
+            className="w-10 h-10 sm:w-12 sm:h-12 rounded-full bg-gradient-to-br from-amber-200/90 to-amber-500/80 border border-amber-100/70 shadow-lg flex items-center justify-center pointer-events-none"
+          >
+            <div className="w-3 h-3 rounded-full bg-black/40 border border-white/50" />
           </div>
         </div>
       </div>

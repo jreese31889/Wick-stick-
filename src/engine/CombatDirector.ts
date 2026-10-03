@@ -2,6 +2,7 @@ import { PlayerController } from './PlayerController';
 import { EnemyController, resolveDamage, enemyBulletPool } from './EnemyController';
 import { Camera } from './Camera';
 import { SoundFX } from './SoundFX';
+import { Haptics } from './Haptics';
 import { ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
 import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc, EnemyBullet, DestructibleObject } from '../types/game';
@@ -105,6 +106,12 @@ export class CombatDirector {
   public slowMoFactor: number = 1.0;
   public slowMoTimer: number = 0;
   public speedLinesTimer: number = 0; // Cinematic radial speed lines on heavy impacts
+  /**
+   * PHASE 1B 11 — adaptive difficulty signal: damage the player has eaten
+   * recently. GameLoop reads (and periodically clears) this window to steer
+   * the squad's aggression scalar; it starts every run at 0 (neutral).
+   */
+  public playerDamageWindow = 0;
 
   public stats: CombatStats = {
     comboCount: 0,
@@ -122,6 +129,68 @@ export class CombatDirector {
   private tracerIdCounter = 0;
   private playerAttackRegistered = false;
   private lastPlayerState = '';
+
+  // ============================================================
+  // PHASE 1B 8 — STYLE METER (DESIGN §14)
+  //   Style points accrue from *variety*: each move kind pays out, but
+  //   repeating the same kind back-to-back pays less and less. The meter
+  //   bleeds off while the fight goes quiet, so the rank under the combo
+  //   HUD reflects how alive the brawl currently is.
+  // ============================================================
+  public stylePoints = 0;
+  public styleRank = 'D';
+  /** Last kind registered + how many times it has been chained — repeat decay. */
+  private styleKind = '';
+  private styleRepeat = 0;
+  private styleIdle = 0;
+  /** Seconds after which an untouched meter starts draining. */
+  private static readonly STYLE_GRACE = 2.2;
+  private static readonly STYLE_DECAY = 9;
+  /** Base payout per style action kind (before the repeat penalty). */
+  private static readonly STYLE_PAYOUT: Record<string, number> = {
+    JAB: 3,
+    KICK: 5,
+    SWEEP: 9,
+    FLYING_KICK: 8,
+    FINISHER: 18,
+    PARRY: 14,
+    RIPOSTE: 12,
+    TAKEDOWN: 16,
+    EXECUTION: 20,
+    GRAPPLE: 10,
+    HEADSHOT: 12,
+    RICOCHET: 7,
+    DISARM: 12,
+    ENV: 16,
+    MULTI: 12,
+    GUNFU: 10,
+  };
+
+  /**
+   * PHASE 1B style payout. `kind` is a STYLE_PAYOUT key; repeating the same
+   * kind decays its value to a 30% floor, and switching kinds resets the
+   * chain — the whole point is rewarding variety over spam.
+   */
+  public registerStyle(kind: string): void {
+    const base = CombatDirector.STYLE_PAYOUT[kind];
+    if (base === undefined) return;
+    if (this.styleKind === kind) {
+      this.styleRepeat++;
+    } else {
+      this.styleKind = kind;
+      this.styleRepeat = 0;
+    }
+    const penalty = Math.max(0.3, 1 - this.styleRepeat * 0.22);
+    this.stylePoints = Math.min(100, this.stylePoints + base * penalty);
+    this.styleIdle = 0;
+    this.updateStyleRank();
+  }
+
+  private updateStyleRank(): void {
+    const p = this.stylePoints;
+    this.styleRank = p >= 90 ? 'SS' : p >= 75 ? 'S' : p >= 55 ? 'A' : p >= 35 ? 'B' : p >= 15 ? 'C' : 'D';
+  }
+
 
   // Awarded once per wave when the last enemy dies; cleared on the next spawn
   private waveClearAwarded = false;
@@ -256,6 +325,13 @@ export class CombatDirector {
     this.moveBanner = '';
     this.moveBannerTimer = 0;
     this.bannerChanged = true;
+    // PHASE 1B: style meter + adaptive-damage window both restart per fight
+    this.stylePoints = 0;
+    this.styleRank = 'D';
+    this.styleKind = '';
+    this.styleRepeat = 0;
+    this.styleIdle = 0;
+    this.playerDamageWindow = 0;
   }
 
   public update(
@@ -302,6 +378,16 @@ export class CombatDirector {
       this.stats.comboTimer -= dt;
       if (this.stats.comboTimer <= 0) {
         this.breakCombo();
+      }
+    }
+
+    // 3b. PHASE 1B style meter: after a short grace window an untouched
+    // meter drains, so the rank falls back toward D when the fight cools off.
+    if (this.stylePoints > 0) {
+      this.styleIdle += dt;
+      if (this.styleIdle > CombatDirector.STYLE_GRACE) {
+        this.stylePoints = Math.max(0, this.stylePoints - CombatDirector.STYLE_DECAY * dt);
+        this.updateStyleRank();
       }
     }
 
@@ -495,7 +581,11 @@ export class CombatDirector {
     // 11. Enemy ranged fire: drain pending shots, simulate & collide bullets.
     // Uses the effective dt passed in, so pause / hit-stop / slow-mo
     // freeze or scale bullets exactly like everything else.
-    this.updateEnemyBullets(dt, player, enemies, camera);
+    this.updateEnemyBullets(dt, player, enemies, camera, environmentManager);
+
+    // 12. PHASE 1B 7: bodies thrown into props — glass shatters, crates and
+    // barrels are smashed (barrels cook off), the impact hurts the throwee.
+    this.resolveEnvironmentalImpacts(enemies, environmentManager, camera);
   }
 
   private checkPlayerGunfire(
@@ -538,8 +628,12 @@ export class CombatDirector {
     if (!player.hasFiredBulletThisShot) return;
     player.hasFiredBulletThisShot = false;
 
-    const facingRight = player.physics.facingRight;
-    const dir = facingRight ? 1 : -1;
+    // PHASE 1B aim model: hip-fire keeps the shipped straight muzzle line,
+    // precision aim flies along the stick with a light head-magnetism assist.
+    const shot = this.shotVector(player, enemies);
+    const dir = shot.dir;
+    const dirX = shot.dx;
+    const dirY = shot.dy;
     const originX = player.physics.position.x + dir * 34;
     const originY = player.physics.position.y - 62; // Tactical pistol muzzle height
 
@@ -548,55 +642,58 @@ export class CombatDirector {
 
     // 2. Raycast against active enemies along bullet trajectory
     let closestEnemy: EnemyController | null = null;
-    let closestDist = 99999;
+    let closestT = 99999;
 
     for (const enemy of enemies) {
       if (enemy.health <= 0 && enemy.state === 'DOWNED') continue;
-      const enemyDistX = (enemy.position.x - originX) * dir;
-      // Must be in front of the gun
-      if (enemyDistX > 0 && enemyDistX < closestDist) {
-        // Vertical hit check (head to feet)
-        const enemyTopY = enemy.position.y - 110;
-        const enemyBottomY = enemy.position.y + 10;
-        if (originY >= enemyTopY && originY <= enemyBottomY) {
-          closestDist = enemyDistX;
-          closestEnemy = enemy;
-        }
+      const t = rayToVertical(
+        originX, originY, dirX, dirY,
+        enemy.position.x, enemy.position.y - 110, enemy.position.y + 10, 99999
+      );
+      if (t >= 0 && t < closestT) {
+        closestT = t;
+        closestEnemy = enemy;
       }
     }
 
     // Phase 1 D2: props standing in the muzzle line take the round instead
     if (environmentManager) {
-      let propDist = closestDist;
+      let propT = closestT;
       let propHit: DestructibleObject | null = null;
       for (const obj of environmentManager.destructibles) {
         if (obj.isBroken) continue;
-        const ahead = (obj.x - originX) * dir;
-        if (ahead <= 0 || ahead >= propDist) continue;
-        if (originY >= obj.y - obj.height && originY <= obj.y) {
-          propDist = ahead;
+        const t = rayToVertical(
+          originX, originY, dirX, dirY,
+          obj.x, obj.y - obj.height, obj.y, closestT
+        );
+        if (t >= 0 && t < propT) {
+          propT = t;
           propHit = obj;
         }
       }
       if (propHit) {
-        const impactX = originX + dir * propDist;
-        this.pushTracer(originX, originY, impactX, originY, 0.12, 3.5);
+        const impactX = originX + dirX * propT;
+        const impactY = originY + dirY * propT;
+        this.pushTracer(originX, originY, impactX, impactY, 0.12, 3.5);
         environmentManager.damageObject(propHit, 28, dir * 160, -60);
-        this.spawnSparks(impactX, originY, -dir, 8, this.surfaceColor(propHit.type));
+        this.spawnSparks(impactX, impactY, -dir, 8, this.surfaceColor(propHit.type));
         camera.addTrauma(0.1);
+        Haptics.cue('hit');
         return;
       }
     }
 
     if (closestEnemy) {
-      const impactX = closestEnemy.position.x - dir * 14;
-      const impactY = originY;
+      const impactX = originX + dirX * closestT - dir * 10;
+      const impactY = originY + dirY * closestT;
+      // PHASE 1B hit zones: the top band of the rig is the head.
+      const isHeadshot = impactY <= closestEnemy.position.y - 88;
 
       // Create glowing supersonic bullet tracer to impact point
       this.pushTracer(originX, originY, impactX, impactY, 0.12, 3.5);
 
       // Close-Quarters Gun-Fu Double Tap execution check (< 95px)
-      const isPointBlank = closestDist < 95;
+      const isPointBlank = closestT < 95;
 
       if (closestEnemy.evading) {
         // Roll phases straight through the round
@@ -610,6 +707,7 @@ export class CombatDirector {
         SoundFX.playPunch('light');
         this.spawnSparks(impactX, impactY, -dir, 8, '#94a3b8');
         this.addPopup(impactX, impactY - 20, 'BLOCKED', '#94a3b8', 14);
+        Haptics.cue('hit');
       } else if (isPointBlank) {
         // == POINT-BLANK GUN-FU EXECUTION ==
         const damage = Math.max(1, Math.round(42 * this.comboDamageMultiplier()));
@@ -628,30 +726,199 @@ export class CombatDirector {
         this.addCombo(2, 3.5);
         this.stats.takedownCount++;
         this.stats.score += 150;
+        this.registerStyle('GUNFU');
+        Haptics.cue('heavy');
       } else {
-        // Standard bullet impact
-        const rawDamage = Math.max(1, Math.round(28 * this.comboDamageMultiplier()));
+        // Standard bullet impact. PHASE 1B hit zones: a round that lands in
+        // the head band pays a 1.6x precision multiplier + style credit —
+        // body damage stays exactly at the shipped 28.
+        const rawDamage = Math.max(
+          1,
+          Math.round(28 * this.comboDamageMultiplier() * (isHeadshot ? 1.6 : 1))
+        );
         const damage = closestEnemy.takeDamage(rawDamage, dir * 340, -140, false);
-        this.hitStopFrames = 6;
-        camera.addTrauma(0.28);
+        this.hitStopFrames = isHeadshot ? 8 : 6;
+        camera.addTrauma(isHeadshot ? 0.34 : 0.28);
         SoundFX.playPunch('heavy');
-        this.spawnShockwave(impactX, impactY, 32, '#fbbf24');
-        this.spawnSparks(impactX, impactY, dir, 12, '#fbbf24');
-        this.spawnBlood(impactX, impactY, dir, 7);
-        this.addPopup(impactX, impactY - 20, `-${damage}`, '#fde047', 17);
+        this.spawnShockwave(impactX, impactY, isHeadshot ? 40 : 32, '#fbbf24');
+        this.spawnSparks(impactX, impactY, dir, isHeadshot ? 16 : 12, '#fbbf24');
+        this.spawnBlood(impactX, impactY, dir, isHeadshot ? 10 : 7);
+        if (isHeadshot) {
+          this.addPopup(impactX, impactY - 30, `HEADSHOT -${damage}`, '#fde047', 20);
+          this.registerStyle('HEADSHOT');
+          this.announceMove('HEADSHOT');
+        } else {
+          this.addPopup(impactX, impactY - 20, `-${damage}`, '#fde047', 17);
+        }
 
         this.addCombo(1, 3.0);
+        Haptics.cue('shot');
       }
     } else {
       // No enemy hit: bullet travels to arena boundary wall and creates sparks
       const arenaBound = 840;
-      const endX = dir > 0 ? arenaBound : -arenaBound;
-      this.pushTracer(originX, originY, endX, originY, 0.1, 3);
+      const endX = dirX > 0 ? arenaBound : -arenaBound;
+      const tWall = Math.abs(dirX) > 0.001 ? Math.abs((endX - originX) / dirX) : 0;
+      const endY = originY + dirY * tWall;
+      this.pushTracer(originX, originY, endX, endY, 0.1, 3);
 
       // Wall ricochet sparks
-      this.spawnSparks(endX, originY, -dir, 10, '#fef08a');
+      this.spawnSparks(endX, endY, -dir, 10, '#fef08a');
       camera.addTrauma(0.12);
+      Haptics.cue('hit');
+
+      // PHASE 1B ricochet: a share of wall strikes skip off at the reflected
+      // angle and resolve one more (half-damage) pass down range.
+      this.resolveRicochet(enemies, endX, endY, -dirX, dirY, camera, environmentManager, 28);
     }
+  }
+
+  /**
+   * PHASE 1B aim model — the direction a round actually travels.
+   * Hip-fire (no live aim input) keeps the shipped straight muzzle line.
+   * Precision aim flies along the stick, nudged toward the nearest enemy
+   * head when it already sits inside 12° of the reticle (the on-screen
+   * laser shows the final path, so the assist stays readable). The result
+   * is written into a reusable record — never allocated per shot.
+   */
+  private readonly shotDir = { dx: 1, dy: 0, dir: 1 };
+  private shotVector(player: PlayerController, enemies: EnemyController[]) {
+    const s = this.shotDir;
+    const aim = player.physics.aimAngle;
+    if (!player.precisionAim || aim === null || aim === undefined) {
+      s.dx = player.physics.facingRight ? 1 : -1;
+      s.dy = 0;
+      s.dir = s.dx > 0 ? 1 : -1;
+      return s;
+    }
+
+    let ang = aim;
+    const mx = player.physics.position.x + (Math.cos(ang) >= 0 ? 34 : -34);
+    const my = player.physics.position.y - 62;
+    const ASSIST = 0.2094; // 12°
+    let bestDiff = ASSIST;
+    for (const e of enemies) {
+      if (e.health <= 0 && e.state === 'DOWNED') continue;
+      const hx = e.position.x - mx;
+      const hy = e.position.y - 96 - my;
+      if (Math.abs(hy) > 320 || hx * hx + hy * hy > 490000) continue;
+      const toHead = Math.atan2(hy, hx);
+      const diff = Math.abs(((toHead - ang + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        ang = toHead;
+      }
+    }
+
+    let dx = Math.cos(ang);
+    let dy = Math.sin(ang);
+    // Keep the ray solvable: a near-vertical shot has no meaningful x crossing
+    if (Math.abs(dx) < 0.25) {
+      const sign = dx >= 0 ? 1 : -1;
+      dx = 0.25 * sign;
+      const n = Math.hypot(dx, dy) || 1;
+      dx /= n;
+      dy /= n;
+    }
+    s.dx = dx;
+    s.dy = dy;
+    s.dir = dx >= 0 ? 1 : -1;
+    return s;
+  }
+
+  /**
+   * PHASE 1B ricochet: re-fires the shot from the impact point along the
+   * reflected vector — one bounce max, half damage, full style credit when
+   * it pays off. Returns nothing: the FX are pushed straight into the pools.
+   */
+  private resolveRicochet(
+    enemies: EnemyController[],
+    fromX: number,
+    fromY: number,
+    dx: number,
+    dy: number,
+    camera: Camera,
+    environmentManager: EnvironmentManager | undefined,
+    baseDamage: number
+  ): void {
+    if (Math.random() >= 0.45) return;
+    const n = Math.hypot(dx, dy) || 1;
+    dx /= n;
+    dy /= n;
+    const dir = dx >= 0 ? 1 : -1;
+    const MAX = 1000;
+
+    let enemy: EnemyController | null = null;
+    let enemyT = MAX;
+    for (const e of enemies) {
+      if (e.health <= 0 && e.state === 'DOWNED') continue;
+      const t = rayToVertical(fromX, fromY, dx, dy, e.position.x, e.position.y - 110, e.position.y + 10, MAX);
+      if (t >= 0 && t < enemyT) {
+        enemyT = t;
+        enemy = e;
+      }
+    }
+
+    let prop: DestructibleObject | null = null;
+    let propT = MAX;
+    if (environmentManager) {
+      for (const obj of environmentManager.destructibles) {
+        if (obj.isBroken) continue;
+        const t = rayToVertical(fromX, fromY, dx, dy, obj.x, obj.y - obj.height, obj.y, MAX);
+        if (t >= 0 && t < propT) {
+          propT = t;
+          prop = obj;
+        }
+      }
+    }
+
+    if (enemy && (!prop || enemyT <= propT)) {
+      const impactX = fromX + dx * enemyT - dir * 8;
+      const impactY = fromY + dy * enemyT;
+      this.pushTracer(fromX, fromY, impactX, impactY, 0.1, 2.5);
+      if (enemy.evading) {
+        this.spawnSparks(impactX, impactY, -dir, 5, '#94a3b8');
+        return;
+      }
+      if (enemy.state === 'BLOCK') {
+        const chip = Math.max(2, Math.round(baseDamage * 0.15));
+        enemy.takeDamage(chip, dir * 120, -50, false);
+        this.spawnSparks(impactX, impactY, -dir, 6, '#94a3b8');
+        this.addPopup(impactX, impactY - 16, 'BLOCKED', '#94a3b8', 14);
+        return;
+      }
+      const raw = Math.max(1, Math.round(baseDamage * 0.5 * this.comboDamageMultiplier()));
+      const landed = enemy.takeDamage(raw, dir * 300, -120, false);
+      if (landed > 0) {
+        this.hitStopFrames = 5;
+        camera.addTrauma(0.2);
+        SoundFX.playPunch('heavy');
+        this.spawnSparks(impactX, impactY, dir, 10, '#fef08a');
+        this.spawnBlood(impactX, impactY, dir, 5);
+        this.addPopup(impactX, impactY - 24, `RICOCHET -${landed}`, '#fef08a', 18);
+        this.addCombo(1, 3.0);
+        this.registerStyle('RICOCHET');
+        Haptics.cue('hit');
+      } else {
+        this.spawnSparks(impactX, impactY, -dir, 5, '#94a3b8');
+      }
+      return;
+    }
+
+    if (prop && environmentManager) {
+      const impactX = fromX + dx * propT;
+      const impactY = fromY + dy * propT;
+      this.pushTracer(fromX, fromY, impactX, impactY, 0.1, 2.5);
+      environmentManager.damageObject(prop, Math.max(1, Math.round(baseDamage * 0.5)), dir * 130, -60);
+      this.spawnSparks(impactX, impactY, -dir, 7, this.surfaceColor(prop.type));
+      return;
+    }
+
+    // Second wall — sparks only, the round is spent
+    const endX2 = dir > 0 ? 840 : -840;
+    const tWall = Math.abs((endX2 - fromX) / dx);
+    this.pushTracer(fromX, fromY, endX2, fromY + dy * tWall, 0.09, 2);
+    this.spawnSparks(endX2, fromY + dy * tWall, -dir, 5, '#fef08a');
   }
 
   /** Spent brass tumbling out of the ejection port (pooled, capped). */
@@ -710,21 +977,34 @@ export class CombatDirector {
     player.physics.velocity.x = recoilDir * stats.recoil;
 
     const dir = player.physics.facingRight ? 1 : -1;
-    const originX = player.physics.position.x + dir * 34;
+    // PHASE 1B aim model: precision aim flies along the stick (with head
+    // assist) and tightens the cone to 35%; hip-fire keeps the shipped cone.
+    const shot = this.shotVector(player, enemies);
+    const baseX = shot.dx;
+    const baseY = shot.dy;
+    const dirShot = shot.dir;
+    const originX = player.physics.position.x + dirShot * 34;
     const originY = player.physics.position.y - 62;
-    this.ejectCasing(originX, originY, dir);
+    this.ejectCasing(originX, originY, dirShot);
+    const spreadScale = player.precisionAim ? 0.35 : 1;
 
     const MAX_RANGE = 1500;
     const comboMult = this.comboDamageMultiplier();
     let totalDamage = 0;
-    let anchorX = originX + dir * 320;
-    let anchorY = originY;
+    let anchorX = originX + baseX * 320;
+    let anchorY = originY + baseY * 320;
     let hitEnemyOnce = false;
+    let headshotLanded = false;
 
     for (let pellet = 0; pellet < stats.pellets; pellet++) {
-      const spread = stats.spread > 0 ? (Math.random() * 2 - 1) * stats.spread : 0;
-      const dx = Math.cos(spread) * dir;
-      const dy = Math.sin(spread);
+      const spread =
+        stats.spread > 0 ? (Math.random() * 2 - 1) * stats.spread * spreadScale : 0;
+      // Rotate the base direction by this pellet's spread (hip-fire base is
+      // axis-aligned, so this reduces to the shipped cos/sin cone exactly).
+      const cosS = Math.cos(spread);
+      const sinS = Math.sin(spread);
+      const dx = baseX * cosS - baseY * sinS;
+      const dy = baseX * sinS + baseY * cosS;
 
       // Nearest live enemy along this ray
       let enemy: EnemyController | null = null;
@@ -759,7 +1039,7 @@ export class CombatDirector {
       }
 
       if (enemy && (!prop || enemyT <= propT)) {
-        const impactX = enemy.position.x - dir * 12;
+        const impactX = originX + dx * enemyT - dirShot * 8;
         const impactY = originY + dy * enemyT;
         this.pushTracer(originX, originY, impactX, impactY, stats.tracerLife, stats.tracerWidth);
 
@@ -782,12 +1062,18 @@ export class CombatDirector {
           continue;
         }
 
-        const raw = Math.max(1, Math.round(stats.damage * falloff * comboMult));
+        // PHASE 1B hit zones: rounds landing in the head band pay 1.6x.
+        const isHeadshot = impactY <= enemy.position.y - 88;
+        const raw = Math.max(
+          1,
+          Math.round(stats.damage * falloff * comboMult * (isHeadshot ? 1.6 : 1))
+        );
         const landed = enemy.takeDamage(raw, dir * stats.recoil, -90 - stats.recoil * 0.15, false);
         if (landed > 0) {
           totalDamage += landed;
-          this.spawnBlood(impactX, impactY, dir, 5);
-          this.spawnSparks(impactX, impactY, dir, 6, '#fbbf24');
+          this.spawnBlood(impactX, impactY, dir, isHeadshot ? 8 : 5);
+          this.spawnSparks(impactX, impactY, dir, isHeadshot ? 9 : 6, '#fbbf24');
+          if (isHeadshot) headshotLanded = true;
           if (!hitEnemyOnce) {
             anchorX = impactX;
             anchorY = impactY;
@@ -808,12 +1094,15 @@ export class CombatDirector {
         anchorY = impactY;
       } else {
         // Miss: the round flies to the arena wall
-        const endX = dir > 0 ? 840 : -840;
+        const endX = dx > 0 ? 840 : -840;
         const tWall = Math.abs((endX - originX) / dx);
         const endY = originY + dy * tWall;
         this.pushTracer(originX, originY, endX, endY, stats.tracerLife, stats.tracerWidth);
         if (pellet === 0) {
           this.spawnSparks(endX, endY, -dir, 6, this.surfaceColor('WALL'));
+          // PHASE 1B ricochet: the lead pellet may skip off the wall once
+          // (45% roll inside) and resolve a half-damage second pass.
+          this.resolveRicochet(enemies, endX, endY, -dx, dy, camera, environmentManager, stats.damage);
         }
       }
     }
@@ -823,6 +1112,12 @@ export class CombatDirector {
       camera.addTrauma(stats.trauma);
       this.addPopup(anchorX, anchorY - 20, `-${totalDamage}`, '#fde047', stats.pellets > 1 ? 19 : 17);
       this.addCombo(1, 3.0);
+      Haptics.cue('shot');
+      if (headshotLanded) {
+        this.addPopup(anchorX, anchorY - 46, 'HEADSHOT!', '#fde047', 20);
+        this.registerStyle('HEADSHOT');
+        this.announceMove('HEADSHOT');
+      }
     } else {
       camera.addTrauma(stats.trauma * 0.35);
     }
@@ -843,6 +1138,7 @@ export class CombatDirector {
   ): void {
     const RADIUS = 205;
     SoundFX.playExplosion();
+    Haptics.cue('boom');
     this.spawnShockwave(x, y, RADIUS, '#fb923c');
     this.spawnSparks(x, y, 1, 24, '#fdba74');
     this.spawnSparks(x, y, -1, 18, '#fef08a');
@@ -1170,6 +1466,7 @@ export class CombatDirector {
           this.announceMove('PARRY RIPOSTE');
           this.addPopup(impactX, impactY - 46, 'RIPOSTE!', '#38bdf8', 22);
           this.spawnShockwave(impactX, impactY, 55, '#38bdf8');
+          this.registerStyle('RIPOSTE');
         }
 
         // Punish window (dodge recovery / heavy recovery) hits harder; the
@@ -1257,6 +1554,34 @@ export class CombatDirector {
         this.hitStopFrames = isFinisherHit ? Math.max(hitStop, 14) : hitStop;
         enemy.takeDamage(baseDamage, finalKnockbackX, knockbackY, isHeavy || isFinisherHit);
 
+        // PHASE 1B 3 — DISARM: a heavy blow (or the chain finisher) against a
+        // ranged archetype knocks the gun loose. It drops as a real pickup the
+        // player can grab, and the enemy closes to melee for the next 8s.
+        if (
+          enemy.health > 0 &&
+          (enemy.type === 'GUNNER' || enemy.type === 'SNIPER') &&
+          enemy.disarmTimer <= 0 &&
+          (isHeavy || isFinisherHit) &&
+          Math.random() < 0.5 &&
+          environmentManager
+        ) {
+          enemy.disarmTimer = 8;
+          environmentManager.dropWeapon(
+            enemy.type === 'SNIPER' ? 'RIFLE' : 'SMG',
+            enemy.position.x,
+            enemy.position.y - 40,
+            -dirAway * 120,
+            -220
+          );
+          this.addPopup(impactX, impactY - 46, 'DISARMED! +50', '#38bdf8', 20);
+          this.announceMove('DISARM');
+          this.registerStyle('DISARM');
+          this.stats.score += 50;
+          this.spawnSparks(impactX, impactY, dirAway, 14, '#38bdf8');
+          SoundFX.playGunCock();
+          Haptics.cue('takedown');
+        }
+
         // LEG SWEEP always converts the knockdown, super armor and all
         if (pState === 'ATTACK_SWEEP') {
           enemy.state = 'KNOCKBACK';
@@ -1280,6 +1605,14 @@ export class CombatDirector {
         // Combo chain & scoring (arms the next finisher at 5x / 10x / 15x)
         this.stats.totalDamageDealt += landDamage;
         this.addCombo(1, CombatDirector.COMBO_WINDOW);
+
+        // PHASE 1B style variety credit + impact haptic
+        if (pState === 'ATTACK_SWEEP') this.registerStyle('SWEEP');
+        else if (isFlyingKick) this.registerStyle('FLYING_KICK');
+        else if (isFinisherHit) this.registerStyle('FINISHER');
+        else if (soundType === 'kick') this.registerStyle('KICK');
+        else this.registerStyle('JAB');
+        Haptics.cue(isFinisherHit || isHeavy ? 'heavy' : 'hit');
 
         // Particles & Popups — blood sprays from the impact point on every landed hit
         this.spawnSparks(impactX, impactY, f, isHeavy ? 14 : 8, isHeavy ? '#f59e0b' : '#ef4444');
@@ -1366,6 +1699,8 @@ export class CombatDirector {
             // Opens the RIPOSTE window: the next landed strike hits at 2.5x
             this.riposteWindow = CombatDirector.RIPOSTE_WINDOW;
             this.announceMove('RIPOSTE READY');
+            this.registerStyle('PARRY');
+            Haptics.cue('parry');
             return;
           } else {
             // Standard Block Guard
@@ -1385,6 +1720,9 @@ export class CombatDirector {
         camera.addTrauma(0.35);
         this.hitStopFrames = hb.hitStopFrames;
         this.breakCombo(); // Chain interrupted
+        // PHASE 1B 11: feed the adaptive-difficulty window + hurt haptic
+        this.playerDamageWindow += hb.damage;
+        Haptics.cue('hurt');
 
         this.addPopup(px, py - 20, `-${hb.damage}`, '#ef4444', 18);
         this.spawnSparks(hb.x, hb.y, Math.sign(hb.knockbackX), 10, '#ef4444');
@@ -1429,6 +1767,11 @@ export class CombatDirector {
         enemy.velocity.y = 0;
         SoundFX.playWhoosh(1.2);
         camera.addTrauma(0.15);
+        // PHASE 1B 9 — takedown camera: push in tight for the grab and let
+        // the hold expire on its own when the move plays out.
+        camera.pushIn(1.35, 1.1);
+        this.registerStyle('GRAPPLE');
+        Haptics.cue('heavy');
         break;
       }
     }
@@ -1444,7 +1787,8 @@ export class CombatDirector {
     dt: number,
     player: PlayerController,
     enemies: EnemyController[],
-    camera: Camera
+    camera: Camera,
+    environmentManager?: EnvironmentManager
   ) {
     // Drain per-enemy pending ranged shots into the shared bullet pool
     for (const e of enemies) {
@@ -1492,6 +1836,32 @@ export class CombatDirector {
         continue;
       }
 
+      // PHASE 1B 5 — COVER: solid props eat enemy rounds (glass panels are
+      // windows and stay transparent to fire), so a body behind a crate is
+      // actually protected. The round spends itself on the first prop hit.
+      if (environmentManager) {
+        let cover: DestructibleObject | null = null;
+        for (const obj of environmentManager.destructibles) {
+          if (obj.isBroken || obj.type === 'GLASS_PANEL') continue;
+          if (
+            Math.abs(b.x - obj.x) <= obj.width * 0.5 &&
+            b.y <= obj.y &&
+            b.y >= obj.y - obj.height
+          ) {
+            cover = obj;
+            break;
+          }
+        }
+        if (cover) {
+          this.enemyBullets.splice(i, 1);
+          const coverDir = Math.sign(b.vx) || 1;
+          environmentManager.damageObject(cover, b.damage, coverDir * 90, -50);
+          this.spawnSparks(b.x, b.y, -coverDir, 7, this.surfaceColor(cover.type));
+          enemyBulletPool.release(b);
+          continue;
+        }
+      }
+
       if (playerDead) continue;
 
       const dx = b.x - px;
@@ -1531,9 +1901,80 @@ export class CombatDirector {
           this.addPopup(px, py - 20, `-${b.damage}`, '#ef4444', 18);
           this.spawnSparks(b.x, b.y, dir, 10, '#ef4444');
           this.spawnBlood(b.x, b.y, dir, 5);
+          // PHASE 1B 11: adaptive-difficulty window + hurt haptic
+          this.playerDamageWindow += b.damage;
+          Haptics.cue('hurt');
         }
         // P3-01: recycled only after every read of the shell is done
         enemyBulletPool.release(b);
+      }
+    }
+  }
+
+  /**
+   * PHASE 1B 7 — environmental kills. A body travelling faster than 300 px/s
+   * (heavy knockback, the GUN-FU BOWL, a slam) plows through whatever it
+   * touches: glass panels burst, crates and racks splinter, and an explosive
+   * barrel cooks off — which usually finishes whatever hit it. One prop is
+   * resolved per enemy per frame, so a flight through a table cluster reads
+   * as a chain instead of a single instant wipe.
+   */
+  private resolveEnvironmentalImpacts(
+    enemies: EnemyController[],
+    environmentManager: EnvironmentManager | undefined,
+    camera: Camera
+  ): void {
+    if (!environmentManager) return;
+
+    for (const enemy of enemies) {
+      if (enemy.health <= 0) continue;
+      const speed = Math.abs(enemy.velocity.x);
+      if (speed < 300) continue;
+
+      const bodyL = enemy.position.x - 24;
+      const bodyR = enemy.position.x + 24;
+      const bodyT = enemy.position.y - 104;
+      const bodyB = enemy.position.y;
+
+      for (const obj of environmentManager.destructibles) {
+        if (obj.isBroken) continue;
+        const oL = obj.x - obj.width * 0.5;
+        const oR = obj.x + obj.width * 0.5;
+        if (bodyR < oL || bodyL > oR) continue;
+        if (bodyB < obj.y - obj.height || bodyT > obj.y) continue;
+
+        const dirE = enemy.velocity.x >= 0 ? 1 : -1;
+        const isBarrel = obj.type === 'EXPLOSIVE_BARREL';
+        const isGlass = obj.type === 'GLASS_PANEL' || obj.type === 'GLASS_DISPLAY';
+
+        // Barrel: guaranteed cook-off on a body hit (chain blast resolves next
+        // frame through the shipped pendingExplosions queue). Glass: shatters
+        // under the impact. Everything else: a heavy structural hit.
+        environmentManager.damageObject(
+          obj,
+          isBarrel ? 999 : isGlass ? 120 : 60,
+          dirE * 200,
+          -90
+        );
+
+        if (!isGlass) {
+          // Solid props hurt: modest body damage on top of the shatter
+          const slam = Math.max(6, Math.round(speed * 0.03));
+          enemy.takeDamage(slam, dirE * 120, -80, false);
+        }
+
+        this.registerStyle('ENV');
+        this.addPopup(
+          enemy.position.x,
+          enemy.position.y - 130,
+          isBarrel ? 'BARREL SLAM!' : isGlass ? 'GLASS BREAK!' : 'ENV SLAM!',
+          isBarrel ? '#fb923c' : '#a5f3fc',
+          20
+        );
+        this.announceMove(isBarrel ? 'ENVIRONMENTAL KILL' : 'ENV IMPACT');
+        camera.addTrauma(isBarrel ? 0.5 : 0.28);
+        Haptics.cue(isBarrel ? 'boom' : 'heavy');
+        break;
       }
     }
   }
@@ -1602,6 +2043,10 @@ export class CombatDirector {
         this.spawnBlood(enemy.position.x, 0, -f, 6);
         this.addPopup(enemy.position.x, py - 35, `TAKEDOWN ${damage}`, '#f59e0b', 20);
         this.announceMove('JUDO SLAM');
+        // PHASE 1B 9/8: the slam frame gets the tightest framing of the move
+        camera.pushIn(1.42, 0.95);
+        this.registerStyle('TAKEDOWN');
+        Haptics.cue('takedown');
 
         // == GUN-FU RELEASE: the slammed body becomes the projectile ==
         // Aim it at whoever is left standing so the throw bowls through the
@@ -1688,6 +2133,10 @@ export class CombatDirector {
         this.stats.score += 150;
         this.addCombo(2, 3.5);
         this.announceMove('GRIP EXECUTION');
+        // PHASE 1B 9/8: temple shot gets its own push-in + style credit
+        camera.pushIn(1.45, 1.0);
+        this.registerStyle('EXECUTION');
+        Haptics.cue('takedown');
       } else {
         // Rolled through the muzzle — release them instead of leaving a
         // GRAPPLED husk behind when the grapple ends

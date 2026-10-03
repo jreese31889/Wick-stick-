@@ -17,12 +17,15 @@ export interface GameSettings {
   quality: Quality;
   /** Show the FPS chip in the HUD (visible on xl+ layouts). */
   showFps: boolean;
+  /** PHASE 1B E6: gameplay haptics (pad rumble + phone vibration). */
+  haptics: boolean;
 }
 
 export const DEFAULT_SETTINGS: GameSettings = {
   sfxVolume: 100,
   quality: 'high',
   showFps: true,
+  haptics: true,
 };
 
 export const QUALITY_OPTIONS: { id: Quality; label: string; blurb: string }[] = [
@@ -109,6 +112,7 @@ export function loadSettings(): GameSettings {
     sfxVolume: clamp(Math.round(num(raw.sfxVolume, DEFAULT_SETTINGS.sfxVolume)), 0, 100),
     quality,
     showFps: typeof raw.showFps === 'boolean' ? raw.showFps : DEFAULT_SETTINGS.showFps,
+    haptics: typeof raw.haptics === 'boolean' ? raw.haptics : DEFAULT_SETTINGS.haptics,
   };
 }
 
