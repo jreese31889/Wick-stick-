@@ -1117,8 +1117,9 @@ export class EnemyController {
     this.velocity.y = knockbackY;
     this.grounded = false;
 
-    // Stagger Build-up
-    this.staggerMeter += isHeavy ? 30 : 15;
+    // Stagger Build-up — scaled per archetype (BERSERKER cracks at 2x,
+    // ACROBAT at 1.2x; everyone else sits at the 1.0 default)
+    this.staggerMeter += (isHeavy ? 30 : 15) * this.staggerTakenScale;
     if (this.staggerMeter >= this.maxStagger) {
       this.isStaggered = true;
     }

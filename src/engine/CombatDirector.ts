@@ -6,7 +6,7 @@ import { SoundFX } from './SoundFX';
 import { Haptics } from './Haptics';
 import { ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
-import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc, EnemyBullet, DestructibleObject } from '../types/game';
+import { DamagePopup, ImpactSpark, ShockwaveRing, BulletTracer, CasingParticle, BloodDecal, BladeSlashArc, EnemyBullet, DestructibleObject, SpecialMoveId } from '../types/game';
 import { EnvironmentManager } from './EnvironmentManager';
 import { GUNS, falloffMultiplier } from './Weapons';
 
@@ -165,6 +165,8 @@ export class CombatDirector {
     ENV: 16,
     MULTI: 12,
     GUNFU: 10,
+    SPIN_SLASH: 14,
+    EXECUTIONER: 22,
   };
 
   /**
@@ -261,6 +263,19 @@ export class CombatDirector {
     this.stats.comboTimer = 0;
     this.stats.finisherArmed = false;
     this.updateStyleRating();
+  }
+
+  /**
+   * A1 SPECIALS: `PlayerController.comboMeter` is a read-only mirror of this
+   * director's chain count — the player-side gate for SPIN_SLASH (5) /
+   * EXECUTIONER (15) reads it, but only the director ever owns the chain.
+   * Mirrored after the decay/break check (so a lapsed chain reads 0 on the
+   * very frame it dies) and again at the end of update (so landed hits,
+   * damage breaks and special spends are current before the next frame's
+   * player step runs).
+   */
+  private mirrorComboMeter(player: PlayerController): void {
+    player.comboMeter = this.stats.comboCount;
   }
 
   // ============================================================
@@ -388,6 +403,21 @@ export class CombatDirector {
       }
     }
 
+    // 3a. A1: mirror the chain into player.comboMeter AFTER break handling,
+    // so the special gate sees a lapsed chain as 0 on the frame it dies.
+    this.mirrorComboMeter(player);
+
+    // 3b. A1: a trigger whose state was forced off the special (dodge cancel,
+    // grapple lock, gun-fu forceState) can never resolve its strike window —
+    // drop it here without spending anything.
+    if (
+      player.pendingSpecial !== null &&
+      player.physics.state !== 'ATTACK_SPECIAL' &&
+      player.physics.state !== 'ATTACK_SUPER'
+    ) {
+      player.pendingSpecial = null;
+    }
+
     // 3b. PHASE 1B style meter: after a short grace window an untouched
     // meter drains, so the rank falls back toward D when the fight cools off.
     if (this.stylePoints > 0) {
@@ -407,6 +437,9 @@ export class CombatDirector {
     // 5. Handle active Grapple / Takedown
     if (this.isGrappling && this.grappledEnemy) {
       this.updateGrapple(dt, player, this.grappledEnemy, camera, enemies);
+      // The slam credits the chain on the way out — keep the mirror current
+      // on this early-return path too.
+      this.mirrorComboMeter(player);
       return;
     }
 
@@ -603,6 +636,10 @@ export class CombatDirector {
     // 12. PHASE 1B 7: bodies thrown into props — glass shatters, crates and
     // barrels are smashed (barrels cook off), the impact hurts the throwee.
     this.resolveEnvironmentalImpacts(enemies, environmentManager, camera, player.physics.position.x);
+
+    // 13. A1: re-mirror after steps 7–12 (landed hits, damage breaks, special
+    // spends) so the meter the player reads next frame is already current.
+    this.mirrorComboMeter(player);
   }
 
   private checkPlayerGunfire(
@@ -1324,6 +1361,8 @@ export class CombatDirector {
       pState === 'ATTACK_KICK' ||
       pState === 'ATTACK_SWEEP' ||
       pState === 'ATTACK_FLYING_KICK' ||
+      pState === 'ATTACK_SPECIAL' ||
+      pState === 'ATTACK_SUPER' ||
       player.physics.isSliding;
 
     if (!isAttacking) return;
@@ -1331,6 +1370,19 @@ export class CombatDirector {
     // flight instead of spending itself on the first body it touches.
     const isFlyingKick = pState === 'ATTACK_FLYING_KICK';
     if (!isFlyingKick && this.playerAttackRegistered) return;
+
+    // A1: SPIN_SLASH / EXECUTIONER resolve in their own absolute-second strike
+    // window, register exactly once, and burn the meter they were gated on.
+    if (pState === 'ATTACK_SPECIAL' || pState === 'ATTACK_SUPER') {
+      this.resolveSpecialStrike(
+        player,
+        enemies,
+        camera,
+        environmentManager,
+        pState === 'ATTACK_SUPER' ? 'EXECUTIONER' : 'SPIN_SLASH'
+      );
+      return;
+    }
 
     // Active attack strike windows (normalized timing)
     let attackWindowStart = 0.08;
@@ -1693,6 +1745,162 @@ export class CombatDirector {
         break;
       }
     }
+  }
+
+  /**
+   * A1 — COMBO SPECIAL / SUPER strike resolution.
+   *
+   * SPIN_SLASH (0.58 s) whirls and connects with EVERY body inside ~95 px of
+   * the player; EXECUTIONER (0.95 s) slams forward at `strikeX` on a bigger
+   * arc. Both are heavy strikes, both register exactly ONCE (the flying
+   * kick's keep-going, one-tag-per-body bookkeeping does not apply), and both
+   * settle `pendingSpecial`:
+   *   • a contact inside the window clears the trigger and burns the cost it
+   *     was gated on (5 / 15 — PlayerController.SPECIAL_COST / SUPER_COST);
+   *   • a window that closes on empty air clears the trigger WITHOUT
+   *     spending — a whiff costs animation time only.
+   * The windows are absolute seconds: `physics.stateTimer` counts real
+   * seconds (the pose's strikeCurve normalizes separately for animation).
+   */
+  private resolveSpecialStrike(
+    player: PlayerController,
+    enemies: EnemyController[],
+    camera: Camera,
+    environmentManager: EnvironmentManager | undefined,
+    id: SpecialMoveId
+  ): void {
+    const isSuper = id === 'EXECUTIONER';
+    const windowStart = isSuper ? 0.30 : 0.15;
+    const windowEnd = isSuper ? 0.62 : 0.42;
+    const pTimer = player.physics.stateTimer;
+
+    // WHIFF: the window closed without ever registering — drop the trigger
+    // and leave the meter alone.
+    if (player.pendingSpecial !== null && pTimer > windowEnd) {
+      player.pendingSpecial = null;
+      return;
+    }
+    if (pTimer < windowStart || pTimer > windowEnd) return;
+
+    const f = player.physics.facingRight ? 1 : -1;
+    const px = player.physics.position.x;
+    const py = player.physics.position.y;
+    const strikeBonus = player.physics.equippedWeapon === 'KATANA' ? 16 : 0;
+    // The whirl centres on the body; the super reaches forward off a longer arc.
+    const strikeX = isSuper ? px + f * (42 + strikeBonus + 44) : px;
+    const strikeY = py - (isSuper ? 68 : 50);
+    const radius = (isSuper ? 78 : 95) + strikeBonus;
+    const damage = isSuper ? 55 : 30;
+    const knockbackX = isSuper ? 520 : 420;
+    const knockbackY = isSuper ? -240 : -160;
+    const hitStop = isSuper ? 12 : 8;
+
+    // Everything standing in the arc — the spin hits the whole ring at once.
+    const inRange: EnemyController[] = [];
+    for (const enemy of enemies) {
+      if (enemy.health <= 0 || enemy.state === 'DOWNED') continue;
+      const dist = Math.hypot(strikeX - enemy.position.x, strikeY - (enemy.position.y - 50));
+      if (dist < radius) inRange.push(enemy);
+    }
+
+    // Props take the strike too (crates / barrels break on the same frame).
+    // The check only applies damage when something is actually overlapped, so
+    // running it while the arc is empty costs nothing.
+    let propHit = false;
+    if (environmentManager) {
+      propHit = environmentManager.checkHitboxAgainstDestructibles({
+        x: strikeX,
+        y: strikeY,
+        radius: radius + 15,
+        damage,
+        knockbackX: f * knockbackX,
+        knockbackY,
+        hitStopFrames: hitStop,
+      });
+    }
+
+    // Nothing in reach yet — stay inside the window and try again next frame.
+    if (inRange.length === 0 && !propHit) return;
+
+    // ONE registration for the whole move: the arc is spent on this frame.
+    this.playerAttackRegistered = true;
+
+    let connected = propHit;
+    for (const enemy of inRange) {
+      const ex = enemy.position.x;
+      const ey = enemy.position.y - 50;
+      const dirAway = ex >= px ? 1 : -1;
+      const impactX = (strikeX + ex) / 2;
+      const impactY = (strikeY + ey) / 2;
+
+      // Dodge i-frames phase straight through the whirl — no credit, no spend.
+      if (enemy.evading) {
+        this.spawnSparks(impactX, impactY, dirAway, 6, '#94a3b8');
+        this.addPopup(impactX, impactY - 12, 'WHIFF', '#94a3b8', 15);
+        continue;
+      }
+
+      // Both specials are heavy enough to shatter a guard on contact.
+      if (enemy.state === 'BLOCK') {
+        enemy.guardBreak();
+        connected = true;
+        this.spawnSparks(impactX, impactY, f, 16, '#fbbf24');
+        this.addPopup(impactX, impactY - 18, 'GUARD CRUSH!', '#fbbf24', 19);
+        continue;
+      }
+
+      const applied = enemy.takeDamage(damage, dirAway * knockbackX, knockbackY, true);
+      if (applied <= 0) continue;
+      connected = true;
+      this.stats.totalDamageDealt += applied;
+      this.spawnBlood(ex, ey, dirAway, isSuper ? 14 : 9);
+      this.spawnSparks(impactX, impactY, dirAway, isSuper ? 18 : 12, isSuper ? '#f59e0b' : '#38bdf8');
+      this.addPopup(
+        impactX,
+        impactY - 26,
+        `${isSuper ? 'EXECUTIONER' : 'SPIN SLASH'} ${applied}`,
+        isSuper ? '#f59e0b' : '#38bdf8',
+        isSuper ? 24 : 20
+      );
+    }
+
+    // Whiffed clean through (every body in range was phasing) — the trigger
+    // is spent but the meter is not.
+    if (!connected) {
+      player.pendingSpecial = null;
+      return;
+    }
+
+    // A landed strike burns the meter the gate read; a prop-only contact does
+    // not (nothing of the player's chain was cashed in against a fighter).
+    if (player.pendingSpecial === id) {
+      const cost = isSuper ? PlayerController.SUPER_COST : PlayerController.SPECIAL_COST;
+      this.stats.comboCount = Math.max(0, this.stats.comboCount - cost);
+      this.updateStyleRating();
+      player.pendingSpecial = null;
+      this.mirrorComboMeter(player);
+    } else {
+      player.pendingSpecial = null;
+    }
+
+    this.hitStopFrames = hitStop;
+    camera.addTrauma(isSuper ? 0.55 : 0.42);
+    if (isSuper) {
+      this.slowMoFactor = 0.35;
+      this.slowMoTimer = 0.32;
+      this.speedLinesTimer = 0.32;
+    }
+    SoundFX.playPunch(isSuper ? 'slam' : 'heavy');
+    this.spawnShockwave(strikeX, strikeY, isSuper ? 90 : 70, isSuper ? '#f59e0b' : '#38bdf8');
+    if (player.physics.equippedWeapon === 'KATANA') {
+      this.spawnBladeArc(px + f * 25, py - 50, f > 0 ? 0.3 : Math.PI - 0.3, isSuper ? 88 : 72, '#f59e0b');
+    }
+    this.announceMove(isSuper ? 'EXECUTIONER' : 'SPIN SLASH');
+    this.registerStyle(id);
+    // Credit the chain for the landed strike AFTER the spend, so the burn can
+    // never re-arm a finisher the meter no longer pays for.
+    this.addCombo(1, CombatDirector.COMBO_WINDOW);
+    Haptics.cue(isSuper ? 'takedown' : 'heavy');
   }
 
   private checkEnemyAttacks(

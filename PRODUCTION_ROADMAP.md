@@ -6,7 +6,7 @@
 
 Legend: ✅ DONE (ships today) · 🟡 PARTIAL (works, but a documented half of the contract is missing) · ⛔ NEW (does not exist in `src/`).
 
-Summary: **41 features — 29 DONE · 4 PARTIAL · 8 NEW.**
+Summary: **41 features — 31 DONE · 4 PARTIAL · 6 NEW.**
 
 ---
 
@@ -66,8 +66,8 @@ Summary: **41 features — 29 DONE · 4 PARTIAL · 8 NEW.**
 |---|---------|--------|----------------------------|
 | E1 | Impact FX suite: tracers, muzzle bloom, shell casings, sparks, shockwaves, damage popups, blade arcs | ✅ | `CombatDirector` pools (`:39-78`, caps `:120-128`), `Renderer.renderCombatFX` (`:759-860`), `spawnMuzzleBloom` (`:299`) auto-fires on new tracer ids (`:799-803`) |
 | E2 | Blood decals + pooled death ragdolls with joint constraints | ✅ | `CombatDirector.spawnBlood`, `src/engine/Ragdoll.ts`, `ragdollPool` recycle `GameLoop.ts:140-145/:266` |
-| E3 | **Surface-aware impact FX (wood / glass / barrel / wall colour + debris)** | ⛔ NEW | Impacts are hard-coded per hit (`CombatDirector.ts:507/:515/:527-543/:556`); no prop/surface context reaches the FX path |
-| E4 | **Distinct weapon audio: per-gun reports + explosion boom** | ⛔ NEW | Every gun shares `SoundFX.playGunshot` (`SoundFX.ts:193-196`); no explosion sound. Existing signatures must not change — land as new methods `playGunReport(kind)` / `playExplosion()` |
+| E3 | Surface-aware impact FX (wood / glass / barrel / wall colour + debris) | ✅ | `CombatDirector.surfaceColor` (`src/engine/CombatDirector.ts:1015` — glass / crate / barrel / table / rack / wall palette) called at `:733`, `:989`, `:1168`, `:1178`, `:2113`; shatter debris by surface `EnvironmentManager.shatterObject` (`:493-516` — wood splinters for crates, glass otherwise, theme tint in `NEON_GALLERY`) |
+| E4 | Distinct weapon audio: per-gun reports + explosion boom | ✅ | `SoundFX.playGunReport` (`src/engine/SoundFX.ts:381` — SMG dry/up-pitched, SHOTGUN down-pitched + slam body, RIFLE hard crack, PISTOL delegates to the shipped `playGunshot`) fired from `CombatDirector.resolveSalvoShot` (`:1051`); `SoundFX.playExplosion` (`SoundFX.ts:405`) from `CombatDirector.detonateBarrel` (`:1218`). Existing signatures untouched (new methods only) |
 | E5 | **Music system: menu + dynamic combat score** | ✅ | `src/engine/Music.ts` — procedural 96 BPM score (5 layer buses, bar-locked pattern swaps, menu/run/paused/victory/death scenes, 4 run-intensity tiers fed from `App.tsx`), `settings.musicVolume` + `OptionsModal` slider, SFX ducking from `SoundFX.playSample`/`playWorld` |
 | E6 | Haptics / controller rumble | ✅ | `src/engine/Haptics.ts` (`cue`, distance-scaled `cueAt`, `takedown` pattern, `heartbeat` pattern) driven from `CombatDirector` (finisher, grapple slam, execution, barrel slam) + low-HP heartbeat `GameLoop.updateHeartbeat` |
 
@@ -76,9 +76,9 @@ Summary: **41 features — 29 DONE · 4 PARTIAL · 8 NEW.**
 | # | Feature | Status | Implementing file / symbol |
 |---|---------|--------|----------------------------|
 | F1 | Title / pause / game-over + victory screens, stage select, HUD, settings menus | ✅ | `src/App.tsx`, `src/components/PauseMenu.tsx`, `HowToPlayModal.tsx`, HUD `App.tsx:578-762`, boss/combo canvas HUD `Renderer.renderBossHUD` (`:1291`) |
-| F2 | Save system: cleared stages, highest wave, best score/combo/kills/time, victories | ✅ | `settings.ts:46-138` (`john-stick.progress.v1`, sanitized on load), auto-save `App.tsx` |
-| F3 | Landscape mobile controls: floating joystick + labeled PUNCH/KICK/GRAB + 10 touch buttons | ✅ | `VirtualControls.tsx` (buttons `:188-343`, joystick `:148-177`), `InputManager.setVirtualButton` (`:277`) |
-| F4 | Controller (Type-C/Bluetooth) + keyboard bindings | ✅ | `InputManager.handleKeyDown` (`:141`), pad poll (`:322-376`), status badge `App.tsx:654-667` |
+| F2 | Save system: cleared stages, highest wave, best score/combo/kills/time, victories + progression profile | ✅ | Run stats `settings.ts:149` (`john-stick.progress.v1`, sanitized on load); Phase 2 profile in `src/profile/` — `ProfileStore.ts` (`johnstick-profile-v1`, versioned + `sanitizeProfile`), XP/levels + style rank `Progression.ts:23-95`, unlocks/upgrades/skins/achievements catalogs `Catalogs.ts`, auto-save `App.tsx:453/:565/:769` |
+| F3 | Landscape mobile controls: floating joystick + labeled PUNCH/KICK/GRAB + 10 touch buttons, drag-to-place layout editor + swipe gestures | ✅ | `VirtualControls.tsx` (buttons `:188-343`, joystick `:148-177`, swipe gestures on the look area `:425`), `InputManager.setVirtualButton` (`:277`) + one-shot pulse for swipes (`:339`), editor `src/components/TouchLayoutEditor.tsx` (drag any control, `default`/`southpaw` presets, undo, persisted in settings), opened from `App.tsx:725` |
+| F4 | Controller (Type-C/Bluetooth) + keyboard bindings | ✅ | `InputManager.handleKeyDown` (`:141`), pad poll (`:322-376`), rebind table `src/components/PadBindings.ts` (`PAD_BINDINGS`, `PAD_BADGE`, footer hints), status badge `App.tsx:654-667` |
 | F5 | 60 FPS Android target: quality tiers, DPR caps, pooling, capped FX, offline APK | ✅ | `M14_PUNCHLIST.md` (executed at `5f0e644`), `ObjectPool.ts`, FX caps `CombatDirector.ts:120-128` / `EnvironmentManager.ts:92-97`, `settings.applyQuality`, Capacitor package `../wick-stick-game-apk` |
 
 ---
@@ -94,6 +94,54 @@ Summary: **41 features — 29 DONE · 4 PARTIAL · 8 NEW.**
 
 **Guardrails carried into Phase 1:** no change to existing damage numbers, cooldowns, hit-stop frames or gun-fu trigger order; gun-fu moves keep byte-identical triggers; `SoundFX` public signatures unchanged (new methods only); quality tiers/DPR caps untouched; no new per-frame allocations outside pooled records; no git commit.
 
+## Phase 5 — fighting-debug + release prep (this change set)
+
+**Verification:** `npx tsc --noEmit` green · `npm run build` green · `npx tsx smoke_combat.ts` **35/35 PASS** (`ALL GREEN`; headless harness, repo root — no engine import is mocked; it drives the real `CombatDirector`/`EnemyController`/`PlayerController`).
+
+### A1 — combo specials (`SPIN_SLASH` / `EXECUTIONER`) were dead at three independent points
+
+| # | Break | Evidence | Fix |
+|---|-------|----------|-----|
+| 1 | `player.comboMeter` is written nowhere → the `>= 5` / `>= 15` gate could never open | field declared `PlayerController.ts:132`, read at `:753-758`, **0 writers** | `CombatDirector.mirrorComboMeter` (`:277`) copies `stats.comboCount` into it. Called at step **3a** (`:408`) *after* the decay/`breakCombo` check, so a lapsed chain reads 0 on the frame it dies; on the grapple early-return (`:442`); and at step **13** (`:642`) after landed hits, damage breaks and special spends — always before the next `player.update` (GameLoop runs player step 2, director step 7) |
+| 2 | `checkPlayerAttacks`' `isAttacking` union omitted `ATTACK_SPECIAL` / `ATTACK_SUPER` → the move animated but never registered a hit | `CombatDirector.ts:1356-1366`, early return `:1368` | both states added to the union, plus an early branch (`:1374-1385`) that dispatches to `resolveSpecialStrike` (`:1765`) before the normalized-window code runs |
+| 3 | `player.pendingSpecial` was write-only; nothing consumed or cleared it | written `PlayerController.ts:941`, `cancelSpecial` (`:960`) had **0 callers** | three settlement paths: contact clears + spends (`:1876-1884`), a window that closes empty clears without spending (`:1779-1781`), director step **3b** (`:410-419`) drops a trigger whose state was forced off the special (dodge cancel / grapple lock / `forceState`) with no spend |
+
+**Design decision — the meter *is* the chain.** `player.comboMeter` is a **mirror** of `CombatDirector.stats.comboCount`, not a second pool: one number drives the HUD ring, the ≤2.0× damage ramp (`A2` row) and the special gate, so they cannot desync — a separate meter would double-book the player and invent a second decay rule. Costs are `PlayerController.SPECIAL_COST = 5` / `SUPER_COST = 15` (`:142/:144`), charged from `comboCount` **on contact only** (`max(0, count - cost)`, `:1876-1884`); the landing then credits `+1` *after* the spend (`:1902`) so the burn can never re-arm a finisher the meter no longer pays for.
+
+**Strike windows** — absolute seconds on `physics.stateTimer` (the pose's `strikeCurve` normalizes separately for animation only):
+
+| Move | Window | Reach | Effect |
+|------|--------|-------|--------|
+| `SPIN_SLASH` (0.58 s anim) | 0.15 – 0.42 | every body within `95 + KATANA 16` px of the player (whirl) | 30 dmg, heavy, kb 420 / -160, hit-stop 8, trauma 0.42, blade arc, `STYLE_PAYOUT.SPIN_SLASH = 14` |
+| `EXECUTIONER` (0.95 s anim) | 0.30 – 0.62 | forward arc at `strikeX = px ± (42 + KATANA 16 + 44)`, radius `78 + 16` | 55 dmg, heavy, kb 520 / -240, hit-stop 12, trauma 0.55 + slow-mo 0.35, `STYLE_PAYOUT.EXECUTIONER = 22` |
+
+One registration per special (`playerAttackRegistered`; the flying kick's per-body latching deliberately not reused). Props in the arc shatter on the same frame (`checkHitboxAgainstDestructibles`, `:1811-1820`) — a prop-only contact **registers but does not spend**, because no fighter was hit. Guard-break on `BLOCK` (`:1844`), dodge i-frames deny credit (`:1837`), whiff (`!connected`, `:1869`) costs animation time only.
+
+### A2 — `staggerTakenScale` was multiplied into nothing
+
+`EnemyController.takeDamage` now scales the per-hit gain: `this.staggerMeter += (isHeavy ? 30 : 15) * this.staggerTakenScale;` (`EnemyController.ts:1122`). Every other `staggerMeter` write was audited and is **not** a per-hit gain, so none of them takes the scale — they stay deliberately flat: resets at `:961`/`:998`, forced full from `guardBreak` (`:1185`), the wall-slam bonus `+20` (`CombatDirector.ts:518`) and the perfect-parry fill (`:1943`). (Berserker ×2.0 → 60 heavy / 30 light, Acrobat ×1.2 → 18, base ×1.0 → 15, asserted in `smoke_combat.ts`.)
+
+### A3 — movement / lock audit (what was checked)
+
+Each path below has a guaranteed exit, so **no change was made**:
+
+1. **BLOCK** (`PlayerController.handleActions:595-605`) — exits on block release; re-enters from LAND/HURT.
+2. **SLIDE** (`:643-650`) — `stateTimer > 0.42 s` **or** `|vx| < 80` against the 950 px/s scrub; both always reached, and `stateTimer` keeps counting even when an airborne slide has flipped the pose to FALL.
+3. **DODGE_ROLL** (`:652-658`) — `stateTimer > 0.36 s`; nothing can reset the state while `isDodging` (locomotion, LAND and the block branch are all gated on `!isDodging`).
+4. **Attack recovery** (`:799-812`) — `stateTimer >= getAttackDuration`; `ATTACK_FLYING_KICK` additionally needs `grounded`, which gravity guarantees.
+5. **HURT flinch** — `HURT_HOLD = 0.35 s` (`:82`), then locomotion/air state reclaims it.
+6. **LAND** — 0.12 s compression, then gait; if block is held the BLOCK branch takes it over the same frame.
+7. **Countdown fields** — reload, gun cooldown, focus, special i-frames, deny cooldown, jump + coyote all decrement in `PlayerController.update`.
+8. **Input buffers** (Phase 1B, `INPUT_BUFFER` 0.3 s) — punch/kick/dodge channels are *frozen* while dodge/slide own the controller (`:607-641` early returns) and are spent the frame the lock clears; a press during a roll lands on the exit frame (asserted in `smoke_combat.ts`). They are never zeroed without an action, and a fresh press always overwrites the decay.
+
+Left alone on purpose (pre-existing, exit guaranteed, design choice): air-slide (the slide trigger has no `grounded` gate), dodge-cancel of attacks, jump buffer bleeding through recovery (~0.14 s by design), stick deadzones 0.15 / 0.22 (clamped, user-tunable).
+
+**The one provable defect — fixed:** `isBlocking` could survive into a roll/slide. The grounded BLOCK branch returns early, so the only way into the dodge/slide trigger with the guard still up is being *launched* while holding block. Two consequences were provable: (a) `handleMovement` routed the roll through the block-decay branch instead of carrying momentum, and (b) releasing block mid-roll ran `setState('IDLE')` while `isDodging` was still true → 0.36 s of standing i-frames that swallow every input. Fix: the trigger clears the flag before spending stamina (`PlayerController.ts:619`, `A3:` comment) — the guard never travels with the move.
+
+### Scope of this pass
+
+Only `CombatDirector.ts`, `EnemyController.ts` and `PlayerController.ts` changed, plus the new `smoke_combat.ts`. This closes `GAME_AUDIT.md` §8 items **#1** (`comboMeter` never written), **#2** (`SPIN_SLASH`/`EXECUTIONER` unreachable) and **#4** (`staggerTakenScale` read nowhere). Release packaging docs: `RELEASE_BUILD.md` · player-facing history: `CHANGELOG.md`. No git commit.
+
 ## Phase 2+ backlog (explicitly not in this change set)
 
-- A9 input buffering + dodge/block attack chains · C8 `EndlessLevelManager` + rewardMultiplier · B8 touch aim stick · F1 milestone/contract persistence + virtual pause button · style meter (design §14) · cinematic finisher system (design §15) · attack-input bug register in `GAME_AUDIT.md` §8 (comboMeter never written ⇒ `SPIN_SLASH`/`EXECUTIONER` unreachable).
+- A9 input buffering + dodge/block attack chains · C8 `EndlessLevelManager` + rewardMultiplier · B8 touch aim stick · F1 milestone/contract persistence + virtual pause button · style meter (design §14) · cinematic finisher system (design §15) · attack-input bug register in `GAME_AUDIT.md` §8 — **#1 / #2 / #4 closed in Phase 5** (see above), remaining entries stay open.

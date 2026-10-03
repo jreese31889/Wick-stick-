@@ -612,6 +612,11 @@ export class PlayerController {
       this.physics.stamina >= 15
     ) {
       this.dodgeBufferTimer = 0;
+      // A3: the guard never travels with the move. A roll/slide that inherits
+      // isBlocking decays instead of carrying momentum, and releasing block
+      // mid-move would stomp DODGE_ROLL back to IDLE while isDodging is still
+      // true — 0.36 s of standing i-frames that swallow every input.
+      this.physics.isBlocking = false;
       this.physics.stamina -= 15;
       const isCrouching = input.moveY > 0.4;
       const hasSpeed = Math.abs(this.physics.velocity.x) > 100;
