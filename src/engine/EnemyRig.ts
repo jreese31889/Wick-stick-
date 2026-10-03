@@ -37,6 +37,13 @@ function shade(hex: string, t: number): string {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
+/** Pre-built HP labels so the per-enemy readout never allocates a string. */
+const HP_PCT_LABELS: string[] = (() => {
+  const labels: string[] = new Array(101);
+  for (let i = 0; i <= 100; i++) labels[i] = `${i}%`;
+  return labels;
+})();
+
 export class EnemyRig {
   public render(
     ctx: CanvasRenderingContext2D,
@@ -511,7 +518,8 @@ export class EnemyRig {
     ctx.font = 'bold 8px monospace';
     ctx.textAlign = 'left';
     ctx.fillStyle = '#e5e7eb';
-    ctx.fillText(`${Math.ceil(hpRatio * 100)}%`, x + barWidth + 3, y + barHeight);
+    const hpPct = Math.max(0, Math.min(100, Math.ceil(hpRatio * 100)));
+    ctx.fillText(HP_PCT_LABELS[hpPct], x + barWidth + 3, y + barHeight);
 
     // Tag label
     ctx.font = 'bold 9px monospace';

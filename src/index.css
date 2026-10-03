@@ -87,12 +87,24 @@ html, body, #root {
   animation: menuIn 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
+/* Toasts drop from the top edge instead of rising like a modal panel. */
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(-16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.toast-in {
+  animation: toastIn 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
 /* Title-screen action buttons (thumb-sized, landscape-first) */
 .menu-btn {
   width: 100%;
   background-color: rgba(0, 0, 0, 0.55);
   border-color: rgba(255, 255, 255, 0.14);
   color: #e5e7eb;
+  transition: background-color 150ms ease, border-color 150ms ease,
+    color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
 }
 
 .menu-btn:hover {
@@ -104,6 +116,10 @@ html, body, #root {
   background-image: linear-gradient(to right, #f59e0b, #facc15);
   border-color: #fde68a;
   color: #000;
+}
+
+.menu-btn:active {
+  transform: translateY(1px);
 }
 
 .menu-btn-primary:hover {

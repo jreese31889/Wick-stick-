@@ -342,6 +342,9 @@ export class AnimationController {
       case 'BLOCK':
         return this.createBlockPose(0, groundY, facingSign);
 
+      case 'CROUCH':
+        return this.createCrouchPose(0, groundY, facingSign, stateTimer);
+
       case 'ATTACK_LIGHT_1':
         return this.createPunch1Pose(0, groundY, facingSign, stateTimer);
 
@@ -361,6 +364,16 @@ export class AnimationController {
 
       case 'ATTACK_FLYING_KICK':
         return this.createFlyingKickPose(0, groundY, facingSign, stateTimer);
+
+      // OWNER 2026-10-03 — joystick jump/crouch kit
+      case 'ATTACK_AIR_LIGHT':
+        return this.createAirLightPose(0, groundY, facingSign, stateTimer, vy);
+      case 'ATTACK_AIR_HEAVY':
+        return this.createAirHeavyPose(0, groundY, facingSign, stateTimer, vy);
+      case 'ATTACK_CROUCH_POKE':
+        return this.createCrouchPokePose(0, groundY, facingSign, stateTimer);
+      case 'ATTACK_LAUNCHER':
+        return this.createLauncherPose(0, groundY, facingSign, stateTimer);
 
       case 'ATTACK_HEAVY':
         return this.createHeavyStrikePose(0, groundY, facingSign, stateTimer);
@@ -867,6 +880,210 @@ export class AnimationController {
       tieTip: { x: neckX - f * 26, y: neckY + 12 },
       coatTailLeft: { x: x - f * 18, y: hipY + 6 },
       coatTailRight: { x: x - f * 24, y: hipY + 8 }
+    };
+  }
+
+  /**
+   * JOYSTICK CROUCH (owner 2026-10-03): held while the movement stick is
+   * pushed DOWN. Weight drops onto folded legs, torso packs down between the
+   * knees and the guard stays up — a small, readable silhouette so a high
+   * strike visibly passes over the head.
+   */
+  private createCrouchPose(x: number, y: number, f: number, timer: number): StickFigurePose {
+    const breathe = Math.sin(this.breathPhase) * 1.1;
+    const hipY = y - 26 + breathe * 0.5;
+    const torsoY = hipY - 16;
+    const neckY = torsoY - 12;
+    const headY = neckY - 13;
+
+    return {
+      head: { x: x + f * 3, y: headY },
+      neck: { x: x + f * 1, y: neckY },
+      torso: { x: x - f * 2, y: torsoY },
+      hips: { x: x, y: hipY },
+      // Guard stays high — the point of the crouch is that arms still defend
+      leftShoulder: { x: x - f * 5, y: neckY + 2 },
+      leftElbow: { x: x + f * 6, y: neckY + 8 },
+      leftHand: { x: x + f * 12, y: neckY - 4 },
+      rightShoulder: { x: x + f * 5, y: neckY + 2 },
+      rightElbow: { x: x + f * 11, y: neckY + 10 },
+      rightHand: { x: x + f * 15, y: neckY + 1 },
+      // Deep knee fold, feet planted wide for a stable base
+      leftHip: { x: x - f * 7, y: hipY },
+      leftKnee: { x: x - f * 17, y: y - 14 },
+      leftFoot: { x: x - f * 20, y: y },
+      rightHip: { x: x + f * 7, y: hipY },
+      rightKnee: { x: x + f * 16, y: y - 16 },
+      rightFoot: { x: x + f * 15, y: y },
+      tieBase: { x: x + f * 1, y: neckY + 2 },
+      tieMid: { x: x - f * 5, y: neckY + 10 },
+      tieTip: { x: x - f * 9, y: neckY + 18 },
+      coatTailLeft: { x: x - f * 14, y: hipY + 8 },
+      coatTailRight: { x: x + f * 10, y: hipY + 8 },
+    };
+  }
+
+  /**
+   * AIR LIGHT (owner 2026-10-03): fast airborne poke — lead hand snaps out on
+   * a straight line while the legs stay tucked, so it reads as a quick jab
+   * thrown off a jump rather than a ground punch played in the air.
+   */
+  private createAirLightPose(
+    x: number, y: number, f: number, timer: number, vy: number
+  ): StickFigurePose {
+    const extend = strikeCurve(timer, 0.22);
+    const hipY = y - 56;
+    const torsoY = hipY - 20;
+    const neckY = torsoY - 14;
+    const headY = neckY - 14;
+
+    return {
+      head: { x: x + f * (5 + extend * 2), y: headY },
+      neck: { x: x + f * 3, y: neckY },
+      torso: { x: x + f * 2, y: torsoY },
+      hips: { x: x, y: hipY },
+      leftShoulder: { x: x - f * 5, y: neckY + 2 },
+      leftElbow: { x: x + f * (10 + extend * 14), y: neckY },
+      leftHand: { x: x + f * (22 + extend * 30), y: neckY - 2 },
+      rightShoulder: { x: x + f * 5, y: neckY + 2 },
+      rightElbow: { x: x + f * 8, y: neckY + 12 },
+      rightHand: { x: x + f * 12, y: neckY + 2 },
+      leftHip: { x: x - f * 5, y: hipY },
+      leftKnee: { x: x - f * 13, y: hipY + 14 },
+      leftFoot: { x: x - f * 9, y: hipY + 32 },
+      rightHip: { x: x + f * 5, y: hipY },
+      rightKnee: { x: x + f * 13, y: hipY + 12 },
+      rightFoot: { x: x + f * 12, y: hipY + 30 },
+      tieBase: { x: x + f * 2, y: neckY + 2 },
+      tieMid: { x: x - f * 7, y: neckY + 13 },
+      tieTip: { x: x - f * 13, y: neckY + 24 },
+      coatTailLeft: { x: x - f * 12, y: hipY + 14 },
+      coatTailRight: { x: x - f * 6, y: hipY + 14 },
+    };
+  }
+
+  /**
+   * AIR HEAVY (owner 2026-10-03): overhead slam. Both arms load above the
+   * head on the way up, then drive straight down through the target while the
+   * body stacks vertically — the pose holds the loaded frame until the floor
+   * arrives so the commitment reads (Shadow Fight weight).
+   */
+  private createAirHeavyPose(
+    x: number, y: number, f: number, timer: number, vy: number
+  ): StickFigurePose {
+    // Load (arms up) for the first 0.16s, then hammer down and hold.
+    const load = 1 - clamp(timer / 0.16, 0, 1);
+    const drive = clamp((timer - 0.16) / 0.14, 0, 1);
+    const hipY = y - 58;
+    const torsoY = hipY - 20;
+    const neckY = torsoY - 14;
+    const headY = neckY - 14;
+    const armY = neckY - 18 - load * 26 + drive * 34;
+
+    return {
+      head: { x: x + f * 2, y: headY },
+      neck: { x: x, y: neckY },
+      torso: { x: x - f * 2 + drive * 3, y: torsoY },
+      hips: { x: x, y: hipY },
+      leftShoulder: { x: x - f * 7, y: neckY + 2 },
+      leftElbow: { x: x - f * (6 + load * 4), y: armY + 6 },
+      leftHand: { x: x + f * (4 + drive * 12), y: armY },
+      rightShoulder: { x: x + f * 7, y: neckY + 2 },
+      rightElbow: { x: x + f * (8 + load * 6), y: armY + 8 },
+      rightHand: { x: x + f * (14 + drive * 16), y: armY + 2 },
+      leftHip: { x: x - f * 5, y: hipY },
+      leftKnee: { x: x - f * 10, y: hipY + 20 },
+      leftFoot: { x: x - f * 6, y: hipY + 40 },
+      rightHip: { x: x + f * 5, y: hipY },
+      rightKnee: { x: x + f * 11, y: hipY + 18 },
+      rightFoot: { x: x + f * 14, y: hipY + 38 },
+      tieBase: { x: x, y: neckY + 2 },
+      tieMid: { x: x - f * 5, y: neckY + 13 },
+      tieTip: { x: x - f * 9, y: neckY + 24 },
+      coatTailLeft: { x: x - f * 11, y: hipY + 14 },
+      coatTailRight: { x: x - f * 3, y: hipY + 14 },
+    };
+  }
+
+  /**
+   * CROUCH POKE (owner 2026-10-03): fast, safe low strike thrown from the
+   * crouch — hips stay folded, only the lead arm fires and it retracts inside
+   * the window, which is why the recovery is so short.
+   */
+  private createCrouchPokePose(
+    x: number, y: number, f: number, timer: number
+  ): StickFigurePose {
+    const extend = strikeCurve(timer, 0.16);
+    const hipY = y - 26;
+    const torsoY = hipY - 15;
+    const neckY = torsoY - 12;
+    const headY = neckY - 13;
+
+    return {
+      head: { x: x + f * (4 + extend * 2), y: headY },
+      neck: { x: x + f * 2, y: neckY },
+      torso: { x: x - f * 2 + f * extend * 4, y: torsoY },
+      hips: { x: x, y: hipY },
+      leftShoulder: { x: x - f * 5, y: neckY + 2 },
+      leftElbow: { x: x + f * (8 + extend * 16), y: neckY + 4 },
+      leftHand: { x: x + f * (20 + extend * 28), y: neckY + 4 },
+      rightShoulder: { x: x + f * 5, y: neckY + 2 },
+      rightElbow: { x: x + f * 10, y: neckY + 10 },
+      rightHand: { x: x + f * 13, y: neckY + 1 },
+      leftHip: { x: x - f * 7, y: hipY },
+      leftKnee: { x: x - f * 17, y: y - 14 },
+      leftFoot: { x: x - f * 20, y: y },
+      rightHip: { x: x + f * 7, y: hipY },
+      rightKnee: { x: x + f * 15, y: y - 16 },
+      rightFoot: { x: x + f * 14, y: y },
+      tieBase: { x: x + f * 2, y: neckY + 2 },
+      tieMid: { x: x - f * 4, y: neckY + 10 },
+      tieTip: { x: x - f * 8, y: neckY + 18 },
+      coatTailLeft: { x: x - f * 13, y: hipY + 8 },
+      coatTailRight: { x: x + f * 9, y: hipY + 8 },
+    };
+  }
+
+  /**
+   * LAUNCHER (owner 2026-10-03): crouch heavy — a rising uppercut that starts
+   * fully folded and uncoils upward, the whole body extending through the
+   * fist. The vertical drive is what the juggle reads off.
+   */
+  private createLauncherPose(
+    x: number, y: number, f: number, timer: number
+  ): StickFigurePose {
+    const extend = strikeCurve(timer, 0.30);
+    const rise = Math.max(0, extend);
+    // Fold for the anticipation, then uncoil: hips lift, torso stacks tall.
+    const hipY = y - 26 - rise * 22;
+    const torsoY = hipY - 20 - rise * 6;
+    const neckY = torsoY - 14;
+    const headY = neckY - 14;
+
+    return {
+      head: { x: x + f * (3 - rise * 3), y: headY },
+      neck: { x: x + f * 1, y: neckY },
+      torso: { x: x - f * 2 + f * rise * 4, y: torsoY },
+      hips: { x: x + f * rise * 4, y: hipY },
+      // Rear hand drives the uppercut, lead arm pulls back as counterweight
+      leftShoulder: { x: x - f * 6, y: neckY + 4 },
+      leftElbow: { x: x - f * 12, y: neckY + 16 },
+      leftHand: { x: x - f * 16, y: neckY + 8 },
+      rightShoulder: { x: x + f * 6, y: neckY + 4 },
+      rightElbow: { x: x + f * (10 + rise * 6), y: neckY + (10 - rise * 26) },
+      rightHand: { x: x + f * (16 + rise * 14), y: neckY + (4 - rise * 44) },
+      // Drive leg extends, trail heel lifts — the uncoil pushed off the floor
+      leftHip: { x: x - f * 7, y: hipY },
+      leftKnee: { x: x - f * (16 - rise * 6), y: y - 14 - rise * 4 },
+      leftFoot: { x: x - f * (18 - rise * 4), y: y - rise * 8 },
+      rightHip: { x: x + f * 7, y: hipY },
+      rightKnee: { x: x + f * (14 + rise * 4), y: y - 16 - rise * 8 },
+      rightFoot: { x: x + f * (13 + rise * 6), y: y - rise * 10 },
+      tieBase: { x: x + f * 1, y: neckY + 2 },
+      tieMid: { x: x - f * 5, y: neckY + 10 },
+      tieTip: { x: x - f * 9, y: neckY + 19 },
+      coatTailLeft: { x: x - f * 13, y: hipY + 8 },
+      coatTailRight: { x: x + f * 9, y: hipY + 8 },
     };
   }
 

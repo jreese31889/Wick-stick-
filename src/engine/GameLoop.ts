@@ -615,6 +615,13 @@ export class GameLoop {
         this.renderer.spawnDust(this.player.physics.position.x - landDir * 16, this.player.physics.position.y, -80 * landDir, -40, 3);
         this.renderer.spawnDust(this.player.physics.position.x + landDir * 16, this.player.physics.position.y, 90 * landDir, -34, 3);
         this.camera.addTrauma(0.2);
+      } else if (this.player.pendingLandingShockwave) {
+        // OWNER 2026-10-03 — air slam touchdown: floor dust thrown both ways
+        const sx = this.player.physics.position.x;
+        const sy = this.player.physics.position.y;
+        this.renderer.spawnDust(sx - 18, sy, -130, -56, 4);
+        this.renderer.spawnDust(sx + 18, sy, 130, -56, 4);
+        this.renderer.spawnDust(sx, sy, 0, -90, 3);
       } else if (this.player.physics.state === 'LAND' && this.player.physics.stateTimer < 0.04) {
         this.renderer.spawnDust(this.player.physics.position.x - 12, this.player.physics.position.y, -60, -35, 3);
         this.renderer.spawnDust(this.player.physics.position.x + 12, this.player.physics.position.y, 60, -35, 3);
@@ -632,7 +639,9 @@ export class GameLoop {
         pAnimState === 'ATTACK_HEAVY' ||
         pAnimState === 'ATTACK_KICK' ||
         pAnimState === 'ATTACK_SWEEP' ||
-        pAnimState === 'ATTACK_FLYING_KICK'
+        pAnimState === 'ATTACK_FLYING_KICK' ||
+        pAnimState === 'ATTACK_AIR_HEAVY' ||
+        pAnimState === 'ATTACK_LAUNCHER'
       ) {
         this.renderer.spawnAfterimage(
           this.player.currentPose,

@@ -159,6 +159,9 @@ export class CombatDirector {
     KICK: 5,
     SWEEP: 9,
     FLYING_KICK: 8,
+    // OWNER 2026-10-03 — joystick jump / crouch kit style payouts
+    LAUNCHER: 11,
+    AIR: 9,
     FINISHER: 18,
     PARRY: 14,
     RIPOSTE: 12,
@@ -444,6 +447,23 @@ export class CombatDirector {
 
     // 4b. Gun-fu bodies still skidding down the floor bowl into the squad
     this.updateThrownEnemies(dt, enemies, camera);
+
+    // 4c. OWNER 2026-10-03 — air-slam touchdown: shockwave + hit-stop + trauma.
+    // The flag is set by PlayerController on the contact frame and drained
+    // here (after the hit-stop gate), so the ring never plays mid-freeze.
+    if (player.pendingLandingShockwave) {
+      player.pendingLandingShockwave = false;
+      const landX = player.physics.position.x;
+      const landY = player.physics.position.y;
+      this.spawnShockwave(landX, landY - 4, 92, '#f59e0b');
+      this.spawnShockwave(landX, landY - 4, 58, '#fbbf24');
+      this.spawnSparks(landX, landY - 6, player.physics.facingRight ? 1 : -1, 18, '#fbbf24');
+      this.hitStopFrames = Math.max(this.hitStopFrames, 6);
+      camera.addTrauma(0.32);
+      this.speedLinesTimer = Math.max(this.speedLinesTimer, 0.24);
+      SoundFX.playPunch('slam', landX);
+      Haptics.cue('heavy');
+    }
 
     // 5. Handle active Grapple / Takedown
     if (this.isGrappling && this.grappledEnemy) {
@@ -1379,6 +1399,11 @@ export class CombatDirector {
       pState === 'ATTACK_KICK' ||
       pState === 'ATTACK_SWEEP' ||
       pState === 'ATTACK_FLYING_KICK' ||
+      // OWNER 2026-10-03 — joystick jump / crouch kit
+      pState === 'ATTACK_AIR_LIGHT' ||
+      pState === 'ATTACK_AIR_HEAVY' ||
+      pState === 'ATTACK_CROUCH_POKE' ||
+      pState === 'ATTACK_LAUNCHER' ||
       pState === 'ATTACK_SPECIAL' ||
       pState === 'ATTACK_SUPER' ||
       player.physics.isSliding;
@@ -1412,8 +1437,14 @@ export class CombatDirector {
     let soundType: 'light' | 'heavy' | 'kick' = 'light';
     let isHeavy = false;
     let reachBonus = 0;
-    // LEG SWEEP strikes the ankles: same low hitbox the slide uses
-    const lowStrike = player.physics.isSliding || pState === 'ATTACK_SWEEP';
+    // LEG SWEEP strikes the ankles: same low hitbox the slide uses.
+    // CROUCH POKE also fires from the floor line (owner brief: low kit).
+    const lowStrike =
+      player.physics.isSliding ||
+      pState === 'ATTACK_SWEEP' ||
+      pState === 'ATTACK_CROUCH_POKE';
+    /** Height of the strike centre above the feet (px) — 68 is the torso. */
+    let strikeHeight = lowStrike ? 18 : 68;
 
     if (pState === 'ATTACK_LIGHT_1') {
       // PUNCH (jab) — fastest, shortest reach
@@ -1466,6 +1497,50 @@ export class CombatDirector {
       reachBonus = 24;
       attackWindowStart = 0.12;
       attackWindowEnd = 0.42;
+    } else if (pState === 'ATTACK_AIR_LIGHT') {
+      // OWNER: air light — fast poke off a joystick jump, safe but short
+      damage = 12;
+      knockbackX = player.physics.facingRight ? 160 : -160;
+      knockbackY = -70;
+      hitStop = 4;
+      soundType = 'light';
+      attackWindowStart = 0.05;
+      attackWindowEnd = 0.20;
+    } else if (pState === 'ATTACK_AIR_HEAVY') {
+      // OWNER: air heavy — overhead slam. The window stays open while the
+      // body falls so the hit reads on contact, and the landing adds the
+      // shockwave + hit-stop (see `pendingLandingShockwave`).
+      damage = 34;
+      knockbackX = player.physics.facingRight ? 380 : -380;
+      knockbackY = -200;
+      hitStop = 10;
+      soundType = 'heavy';
+      isHeavy = true;
+      reachBonus = 14;
+      strikeHeight = 46;
+      attackWindowStart = 0.12;
+      attackWindowEnd = 1.2;
+    } else if (pState === 'ATTACK_CROUCH_POKE') {
+      // OWNER: crouch light — fast, safe, chips a guard
+      damage = 10;
+      knockbackX = player.physics.facingRight ? 130 : -130;
+      knockbackY = -60;
+      hitStop = 3;
+      soundType = 'light';
+      attackWindowStart = 0.04;
+      attackWindowEnd = 0.14;
+    } else if (pState === 'ATTACK_LAUNCHER') {
+      // OWNER: crouch heavy — rising uppercut that pops the body for a juggle
+      damage = 26;
+      knockbackX = player.physics.facingRight ? 190 : -190;
+      knockbackY = -430;
+      hitStop = 9;
+      soundType = 'kick';
+      isHeavy = true;
+      reachBonus = 6;
+      strikeHeight = 54;
+      attackWindowStart = 0.10;
+      attackWindowEnd = 0.30;
     } else if (pState === 'ATTACK_HEAVY') {
       // Chain finisher animation (armed by the combo system)
       damage = 38;
@@ -1515,7 +1590,7 @@ export class CombatDirector {
     // Check collision against all alive enemies
     const f = player.physics.facingRight ? 1 : -1;
     const strikeX = player.physics.position.x + f * (42 + strikeBonus + reachBonus);
-    const strikeY = player.physics.position.y - (lowStrike ? 18 : 68);
+    const strikeY = player.physics.position.y - strikeHeight;
     const strikeRadius = (lowStrike ? 34 : 36) + strikeBonus + reachBonus;
 
     // Check hit against destructible environmental objects
@@ -1538,6 +1613,11 @@ export class CombatDirector {
 
     for (const enemy of enemies) {
       if (enemy.state === 'DOWNED' && !player.physics.isSliding && pState !== 'ATTACK_SWEEP') continue;
+      // OWNER 2026-10-03 (M15 L-02): the launcher is a JUGGLE STARTER, not a
+      // juggle extender. It refuses a body that is already off the floor, so
+      // the pop can never be chained into an infinite lift — every other
+      // strike still juggles a launched enemy normally.
+      if (pState === 'ATTACK_LAUNCHER' && !enemy.grounded) continue;
       // One flight, one hit per body — the kick keeps going down the line
       if (isFlyingKick && this.flyingKickHits.has(enemy)) continue;
 
@@ -1587,7 +1667,12 @@ export class CombatDirector {
 
         // Check if enemy is guarding (BLOCK state)
         if (enemy.state === 'BLOCK') {
-          if (pState === 'ATTACK_HEAVY' || pState === 'ATTACK_KICK') {
+          if (
+            pState === 'ATTACK_HEAVY' ||
+            pState === 'ATTACK_KICK' ||
+            pState === 'ATTACK_AIR_HEAVY' ||
+            pState === 'ATTACK_LAUNCHER'
+          ) {
             // == GUARD CRUSH! Heavy strike / power kick shatters defense ==
             enemy.guardBreak();
             this.hitStopFrames = 12;
@@ -1705,6 +1790,18 @@ export class CombatDirector {
           enemy.grounded = false;
         }
 
+        // OWNER 2026-10-03 — LAUNCHER: always converts into a vertical
+        // pop, super armor and all, so the body is actually airborne and
+        // readable as a juggle starter.
+        if (pState === 'ATTACK_LAUNCHER') {
+          enemy.state = 'KNOCKBACK';
+          enemy.stateTimer = 0;
+          enemy.velocity.x = finalKnockbackX * 0.45;
+          enemy.velocity.y = -430;
+          enemy.grounded = false;
+          this.spawnShockwave(impactX, impactY + 24, 46, '#fbbf24');
+        }
+
         // Sound FX
         if (!isFinisherHit) {
           SoundFX.playPunch(soundType);
@@ -1722,6 +1819,8 @@ export class CombatDirector {
 
         // PHASE 1B style variety credit + impact haptic
         if (pState === 'ATTACK_SWEEP') this.registerStyle('SWEEP');
+        else if (pState === 'ATTACK_LAUNCHER') this.registerStyle('LAUNCHER');
+        else if (pState === 'ATTACK_AIR_HEAVY') this.registerStyle('AIR');
         else if (isFlyingKick) this.registerStyle('FLYING_KICK');
         else if (isFinisherHit) this.registerStyle('FINISHER');
         else if (soundType === 'kick') this.registerStyle('KICK');
@@ -1751,6 +1850,14 @@ export class CombatDirector {
           this.addPopup(impactX, impactY - 34, `FLYING KICK -${landDamage}`, '#38bdf8', 21);
         } else if (pState === 'ATTACK_SWEEP') {
           this.addPopup(impactX, impactY - 24, `LEG SWEEP -${landDamage}`, '#38bdf8', 19);
+        } else if (pState === 'ATTACK_LAUNCHER') {
+          this.addPopup(impactX, impactY - 40, `LAUNCHER -${landDamage}`, '#fbbf24', 21);
+        } else if (pState === 'ATTACK_AIR_HEAVY') {
+          this.addPopup(impactX, impactY - 34, `AIR SLAM -${landDamage}`, '#f59e0b', 21);
+        } else if (pState === 'ATTACK_AIR_LIGHT') {
+          this.addPopup(impactX, impactY - 18, `AIR -${landDamage}`, '#f87171', 15);
+        } else if (pState === 'ATTACK_CROUCH_POKE') {
+          this.addPopup(impactX, impactY - 6, `${landDamage}`, '#f87171', 14);
         } else {
           this.addPopup(
             impactX,
@@ -1932,7 +2039,13 @@ export class CombatDirector {
     if (player.specialInvulnTimer > 0) return;
 
     const px = player.physics.position.x;
-    const py = player.physics.position.y - 50; // Player torso
+    // OWNER 2026-10-03 — the crouch SHRINKS the hurtbox: the torso folds to
+    // 26 px instead of 50 and the touch radius drops from 24 to 10, so a high
+    // strike (jab / hook / slam land at y-66..-70) mathematically whiffs over
+    // a crouching fighter while a floor-level SWEEP (y-20) still connects.
+    const crouched = !!player.physics.isCrouching;
+    const py = player.physics.position.y - (crouched ? 26 : 50); // Player torso
+    const touch = crouched ? 10 : 24;
 
     for (const enemy of enemies) {
       const hb = enemy.activeHitbox;
@@ -1942,7 +2055,7 @@ export class CombatDirector {
       const dy = hb.y - py;
       const dist = Math.hypot(dx, dy);
 
-      if (dist < hb.radius + 24) {
+      if (dist < hb.radius + touch) {
         // ENEMY HIT CONNECTED!
         enemy.hasHitPlayerThisAttack = true;
 
@@ -2090,11 +2203,16 @@ export class CombatDirector {
     }
 
     const px = player.physics.position.x;
-    const py = player.physics.position.y - 60; // player torso
+    // OWNER: crouching ducks the torso out of the bullet band too — the
+    // rounds are still aimed at standing height, so the low stance is real
+    // cover, not a cosmetic pose.
+    const crouched = !!player.physics.isCrouching;
+    const py = player.physics.position.y - (crouched ? 34 : 60); // player torso
     const isDodging = player.physics.isDodging;
     const isBlocking = player.physics.isBlocking;
     const playerDead = player.physics.health <= 0;
-    const hitRadiusSq = 26 * 26;
+    const hitRadius = crouched ? 17 : 26;
+    const hitRadiusSq = hitRadius * hitRadius;
 
     for (let i = this.enemyBullets.length - 1; i >= 0; i--) {
       const b = this.enemyBullets[i];

@@ -6,6 +6,13 @@ Player-facing history, newest first. Build numbering: `versionCode` `10` = **v10
 
 ## Unreleased — next build (v11)
 
+### Added
+- **Joystick jump.** Flicking the movement stick UP now jumps, with the same 140 ms buffer and variable jump height as the JUMP button — release early for a short hop, hold it for the full arc. Keyboard and pad JUMP keep working as alternates.
+- **Joystick crouch.** Hold the movement stick DOWN to drop into a crouch: the torso folds, the hurtbox shrinks, and you shuffle at half pace. Crouching ducks under jabs, hooks, slams and overheads — but a floor-level sweep still trips you, so it stays a read rather than a free pass.
+- **Crouch attack string.** CROUCH + PUNCH is a fast low poke; press PUNCH again inside the chain window and it becomes a rising uppercut that launches an opponent for a juggle. CROUCH + KICK throws the leg sweep on demand.
+- **Air attack string.** PUNCH in the air is a quick poke that keeps your arc; KICK in the air is an overhead slam that detonates on landing with a shockwave and hit-stop, or a flying kick if you are carrying real forward speed. Landing from the slam commits you to a short recovery — the guard and the dodge stay open throughout.
+- **Enemy jump-ins.** Rushers and acrobats can now coil and leap at you with an overhead dive. It telegraphs as a visible crouch, it whiffs over a crouching fighter, and it leaves them open on the way down — paired with their existing low sweep, the enemy kit now has a proper high/low triangle.
+
 ### Fixed
 - **Combo specials are usable again.** SPIN_SLASH (5-hit chain) and EXECUTIONER (15-hit chain) could never be triggered: the chain counter was never carried over to the special meter, the strike never registered, and a cancelled special never released its charge. All three are fixed, so the moves connect, spend exactly their cost, and refund nothing on a whiff.
 - **Enemy stagger now respects enemy type.** Heavy enemies build stagger 2× slower and acrobats 1.2× slower per hit, as designed — previously every enemy staggered at the same rate regardless of archetype.

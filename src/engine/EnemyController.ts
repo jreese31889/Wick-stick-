@@ -12,6 +12,14 @@ export type AttackPattern =
   | 'FLURRY'
   | 'SLAM'
   | 'LUNGE'
+  /**
+   * OWNER 2026-10-03 — JUMP-IN. The fighter coils, leaps at the player and
+   * drives an overhead down onto them. Readable as an OVERHEAD: it whiffs
+   * over a crouching player, exactly like the player's own high strikes, so
+   * the crouch read cuts both ways. Paired with SWEEP on ACROBAT / RUSHER,
+   * which is the LOW answer to the same crouch.
+   */
+  | 'DIVE'
   | 'RIPOSTE';
 
 /** Seconds into a dodge roll before the i-frames expire (punish window opens). */
@@ -660,8 +668,11 @@ export class EnemyController {
             this.attackPattern = roll < 0.65 ? 'HEAVY_HOOK' : 'JAB';
             this.attackCooldown = 1.8 + Math.random() * 0.6;
           } else if (this.type === 'RUSHER') {
-            this.attackPattern = roll < 0.4 ? 'SWEEP' : 'JAB';
-            this.attackCooldown = 1.2 + Math.random() * 0.4;
+            // OWNER: RUSHER carries a LOW (SWEEP) and a JUMP-IN (DIVE) so the
+            // player's crouch read has an answer on both sides.
+            const dive = roll < 0.34 && absDistToPlayer >= 55;
+            this.attackPattern = dive ? 'DIVE' : roll < 0.64 ? 'SWEEP' : 'JAB';
+            this.attackCooldown = dive ? 1.7 + Math.random() * 0.5 : 1.2 + Math.random() * 0.4;
           } else if (this.type === 'DEFENDER') {
             this.attackPattern = roll < 0.55 ? 'HEAVY_HOOK' : 'JAB';
             this.attackCooldown = 1.5 + Math.random() * 0.4;
@@ -672,8 +683,13 @@ export class EnemyController {
             this.attackPattern = roll < 0.55 ? 'FLURRY' : roll < 0.85 ? 'SLAM' : 'JAB';
             this.attackCooldown = this.attackPattern === 'FLURRY' ? 1.15 : 1.9;
           } else if (this.type === 'ACROBAT') {
-            this.attackPattern = roll < 0.5 ? 'LUNGE' : roll < 0.75 ? 'JAB' : 'SWEEP';
-            this.attackCooldown = 1.0 + Math.random() * 0.35;
+            // OWNER: ACROBAT gets the second jump-in/low pairing — the dive
+            // reads as an OVERHEAD (whiffs on crouch), the sweep as a LOW.
+            const dive = roll < 0.36 && absDistToPlayer >= 55;
+            this.attackPattern = dive
+              ? 'DIVE'
+              : roll < 0.58 ? 'LUNGE' : roll < 0.78 ? 'JAB' : 'SWEEP';
+            this.attackCooldown = dive ? 1.5 + Math.random() * 0.45 : 1.0 + Math.random() * 0.35;
           } else {
             this.attackPattern = roll < 0.3 ? 'HEAVY_HOOK' : roll < 0.5 ? 'SWEEP' : 'JAB';
             this.attackCooldown = 1.5 + Math.random() * 0.5;
@@ -767,6 +783,9 @@ export class EnemyController {
           this.attackPattern === 'FLURRY' ? 0.12 :
           this.attackPattern === 'LUNGE' ? 0.18 :
           this.attackPattern === 'SLAM' ? 0.42 :
+          // OWNER: the dive telegraphs as a visible crouch-coil before the
+          // leap — a jump-in you can read, never an instant burst.
+          this.attackPattern === 'DIVE' ? 0.34 :
           this.attackPattern === 'HEAVY_HOOK' ? 0.36 : this.attackPattern === 'SWEEP' ? 0.25 : 0.22;
         // Recorded for the pose: the wind-up coils for exactly this long and
         // the strike curve peaks inside the committed attack.
@@ -775,6 +794,9 @@ export class EnemyController {
           this.attackPattern === 'FLURRY' ? 0.46 :
           this.attackPattern === 'SLAM' ? 0.34 :
           this.attackPattern === 'LUNGE' ? 0.34 :
+          // The dive is an arc: launch, apex, drive down, land. The recovery
+          // only starts once the feet are back on the floor.
+          this.attackPattern === 'DIVE' ? 1.6 :
           this.attackPattern === 'HEAVY_HOOK' ? 0.38 : 0.30;
 
         if (this.stateTimer >= telegraphTime) {
@@ -853,6 +875,15 @@ export class EnemyController {
               knockbackY: -160,
               hitStopFrames: 5,
             };
+          } else if (this.attackPattern === 'DIVE') {
+            // OWNER: coil → leap. Both feet leave the floor and the arms load
+            // overhead; the hitbox only arms once the arc starts descending,
+            // so the strike reads as a committed overhead coming down.
+            this.velocity.x = f * 360;
+            this.velocity.y = -500;
+            this.grounded = false;
+            this.activeHitbox = null;
+            SoundFX.playWhoosh(0.7, this.position.x);
           } else {
             // Fast lead jab (GUNNERs fight weak up close — they'd rather be shooting)
             this.velocity.x = f * 150;
@@ -883,6 +914,52 @@ export class EnemyController {
             this.fireBullet(playerPos);
           }
         }
+        // OWNER 2026-10-03 — JUMP-IN. The dive doesn't follow the grounded jab
+        // clock: it resolves on touchdown, arms its overhead on the descent,
+        // and leaves the fighter grounded and vulnerable in recovery.
+        if (this.attackPattern === 'DIVE' && !this.rangedShot) {
+          const f = this.facingRight ? 1 : -1;
+          this.velocity.x *= 0.995;
+          if (this.grounded && this.stateTimer > 0.1) {
+            this.activeHitbox = null;
+            this.state = 'RECOVERY';
+            this.stateTimer = 0;
+            this.rangedShot = false;
+            this.recoveryVulnerable = true;
+            break;
+          }
+          if (this.hasHitPlayerThisAttack) {
+            this.activeHitbox = null;
+          } else if (this.velocity.y > -160) {
+            // High strike: the box rides at head height and TRACKS the body
+            // through the arc (arcing attacks can't pin world-space y the way
+            // a grounded jab does), so it only lands on a target standing up
+            // into it.
+            if (!this.activeHitbox) {
+              this.activeHitbox = {
+                x: this.position.x + f * 26,
+                y: this.position.y - 74,
+                radius: 32,
+                damage: Math.round(20 * this.damageScale),
+                knockbackX: f * 340,
+                knockbackY: -240,
+                hitStopFrames: 8,
+              };
+            } else {
+              this.activeHitbox.x = this.position.x + f * 26;
+              this.activeHitbox.y = this.position.y - 74;
+            }
+          }
+          if (this.stateTimer >= this.attackDuration) {
+            this.activeHitbox = null;
+            this.state = 'RECOVERY';
+            this.stateTimer = 0;
+            this.rangedShot = false;
+            this.recoveryVulnerable = true;
+          }
+          break;
+        }
+
         this.velocity.x *= 0.88;
 
         if (this.attackPattern === 'FLURRY') {
@@ -1159,7 +1236,10 @@ export class EnemyController {
     const muzzleX = this.position.x + f * 22;
     const muzzleY = this.position.y - 72;
     const targetX = playerPos.x;
-    const targetY = playerPos.y - 60; // player's torso
+    // AI LAW (G5): never a laser. The round is aimed at standing torso height
+    // with a human-ish vertical error — enough that a crouching fighter makes
+    // most rounds miss, without ever making the shot random nonsense.
+    const targetY = playerPos.y - 60 + (Math.random() * 2 - 1) * 22;
     const dx = targetX - muzzleX;
     const dy = targetY - muzzleY;
     const dist = Math.hypot(dx, dy) || 1;
@@ -1376,6 +1456,39 @@ export class EnemyController {
       };
     }
 
+    if (this.state === 'WINDUP' && this.attackPattern === 'DIVE') {
+      // OWNER: the jump-in telegraph. The body visibly COMPRESSES — hips
+      // drop, knees load, both hands swing up over the head — then the next
+      // frame is already airborne. This is the read: coil → leave the floor.
+      const coil = smoothstep(clamp(this.stateTimer / Math.max(0.05, this.windupDuration), 0, 1));
+      const drop = coil * 16;
+      return {
+        head: { x: px - f * (2 + coil * 3), y: py - 98 + drop },
+        neck: { x: px - f * 2, y: py - 86 + drop * 0.9 },
+        torso: { x: px - f * (2 + coil * 4), y: py - 70 + drop * 0.85 },
+        hips: { x: px - f * coil * 3, y: py - 50 + drop },
+        // Both arms load overhead — unmistakably about to drive down
+        leftShoulder: { x: px - f * 6, y: py - 84 + drop * 0.9 },
+        leftElbow: { x: px - f * (4 + coil * 6), y: py - 96 + drop * 0.8 },
+        leftHand: { x: px - f * (8 + coil * 7), y: py - 108 + drop * 0.7 },
+        rightShoulder: { x: px + f * 4, y: py - 84 + drop * 0.9 },
+        rightElbow: { x: px + f * (2 + coil * 5), y: py - 98 + drop * 0.8 },
+        rightHand: { x: px + f * (6 + coil * 8), y: py - 114 + drop * 0.6 },
+        // Deep knee load, both heels stay planted through the coil
+        leftHip: { x: px - 10, y: py - 50 + drop },
+        leftKnee: { x: px - f * (14 + coil * 9), y: py - 25 + coil * 5 },
+        leftFoot: { x: px - f * (18 + coil * 7), y: py },
+        rightHip: { x: px + 10, y: py - 50 + drop },
+        rightKnee: { x: px + f * (16 - coil * 5), y: py - 25 + coil * 5 },
+        rightFoot: { x: px + f * (22 - coil * 8), y: py - coil * 4 },
+        tieBase: { x: px, y: py - 84 + drop * 0.9 },
+        tieMid: { x: px - f * 2, y: py - 72 + drop * 0.85 },
+        tieTip: { x: px - f * 4, y: py - 60 + drop * 0.8 },
+        coatTailLeft: { x: px - 12, y: py - 44 + drop * 0.5 },
+        coatTailRight: { x: px + 12, y: py - 44 + drop * 0.5 },
+      };
+    }
+
     if (this.state === 'WINDUP') {
       // Progressive coil through the whole telegraph: the fist keeps pulling
       // back, the weight loads onto the rear foot, the lead heel lightens and
@@ -1418,6 +1531,40 @@ export class EnemyController {
       const ext = strikeCurve(beat, beatDur);
       const drive = Math.max(0, ext);
       const lead = Math.max(0, -ext);
+
+      if (this.attackPattern === 'DIVE') {
+        // OWNER: the airborne overhead. Long diagonal on the way down, the
+        // loaded hands whip from over the head through to chest-front on the
+        // drive. Keyed off absolute time rather than the shared strike curve
+        // because the dive runs a whole arc (launch → apex → land), not one
+        // strike beat.
+        const rise = smoothstep(clamp(this.stateTimer / 0.16, 0, 1));
+        const arm = smoothstep(clamp((this.stateTimer - 0.14) / 0.34, 0, 1));
+        const tuck = 1 - arm;
+        return {
+          head: { x: px + f * (8 + arm * 8), y: py - 96 - rise * 6 },
+          neck: { x: px + f * (6 + arm * 6), y: py - 84 - rise * 6 },
+          torso: { x: px + f * (3 + arm * 8), y: py - 66 - rise * 6 },
+          hips: { x: px + f * (2 + arm * 2), y: py - 46 - rise * 3 },
+          leftShoulder: { x: px + f * 2, y: py - 82 - rise * 6 },
+          leftElbow: { x: px + f * (-6 + arm * 26), y: py - 98 + arm * 34 - rise * 3 },
+          leftHand: { x: px + f * (-10 + arm * 44), y: py - 108 + arm * 56 - rise * 3 },
+          rightShoulder: { x: px + f * 8, y: py - 82 - rise * 6 },
+          rightElbow: { x: px + f * (-2 + arm * 30), y: py - 102 + arm * 38 - rise * 3 },
+          rightHand: { x: px + f * (-4 + arm * 52), y: py - 114 + arm * 64 - rise * 3 },
+          leftHip: { x: px - 6, y: py - 46 - rise * 3 },
+          leftKnee: { x: px - f * (10 + tuck * 12), y: py - 24 - rise * 8 - tuck * 8 },
+          leftFoot: { x: px - f * (14 + tuck * 10), y: py - rise * 16 - tuck * 12 },
+          rightHip: { x: px + 12, y: py - 46 - rise * 3 },
+          rightKnee: { x: px + f * (14 + tuck * 8), y: py - 24 - rise * 10 - tuck * 6 },
+          rightFoot: { x: px + f * (20 + tuck * 12), y: py - rise * 20 - tuck * 10 },
+          tieBase: { x: px + f * 2, y: py - 82 - rise * 6 },
+          tieMid: { x: px + f * 4, y: py - 70 - rise * 6 - tuck * 4 },
+          tieTip: { x: px + f * 6, y: py - 58 - rise * 6 - tuck * 8 },
+          coatTailLeft: { x: px - f * (10 + tuck * 6), y: py - 42 - rise * 3 },
+          coatTailRight: { x: px + f * (14 + tuck * 4), y: py - 42 - rise * 3 },
+        };
+      }
 
       if (this.attackPattern === 'SWEEP') {
         // Low sweep kick: support hand braces, the leg scythes through

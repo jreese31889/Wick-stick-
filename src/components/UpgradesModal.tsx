@@ -36,7 +36,7 @@ export const UpgradesModal: React.FC<UpgradesModalProps> = ({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="max-w-2xl w-full bg-[#0d0f15] border border-amber-500/30 rounded-2xl p-5 sm:p-6 shadow-[0_0_50px_rgba(245,158,11,0.2)] flex flex-col gap-4 text-neutral-200 relative animate-in fade-in zoom-in-95 duration-150">
+      <div className="max-w-2xl w-full bg-[#0d0f15] border border-amber-500/30 rounded-2xl p-5 sm:p-6 shadow-[0_0_50px_rgba(245,158,11,0.2)] flex flex-col gap-4 text-neutral-200 relative menu-in">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-amber-500/20 pb-3">
           <div className="flex items-center gap-3">

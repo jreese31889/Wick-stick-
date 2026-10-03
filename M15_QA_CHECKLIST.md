@@ -27,6 +27,11 @@ Item IDs: **A** movement · **B** combos · **C** gun-fu moves · **D** defense 
 | A-07 | Touch button feedback | Tap each of the 10 buttons | 15 ms haptic + press visual (`VC:125-131`); no stuck buttons after drag-off release |
 | A-08 | Input clearing | Start a stage, pause→Main Menu→re-enter | No ghost inputs fire on entry (`clearVirtualInputs` `App.tsx:237-247`) |
 | A-09 | Input buffer gap (known-open) | Press PUNCH during a dodge roll | **Current behavior: input is dropped** (no attack buffer, `PC:376-382`). Record actual behavior; this is design §6/§17 target not yet built — do not "fix" by expecting it |
+| A-10 | **Joystick jump** | Flick the left joystick UP (no JUMP button) | Rising edge arms the same 0.14 s jump buffer as JUMP (`PC` `stickUpEdge`), launches `JUMP_ASCENT`; keyboard/pad JUMP still works as an alternate |
+| A-11 | **Jump cut (variable height)** | Flick UP, release the stick before the apex | Arc cuts short on release (`velocity.y × 0.62`); holding UP gives the full arc — short-hop vs full-jump reads distinctly |
+| A-12 | **Joystick crouch** | Hold the left joystick DOWN | `CROUCH` state + `physics.isCrouching`; releasing stands back up to `IDLE`; holding DOWN after a crouch attack re-enters `CROUCH` on the same frame the attack lets go |
+| A-13 | Crouch shuffle | Crouch, then push the stick sideways | Shuffle at ~0.45× run speed while the `CROUCH` pose holds — slow enough to slip under a high strike, never enough to outrun a commit |
+| A-14 | Crouch vs slide | Hold DOWN, press DODGE | Still the LOW SLIDE (`PC:690-700`) — the dodge button keeps owning slide, the two never fight for a frame |
 
 ## B. Combos, finisher, HUD
 
@@ -43,6 +48,14 @@ Item IDs: **A** movement · **B** combos · **C** gun-fu moves · **D** defense 
 | B-09 | Combo meter charge (known-bug) | Any combo, then PUNCH+KICK chord | **Expected today: denial feedback only** — `comboMeter` is never written so `SPIN_SLASH`(5)/`EXECUTIONER`(15) can never fire (`PC:71,439`). Verify: no crash, light punch lands, `specialDenied` flash plays. **File as High bug if a special ever fires, or track the fix** |
 | B-10 | Style label | Sustain long/varied combo | Style badge climbs NOIR→BABA YAGA (`CD:1419-1424`), pause screen shows `styleRating` |
 | B-11 | Decay-bar overflow (known cosmetic) | Land a move that installs a 3.2–3.5 s window (knife hit, gun-fu crit, slam) | Bar may render beyond full width (normalized by 2.8 `RN:992`). Record; cosmetic |
+| B-12 | **Crouch light** | Hold DOWN, press PUNCH | `ATTACK_CROUCH_POKE`: 10 dmg, low fast strike, 0.04–0.14 s window, low hitbox (`y-68`) |
+| B-13 | **Crouch heavy → launcher** | Hold DOWN, PUNCH, PUNCH inside the 0.45 s chain window | Second press becomes `ATTACK_LAUNCHER`: 26 dmg rising uppercut, `knockbackY −430` launches the body airborne for a juggle; the step is spent, the next crouch PUNCH is a poke again |
+| B-14 | **Crouch kick → sweep** | Hold DOWN, press KICK | `ATTACK_SWEEP` on demand from the crouch (same 18 dmg trip as B-03) |
+| B-15 | **Air light** | Jump, press PUNCH | `ATTACK_AIR_LIGHT`: 12 dmg, 0.05–0.20 s window, momentum only brushed (`vx × 0.9`) so the jump keeps its arc |
+| B-16 | **Air kick routing** | Jump, press KICK — once slow, once at speed | Standing jump → `ATTACK_AIR_HEAVY` overhead slam (34 dmg, `isHeavy`, reach +14); ≥0.75× run speed carried → `ATTACK_FLYING_KICK` |
+| B-17 | **Air slam landing** | Jump, KICK, let the slam touch down | On the touchdown frame: `ATTACK_AIR_HEAVY` still holds for one frame (so the contact registers), then converts to `LAND`; dust both sides, ring shockwave ×2, sparks, 6-frame hit-stop, camera trauma 0.32 |
+| B-18 | **Landing commitment** | Land from the slam, immediately mash PUNCH / then DODGE | PUNCH is refused for the 0.22 s recovery; DODGE still opens on the same frame — the recovery never taxes responsiveness |
+| B-19 | Mid-air SPIN_SLASH / grounded EXECUTIONER | 5 pt special in the air; 15 pt special in the air | `SPIN_SLASH` fires mid-air (whirl is vertical); `EXECUTIONER` only fires grounded (`PC` special branch) |
 
 ## C. Gun-fu special moves (all implemented — verify each fires & reads correctly)
 
@@ -62,6 +75,8 @@ Item IDs: **A** movement · **B** combos · **C** gun-fu moves · **D** defense 
 | C-12 | Riposte cash-in | Within 0.15 s of the parry, land any attack | `PARRY RIPOSTE` banner, ×2.5 damage, speed lines (`CD:812-820`) |
 | C-13 | Riposte window expiry | Parry, wait >0.15 s, then attack | Normal damage, no riposte popup |
 | C-14 | Late block (not a parry) | Block >0.2 s before the hit lands | Normal block: chip damage, guard spark, no stagger (`CD:1015-1024`) |
+| C-15 | **Style credit for the new kit** | Land launcher / air slam / air light | `STYLE_PAYOUT` pays `LAUNCHER 11` and `AIR 9` (`CD`); popups `LAUNCHER`, `AIR SLAM`, `AIR` fire and the style rank climbs — no silent `registerStyle` drops |
+| C-16 | Guard crush on the heavy new moves | Block-check an enemy with air slam / launcher | Both carry `isHeavy` and sit on the guard-crush list (`CD`), so they crack a guard like the grounded heavies |
 
 ## D. Defense, stagger, death
 
@@ -75,6 +90,8 @@ Item IDs: **A** movement · **B** combos · **C** gun-fu moves · **D** defense 
 | D-06 | Player death flow | Let health reach 0 | 1.4 s slow-mo kill-cam → ragdoll spawn → `RUN OVER` end screen with stats (`GameLoop.ts:449-474`) |
 | D-07 | Death during hit-stop/slow-mo | Die right as a finisher lands | No double-transition, end screen shows once, engine frozen behind overlay |
 | D-08 | Dodge vs bullets | Roll through a GUNNER/SNIPER round | Complete miss (`CD:1116/1139`); sniper `pierceBlock` rounds must still be dodgeable and must bypass block (`types/game.ts:331`) |
+| D-09 | **Crouch vs melee (the high/low read)** | Crouch under an enemy JAB / HEAVY_HOOK / SLAM / DIVE, then under a SWEEP | High strikes whiff over you (torso folds to `y-26`, touch radius 24→10); **the floor-level SWEEP still connects** — crouch is a read, not an invulnerability button |
+| D-10 | **Crouch vs bullets** | Hold DOWN in a GUNNER/SNIPER lane | Torso drops out of the aimed band (`y-60` → `y-34`, hit radius 26→17) and rounds carry ±22 px vertical aim error, so most miss — but not all: confirm it is *strong cover*, not immunity |
 
 ## E. Weapons, guns, items
 
@@ -106,6 +123,9 @@ Item IDs: **A** movement · **B** combos · **C** gun-fu moves · **D** defense 
 | F-11 | Wall slam | Knock enemy into arena boundary | `WALL SLAM!` reaction + extra stagger (`EC:913-929`, `CD:315-327`) |
 | F-12 | AI throttle sanity | Let enemies idle far away (if any off-camera) | Distant IDLE/APPROACH enemies update at 20 Hz (`EC:365-384`) — no visible stutter/teleport when they re-engage |
 | F-13 | Ragdoll death | Kill enemies with heavy hits | Ragdoll tumbles, settles, fades ≤7 s; corpse stays until next spawn (`App.tsx:471`) |
+| F-14 | **DIVE jump-in** | Fight RUSHER / ACROBAT at 55–260 px | Both roll `DIVE`: 0.34 s visible crouch-coil telegraph (hips drop, both hands load overhead), then the body leaves the floor and drives an overhead down; the box tracks the arc at `position.y − 74` and it lands into `RECOVERY` — a real punish window |
+| F-15 | **The high/low triangle** | Crouch through the enemy kit | Crouch ducks JAB / HEAVY_HOOK / SLAM / DIVE (highs + overheads); `SWEEP` (low) still trips you; airborne rounds mostly sail over. Both sides of the triangle must be answerable — file it if crouching is ever a flat "no-sell" |
+| F-16 | Dive discipline | Watch 10+ RUSHER/ACROBAT attacks | Dive is chosen ~1/3 of the time and **only from ≥55 px**, on a longer cooldown (1.5–2.2 s) — never as a point-blank insta-burst |
 
 ## G. Levels, spawning, progression
 
@@ -195,7 +215,7 @@ Item IDs: **A** movement · **B** combos · **C** gun-fu moves · **D** defense 
 | # | Test | Steps | Expected |
 |---|---|---|---|
 | L-01 | Boundaries | Run to arena edges | Clamped ±840, wall bounce, no fall-out (`EC:889-942`) |
-| L-02 | Infinite combo exploit | Mash PUNCH on a downed enemy | No hit on `DOWNED` except slide/sweep (`CD:779`); no infinite juggle (no launcher exists) |
+| L-02 | Infinite combo / juggle exploit | Mash PUNCH on a downed enemy, then chain the crouch launcher | No hit on `DOWNED` except slide/sweep (`CD:779`). The `ATTACK_LAUNCHER` **now exists** (`B-13`): confirm a launched body cannot be re-launched while airborne (launcher does not re-fire on a juggle) and the juggle tops out — no infinite lift |
 | L-03 | Grab spam | Mash GRAB | Only one grapple at a time (`isGrappling` gate `CD:1045`) |
 | L-04 | Shoot-during-grapple double fire | Execution input | `pendingPistolShot` cleared so only the execution round fires (`CD:1074`) |
 | L-05 | Pause during hit-stop / slow-mo / kill-cam | Escape at those moments | No state desync; timers resume correctly; pause blocked during kill-cam |
@@ -209,6 +229,7 @@ Item IDs: **A** movement · **B** combos · **C** gun-fu moves · **D** defense 
 | L-13 | Gamepad disconnect mid-combo | Unplug pad | Falls back to touch/keyboard without crashing input poll (`IM:353-380`) |
 | L-14 | Zero enemies door | Reach door logic with empty array | `every()` on empty array = door opens immediately (`GameLoop.ts:338`) — confirm no false wave-clear recording |
 | L-15 | Console cleanliness | Full session, DevTools open | **Zero errors/warnings** (repo has no `console.*`; keep it that way) and zero 404s (assets/audio/ai) |
+| L-16 | Dive pinned at the arena wall | Let a `DIVE` launch carry an enemy into ±830 | Horizontal clamp holds, the arc still resolves into `RECOVERY` — no fall-out, no enemy stuck permanently airborne (`EC` `applyPhysics`) |
 
 ---
 

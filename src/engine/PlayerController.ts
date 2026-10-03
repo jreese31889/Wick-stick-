@@ -63,6 +63,28 @@ export class PlayerController {
   private jumpBufferTimer = 0;
   private coyoteTimer = 0;
 
+  // ---- OWNER 2026-10-03: JOYSTICK-DRIVEN STANCE (push UP = jump, hold DOWN = crouch)
+  /**
+   * Rising edge of the stick being pushed UP. The jump button keeps working —
+   * it is an alternate, never the only path (owner directive). Edge-triggered
+   * so holding the stick up does not machine-gun jumps on every landing.
+   */
+  private stickUpPrev = false;
+  /** Level of "stick is pushed up", used for the variable-height jump cut. */
+  private stickUpHeld = false;
+  /** Crouch-string progress: poke (0/1) then the rising-uppercut launcher. */
+  private crouchPunchStep = 0;
+  /**
+   * Landing commitment from an air attack (Shadow Fight weight): seconds
+   * before a NEW attack may start. Dodging and guarding stay open — the
+   * charter never trades responsiveness for weight.
+   */
+  private landingRecovery = 0;
+  /** One-shot: the air slam just touched down (CombatDirector fires the FX). */
+  public pendingLandingShockwave = false;
+  /** True once the air slam has found the floor — closes its strike window. */
+  private airSlamLanded = false;
+
   // PHASE 1B A9: buffered attack / dodge presses. A press that lands while
   // BLOCK, SLIDE, DODGE_ROLL or an attack recovery owns the controller is
   // held for INPUT_BUFFER seconds and spent the moment the lock clears —
@@ -165,6 +187,7 @@ export class PlayerController {
       isSliding: false,
       isDodging: false,
       isBlocking: false,
+      isCrouching: false,
       isWallSliding: false,
       aimAngle: null,
       state: 'IDLE',
@@ -484,8 +507,16 @@ export class PlayerController {
       this.precisionAim = false;
     }
 
+    // OWNER 2026-10-03 — the movement joystick itself drives the jump: a
+    // push/flick UP arms the exact same 140 ms buffer the JUMP button uses,
+    // so keyboard/pad/touch-JUMP stay as alternates and never the only path.
+    const stickUp = input.moveY < -0.55;
+    const stickUpEdge = stickUp && !this.stickUpPrev;
+    this.stickUpPrev = stickUp;
+    this.stickUpHeld = stickUp;
+
     // Godot Jump Buffer & Coyote Time timers
-    if (input.jumpJustPressed) {
+    if (input.jumpJustPressed || stickUpEdge) {
       this.jumpBufferTimer = 0.14; // 140ms jump buffer
     } else if (this.jumpBufferTimer > 0) {
       this.jumpBufferTimer -= dt;
@@ -497,10 +528,20 @@ export class PlayerController {
       this.coyoteTimer -= dt;
     }
 
-    // Godot Variable Jump Height (Jump Cut)
-    if (!input.jump && this.physics.velocity.y < -120 && !this.physics.grounded) {
+    // Godot Variable Jump Height (Jump Cut) — released either the button or
+    // the stick, so the joystick jump has the same short-hop control.
+    if (
+      !input.jump &&
+      !this.stickUpHeld &&
+      this.physics.velocity.y < -120 &&
+      !this.physics.grounded
+    ) {
       this.physics.velocity.y *= 0.62;
     }
+
+    // Landing commitment from the air kit: blocks starting a NEW attack for
+    // the recovery, never the dodge or the guard (charter: responsiveness).
+    if (this.landingRecovery > 0) this.landingRecovery = Math.max(0, this.landingRecovery - dt);
 
     // Regenerate stamina (boosted by Adrenaline Infusion)
     if (!this.physics.isBlocking && !this.physics.isDodging) {
@@ -642,6 +683,9 @@ export class PlayerController {
       // mid-move would stomp DODGE_ROLL back to IDLE while isDodging is still
       // true — 0.36 s of standing i-frames that swallow every input.
       this.physics.isBlocking = false;
+      // OWNER: the stance flag never travels with a dodge either
+      this.physics.isCrouching = false;
+      this.crouchPunchStep = 0;
       this.physics.stamina -= 15;
       const isCrouching = input.moveY > 0.4;
       const hasSpeed = Math.abs(this.physics.velocity.x) > 100;
@@ -680,6 +724,40 @@ export class PlayerController {
         this.setState('IDLE');
       }
       return;
+    }
+
+    // OWNER 2026-10-03 — JOYSTICK CROUCH: holding the movement stick DOWN
+    // holds the crouch, releasing stands up. The dodge trigger above still
+    // owns stick-down + DODGE (slide), so the two never fight for a frame.
+    // A crouch ATTACK keeps the stance alive through its own frames, so
+    // releasing the stick mid-swing does not cancel the move.
+    const stickCrouch = input.moveY > 0.55 && this.physics.grounded;
+    const inCrouchAttack =
+      this.physics.state === 'ATTACK_CROUCH_POKE' ||
+      this.physics.state === 'ATTACK_LAUNCHER' ||
+      this.physics.state === 'ATTACK_SWEEP';
+    if (stickCrouch && !this.physics.isBlocking && (!isAttacking || inCrouchAttack)) {
+      if (!this.physics.isCrouching) {
+        this.physics.isCrouching = true;
+        this.crouchPunchStep = 0;
+        this.setState('CROUCH');
+      } else if (
+        this.physics.state !== 'CROUCH' &&
+        !inCrouchAttack &&
+        (this.physics.state === 'IDLE' ||
+          this.physics.state === 'WALK' ||
+          this.physics.state === 'RUN' ||
+          this.physics.state === 'LAND')
+      ) {
+        // The stance owns the pose whenever it is held and no attack is
+        // playing — without this the fighter stands back up out of the crouch
+        // the frame after any attack finishes while the stick is still down.
+        this.setState('CROUCH');
+      }
+    } else if (this.physics.isCrouching && !inCrouchAttack) {
+      this.physics.isCrouching = false;
+      this.crouchPunchStep = 0;
+      if (this.physics.state === 'CROUCH') this.setState('IDLE');
     }
 
     // BULLET-TIME FOCUS TRIGGER
@@ -766,16 +844,18 @@ export class PlayerController {
     }
 
     // COMBO SPECIAL / SUPER — spends the combo meter (5 / 15 points)
+    // OWNER 2026-10-03: SPIN_SLASH also fires MID-AIR (the whirl is a
+    // vertical move); EXECUTIONER stays grounded (it is a body-slam).
     if (
       input.specialJustPressed &&
       !isAttacking &&
       !this.physics.isBlocking &&
       !this.physics.isDodging &&
       !this.physics.isSliding &&
-      this.physics.grounded &&
-      this.specialDenyCooldown <= 0
+      this.specialDenyCooldown <= 0 &&
+      (this.physics.grounded || this.comboMeter >= PlayerController.SPECIAL_COST)
     ) {
-      if (this.comboMeter >= PlayerController.SUPER_COST) {
+      if (this.comboMeter >= PlayerController.SUPER_COST && this.physics.grounded) {
         this.triggerSpecial('EXECUTIONER');
         return;
       }
@@ -792,12 +872,23 @@ export class PlayerController {
 
     // PUNCH BUTTON — jab / cross / spinning string (short reach, fast)
     // PHASE 1B A9: a press buffered through BLOCK / DODGE / SLIDE lands here.
+    // OWNER 2026-10-03: context resolves first — airborne = air light,
+    // crouched = the low kit — then the standing string.
     if (
       (input.attackJustPressed || this.punchBufferTimer > 0) &&
       !this.physics.isBlocking &&
-      !this.physics.isDodging
+      !this.physics.isDodging &&
+      this.landingRecovery <= 0
     ) {
       this.punchBufferTimer = 0;
+      if (!this.physics.grounded && !this.physics.isCrouching) {
+        this.triggerAirAttack('light');
+        return;
+      }
+      if (this.physics.isCrouching && this.physics.grounded) {
+        this.triggerCrouchAttack('punch');
+        return;
+      }
       if (this.finisherArmed) {
         this.triggerFinisher();
       } else {
@@ -810,9 +901,18 @@ export class PlayerController {
     if (
       (input.heavyAttackJustPressed || this.kickBufferTimer > 0) &&
       !this.physics.isBlocking &&
-      !this.physics.isDodging
+      !this.physics.isDodging &&
+      this.landingRecovery <= 0
     ) {
       this.kickBufferTimer = 0;
+      if (!this.physics.grounded && !this.physics.isCrouching) {
+        this.triggerKick();
+        return;
+      }
+      if (this.physics.isCrouching && this.physics.grounded) {
+        this.triggerCrouchAttack('kick');
+        return;
+      }
       if (this.finisherArmed) {
         this.triggerFinisher();
       } else {
@@ -829,6 +929,15 @@ export class PlayerController {
         // then recovers as soon as the minimum strike time has elapsed.
         if (this.physics.grounded && this.physics.stateTimer >= attackDuration) {
           this.setState('IDLE');
+        }
+      } else if (this.physics.state === 'ATTACK_AIR_HEAVY') {
+        // OWNER: the overhead slam holds through the fall, touches down, and
+        // converts to the LAND recovery on the following frame — commitment,
+        // not a free cancel (the landing shockwave fires on the touchdown
+        // frame itself, see handleMovement).
+        if (this.airSlamLanded) {
+          this.airSlamLanded = false;
+          this.setState('LAND');
         }
       } else if (this.physics.stateTimer >= attackDuration) {
         this.setState('IDLE');
@@ -902,8 +1011,91 @@ export class PlayerController {
     }
   }
 
+  /**
+   * OWNER 2026-10-03 — AIR LIGHT: fast airborne poke. Momentum is only
+   * brushed, so a jump keeps its arc; the pose retracts inside 0.22 s which
+   * is what makes it "safe".
+   */
+  private triggerAirAttack(kind: 'light'): void {
+    this.consumeWeaponOnStrike();
+    this.comboStep = 0;
+    this.comboTimer = 0;
+    this.runSustainTimer = 0;
+    this.physics.velocity.x *= 0.9;
+    this.setState('ATTACK_AIR_LIGHT');
+    SoundFX.playWhoosh(0.95);
+  }
+
+  /**
+   * OWNER 2026-10-03 — CROUCH KIT. Two buttons, three moves:
+   *   • CROUCH + PUNCH → low poke (fast, safe, chips)
+   *   • CROUCH + PUNCH again inside the chain window → rising uppercut
+   *     LAUNCHER that pops the body for a juggle
+   *   • CROUCH + KICK → ATTACK_SWEEP, the existing trip (wired to crouch)
+   */
+  private triggerCrouchAttack(kind: 'punch' | 'kick'): void {
+    this.consumeWeaponOnStrike();
+    const dir = this.physics.facingRight ? 1 : -1;
+
+    if (kind === 'kick') {
+      this.setState('ATTACK_SWEEP');
+      this.physics.velocity.x = dir * 210;
+      this.crouchPunchStep = 0;
+      this.comboStep = 0;
+      this.comboTimer = 0;
+      this.runSustainTimer = 0;
+      SoundFX.playWhoosh(0.95);
+      return;
+    }
+
+    if (this.crouchPunchStep === 1 && this.comboTimer > 0) {
+      // Crouch heavy: the rising uppercut
+      this.setState('ATTACK_LAUNCHER');
+      this.crouchPunchStep = 0;
+      this.comboTimer = 0;
+      this.physics.velocity.x = dir * 70;
+      SoundFX.playWhoosh(1.15);
+    } else {
+      this.setState('ATTACK_CROUCH_POKE');
+      this.crouchPunchStep = 1;
+      this.comboTimer = 0.45;
+      this.physics.velocity.x = dir * 60;
+      SoundFX.playWhoosh(0.9);
+    }
+    this.runSustainTimer = 0;
+  }
+
   /** KICK — contextual: LEG SWEEP ender, FLYING KICK out of a sprint, or power kick. */
   private triggerKick(): void {
+    // OWNER 2026-10-03 — AIR KIT: KICK while airborne. The FLYING KICK was
+    // previously only reachable from a grounded, sustained sprint — this is
+    // the input path the owner asked for. Momentum buys the flying kick;
+    // a slow jump gets the overhead slam instead.
+    if (!this.physics.grounded && !this.physics.isCrouching) {
+      this.consumeWeaponOnStrike();
+      this.comboStep = 0;
+      this.comboTimer = 0;
+      this.runSustainTimer = 0;
+      const carried = Math.abs(this.physics.velocity.x) >= this.runSpeed() * 0.75;
+      if (carried) {
+        const flyDir = Math.sign(this.physics.velocity.x) || (this.physics.facingRight ? 1 : -1);
+        this.physics.facingRight = flyDir > 0;
+        this.setState('ATTACK_FLYING_KICK');
+        this.physics.velocity.x = flyDir * Math.max(Math.abs(this.physics.velocity.x), 430);
+        SoundFX.playWhoosh(1.35);
+      } else {
+        this.physics.velocity.x *= 0.55;
+        this.setState('ATTACK_AIR_HEAVY');
+        SoundFX.playWhoosh(1.15);
+      }
+      return;
+    }
+
+    if (this.physics.isCrouching && this.physics.grounded) {
+      this.triggerCrouchAttack('kick');
+      return;
+    }
+
     // LEG SWEEP ender: PUNCH, PUNCH, KICK — the third chain hit drops low.
     if (this.comboTimer > 0 && this.comboStep === 2) {
       this.consumeWeaponOnStrike();
@@ -999,7 +1191,10 @@ export class PlayerController {
     // target (an exponential approach never arrives, which reads as input lag
     // at the top end of the stick).
     if (!this.physics.isDodging && !this.physics.isSliding && !this.physics.isBlocking && !isAttacking) {
-      const targetSpeed = input.moveX * this.runSpeed();
+      // OWNER: a crouched fighter shuffle-walks at half pace — enough to slip
+      // under a high strike, never enough to outrun a commit.
+      const crouchScale = this.physics.isCrouching ? 0.45 : 1;
+      const targetSpeed = input.moveX * this.runSpeed() * crouchScale;
 
       if (Math.abs(input.moveX) > 0.08) {
         this.physics.velocity.x = moveToward(
@@ -1073,7 +1268,20 @@ export class PlayerController {
       if (!this.physics.grounded) {
         // Just landed
         this.physics.grounded = true;
-        if (
+        const airHeavy = this.physics.state === 'ATTACK_AIR_HEAVY';
+        const airLight = this.physics.state === 'ATTACK_AIR_LIGHT';
+        if (airHeavy) {
+          // OWNER (Shadow Fight weight): the slam keeps its state for exactly
+          // one more frame so CombatDirector registers the contact on the
+          // touchdown frame, then the recovery branch converts it to LAND.
+          this.airSlamLanded = true;
+          this.pendingLandingShockwave = true;
+          this.landingRecovery = 0.22;
+        } else if (airLight) {
+          // Landing cancels the air poke straight into the LAND recovery.
+          this.landingRecovery = PlayerController.LAND_HOLD;
+          this.setState('LAND');
+        } else if (
           !inHurtFlinch &&
           !this.physics.isDodging &&
           !this.physics.isSliding &&
@@ -1089,7 +1297,28 @@ export class PlayerController {
     // State Selection for locomotion when not locked in action
     if (inHurtFlinch) {
       // Hold the flinch; locomotion takes back over the frame it decays.
-    } else if (this.physics.grounded && !this.physics.isDodging && !this.physics.isSliding && !this.physics.isBlocking && !isAttacking) {
+    } else if (
+      this.physics.grounded &&
+      !this.physics.isDodging &&
+      !this.physics.isSliding &&
+      !this.physics.isBlocking &&
+      !isAttacking &&
+      this.physics.isCrouching
+    ) {
+      // The stance owns the pose the instant an attack lets go of it —
+      // handleActions runs before the recovery can flip the state to IDLE,
+      // so without this the fighter stands tall for a frame between strikes.
+      if (!(this.physics.state === 'LAND' && this.physics.stateTimer < PlayerController.LAND_HOLD)) {
+        if (this.physics.state !== 'CROUCH') this.setState('CROUCH');
+      }
+    } else if (
+      this.physics.grounded &&
+      !this.physics.isDodging &&
+      !this.physics.isSliding &&
+      !this.physics.isBlocking &&
+      !isAttacking &&
+      !this.physics.isCrouching
+    ) {
       if (this.physics.state === 'LAND' && this.physics.stateTimer < PlayerController.LAND_HOLD) {
         // Stay in land compression briefly
       } else {
@@ -1155,6 +1384,11 @@ export class PlayerController {
       case 'ATTACK_KICK': return 0.34;
       case 'ATTACK_SWEEP': return 0.30;
       case 'ATTACK_FLYING_KICK': return 0.40;
+      // OWNER 2026-10-03 — joystick jump / crouch kit
+      case 'ATTACK_AIR_LIGHT': return 0.22;
+      case 'ATTACK_AIR_HEAVY': return 0.50; // holds to touchdown, then LAND
+      case 'ATTACK_CROUCH_POKE': return 0.16;
+      case 'ATTACK_LAUNCHER': return 0.34;
       case 'ATTACK_HEAVY': return 0.32;
       case 'ATTACK_SPECIAL': return 0.58;
       case 'ATTACK_SUPER': return 0.95;

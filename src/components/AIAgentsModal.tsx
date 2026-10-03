@@ -242,7 +242,7 @@ export const AIAgentsModal: React.FC<AIAgentsModalProps> = ({
 
   return (
     <div
-      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[56] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto animate-in fade-in duration-150"
+      className="safe-top safe-bottom safe-left safe-right fixed inset-0 z-[56] bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 overflow-y-auto menu-in"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -276,7 +276,7 @@ export const AIAgentsModal: React.FC<AIAgentsModalProps> = ({
 
         {/* Status Toast Banner */}
         {statusMessage && (
-          <div className="px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-mono flex items-center gap-2 animate-in fade-in">
+          <div className="px-3 py-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-mono flex items-center gap-2 menu-in">
             <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
             <span>{statusMessage}</span>
           </div>
@@ -427,7 +427,7 @@ export const AIAgentsModal: React.FC<AIAgentsModalProps> = ({
             </div>
 
             {expansionResult && (
-              <div className="p-4 rounded-xl bg-black/60 border border-amber-500/40 space-y-3 font-mono text-xs animate-in fade-in">
+              <div className="p-4 rounded-xl bg-black/60 border border-amber-500/40 space-y-3 font-mono text-xs menu-in">
                 <div className="flex items-center justify-between border-b border-white/10 pb-2">
                   <span className="font-black text-amber-300 text-sm uppercase">
                     {expansionResult.expansionName}

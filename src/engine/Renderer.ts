@@ -89,6 +89,9 @@ function copyPoseInto(src: StickFigurePose, dst: StickFigurePose): void {
   }
 }
 
+/** Shared deform record — returned by playerDeform() so the frame allocates nothing. */
+const DEFORM_SCRATCH = { x: 1, y: 1 };
+
 export class Renderer {
   private particles: DustParticle[] = [];
   private afterimages: Afterimage[] = [];
@@ -126,7 +129,14 @@ export class Renderer {
   private static readonly PARALLAX_NEAR = 1.25;
 
   /** Stage LUT grade — two gradients rebuilt only when the stage/size changes. */
+  private impactGrad: CanvasGradient | null = null;
+  private impactGradKey = '';
+  private impactGradCtx: CanvasRenderingContext2D | null = null;
   private gradeKey = '';
+  private gradeAmbience = '';
+  private gradeAccent = '';
+  private gradeW = 0;
+  private gradeH = 0;
   private gradeMultiply: CanvasGradient | null = null;
   private gradeScreen: CanvasGradient | null = null;
 
@@ -417,6 +427,9 @@ export class Renderer {
       this.grainPatternCtx = null;
       this.lampGlow = null;
       this.fixtureGlow = null;
+      this.impactGrad = null;
+      this.impactGradCtx = null;
+      this.impactGradKey = '';
     }
 
     ctx.clearRect(0, 0, width, height);
@@ -1177,14 +1190,29 @@ export class Renderer {
     if (bloom.life <= 0) return;
     const p = Math.max(0, bloom.life / bloom.maxLife);
     const radius = bloom.radius * (0.55 + (1 - p) * 0.75);
+
+    // One gradient per (rgb, radius) — built only when a new beat fires.
+    // Growth is a scale on the context, and fade is globalAlpha, so a live
+    // bloom costs zero allocations per frame.
+    const key = `${bloom.rgb}|${bloom.radius}`;
+    if (this.impactGradKey !== key || this.impactGradCtx !== ctx) {
+      const g = ctx.createRadialGradient(0, 0, 4, 0, 0, bloom.radius * 1.3);
+      g.addColorStop(0, `rgba(${bloom.rgb}, 0.5)`);
+      g.addColorStop(0.4, `rgba(${bloom.rgb}, 0.22)`);
+      g.addColorStop(1, `rgba(${bloom.rgb}, 0)`);
+      this.impactGrad = g;
+      this.impactGradKey = key;
+      this.impactGradCtx = ctx;
+    }
+
+    const scale = radius / (bloom.radius * 1.3);
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    const grad = ctx.createRadialGradient(bloom.x, bloom.y, 4, bloom.x, bloom.y, radius);
-    grad.addColorStop(0, `rgba(${bloom.rgb}, ${(0.5 * p).toFixed(3)})`);
-    grad.addColorStop(0.4, `rgba(${bloom.rgb}, ${(0.22 * p).toFixed(3)})`);
-    grad.addColorStop(1, `rgba(${bloom.rgb}, 0)`);
-    ctx.fillStyle = grad;
-    ctx.fillRect(bloom.x - radius, bloom.y - radius, radius * 2, radius * 2);
+    ctx.globalAlpha = p;
+    ctx.translate(bloom.x, bloom.y);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = this.impactGrad;
+    ctx.fillRect(-bloom.radius * 1.3, -bloom.radius * 1.3, bloom.radius * 2.6, bloom.radius * 2.6);
     ctx.restore();
   }
 
@@ -1564,21 +1592,26 @@ export class Renderer {
    * already carries the knee bend), so no combat value reads it.
    */
   private playerDeform(player: PlayerController): { x: number; y: number } {
+    // One shared scratch record — the hot path never allocates.
+    const out = DEFORM_SCRATCH;
+    out.x = 1;
+    out.y = 1;
     const state = player.physics.state;
     const t = player.physics.stateTimer;
     if (state === 'LAND' && t < 0.14) {
       const k = 1 - t / 0.14;
-      return { x: 1 + 0.16 * k, y: 1 - 0.2 * k };
-    }
-    if (state === 'HURT' && t < 0.12) {
+      out.x = 1 + 0.16 * k;
+      out.y = 1 - 0.2 * k;
+    } else if (state === 'HURT' && t < 0.12) {
       const k = 1 - t / 0.12;
-      return { x: 1 - 0.1 * k, y: 1 - 0.12 * k };
-    }
-    if (state === 'KNOCKBACK' && t < 0.16) {
+      out.x = 1 - 0.1 * k;
+      out.y = 1 - 0.12 * k;
+    } else if (state === 'KNOCKBACK' && t < 0.16) {
       const k = 1 - t / 0.16;
-      return { x: 1 - 0.08 * k, y: 1 - 0.1 * k };
+      out.x = 1 - 0.08 * k;
+      out.y = 1 - 0.1 * k;
     }
-    return { x: 1, y: 1 };
+    return out;
   }
 
   /**
@@ -1656,19 +1689,33 @@ export class Renderer {
     if (this.quality === 'low' || !env) return;
     const ambience = env.config.ambienceColor;
     const accent = env.config.accentColor;
-    const key = `${ambience}|${accent}|${width}x${height}`;
-    if (this.gradeKey !== key) {
+    // Field comparisons instead of a template-string key: identical
+    // semantics, zero per-frame allocation.
+    if (
+      this.gradeKey === '' ||
+      this.gradeAmbience !== ambience ||
+      this.gradeAccent !== accent ||
+      this.gradeW !== width ||
+      this.gradeH !== height
+    ) {
+      // ambienceColor is near-black in every stage, so multiply ≈ darkening
+      // toward that hue. Kept under the vignette's own falloff so the corners
+      // grade rather than crush.
       const shadow = ctx.createLinearGradient(0, 0, 0, height);
-      shadow.addColorStop(0, withAlpha(ambience, 0.2));
-      shadow.addColorStop(0.5, withAlpha(ambience, 0.07));
-      shadow.addColorStop(1, withAlpha(ambience, 0.24));
+      shadow.addColorStop(0, withAlpha(ambience, 0.14));
+      shadow.addColorStop(0.5, withAlpha(ambience, 0.05));
+      shadow.addColorStop(1, withAlpha(ambience, 0.18));
       const lift = ctx.createLinearGradient(0, 0, 0, height);
       lift.addColorStop(0, withAlpha(accent, 0.11));
       lift.addColorStop(0.45, withAlpha(accent, 0.03));
       lift.addColorStop(1, 'rgba(0, 0, 0, 0)');
       this.gradeMultiply = shadow;
       this.gradeScreen = lift;
-      this.gradeKey = key;
+      this.gradeKey = 'grade';
+      this.gradeAmbience = ambience;
+      this.gradeAccent = accent;
+      this.gradeW = width;
+      this.gradeH = height;
     }
 
     ctx.save();

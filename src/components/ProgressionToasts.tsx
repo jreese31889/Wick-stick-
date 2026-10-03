@@ -58,7 +58,7 @@ export const ProgressionToasts: React.FC<{ toasts: ProgressToast[] }> = ({ toast
         return (
           <div
             key={toast.id}
-            className={`min-w-[240px] max-w-[92vw] rounded-xl bg-[#0d0f15]/95 backdrop-blur-md border px-4 py-2.5 flex items-center gap-3 animate-in fade-in slide-in-from-top-4 duration-200 ${style.frame}`}
+            className={`min-w-[240px] max-w-[92vw] rounded-xl bg-[#0d0f15]/95 backdrop-blur-md border px-4 py-2.5 flex items-center gap-3 toast-in ${style.frame}`}
           >
             <div className={`p-2 rounded-lg bg-white/5 shrink-0 ${style.iconClass}`}>
               <Icon className="w-5 h-5" />

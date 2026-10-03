@@ -13,6 +13,7 @@ export type AnimationState =
   | 'SLIDE'
   | 'DODGE_ROLL'
   | 'BLOCK'
+  | 'CROUCH'
   | 'ATTACK_LIGHT_1'
   | 'ATTACK_LIGHT_2'
   | 'ATTACK_LIGHT_3'
@@ -20,6 +21,14 @@ export type AnimationState =
   | 'ATTACK_KICK'
   | 'ATTACK_SWEEP'
   | 'ATTACK_FLYING_KICK'
+  /** OWNER 2026-10-03: air kit — fast poke off a joystick jump. */
+  | 'ATTACK_AIR_LIGHT'
+  /** OWNER 2026-10-03: air kit — overhead slam, lands into a shockwave. */
+  | 'ATTACK_AIR_HEAVY'
+  /** OWNER 2026-10-03: crouch kit — fast, safe, chip damage. */
+  | 'ATTACK_CROUCH_POKE'
+  /** OWNER 2026-10-03: crouch kit — rising uppercut launcher (juggle starter). */
+  | 'ATTACK_LAUNCHER'
   | 'ATTACK_GUN_SHOT'
   | 'ATTACK_SPECIAL'
   | 'ATTACK_SUPER'
@@ -102,6 +111,14 @@ export interface PlayerPhysics {
   isSliding: boolean;
   isDodging: boolean;
   isBlocking: boolean;
+  /**
+   * OWNER 2026-10-03 — joystick stance: holding the movement stick DOWN holds
+   * a crouch. Crouching shrinks the hurtbox (high strikes whiff over you) and
+   * unlocks the low kit (`ATTACK_CROUCH_POKE` / `ATTACK_SWEEP` /
+   * `ATTACK_LAUNCHER`). CombatDirector reads it for the hurtbox, so it is a
+   * physics fact, not a render flag.
+   */
+  isCrouching?: boolean;
   isWallSliding?: boolean;
   aimAngle?: number | null;
   state: AnimationState;
