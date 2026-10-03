@@ -38,6 +38,7 @@ import { useLandscapeLock, shouldShowRotateHint } from './hooks/useLandscapeLock
 import { MainMenu } from './components/MainMenu';
 import { PauseMenu } from './components/PauseMenu';
 import { OptionsModal } from './components/OptionsModal';
+import { TouchLayoutEditor } from './components/TouchLayoutEditor';
 import { StageSelectModal, STAGES, getNextStage } from './components/StageSelectModal';
 import type { StageDef } from './components/StageSelectModal';
 import { GameOverScreen } from './components/GameOverScreen';
@@ -50,7 +51,8 @@ import {
   saveProgress,
   saveSettings,
 } from './components/settings';
-import type { GameProgress, GameSettings } from './components/settings';
+import type { GameProgress, GameSettings, TouchControlId, TouchLayout } from './components/settings';
+import { initBackButton, exitApp, setScreenAwake, isNativePlatform, installTouchGuards } from './platform/Platform';
 import {
   loadProfile,
   saveProfile,
@@ -241,6 +243,11 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
   const [rotateDismissed, setRotateDismissed] = useState(false);
+  // PHASE 3 2: touch layout editor (draft saved only on "Save layout")
+  const [layoutEditorOpen, setLayoutEditorOpen] = useState(false);
+  const [layoutDraft, setLayoutDraft] = useState<TouchLayout | null>(null);
+  // PHASE 3 5: Android back at the root screen → confirm before leaving
+  const [showExitConfirm, setShowExitConfirm] = useState(false);
 
   // Persistent settings (audio / graphics / HUD) + career progression
   const [settings, setSettings] = useState<GameSettings>(loadSettings);
@@ -294,7 +301,7 @@ export default function App() {
     input.setVirtualAim(0, 0, false);
     const buttons = [
       'jump', 'dodge', 'attack', 'heavy', 'block',
-      'grab', 'shoot', 'reload', 'interact', 'focus', 'special',
+      'grab', 'shoot', 'reload', 'interact', 'focus', 'special', 'swap',
     ] as const;
     for (const button of buttons) input.setVirtualButton(button, false);
   }, [gameLoop]);
@@ -321,12 +328,15 @@ export default function App() {
 
   const togglePause = useCallback(() => {
     // Pause only exists mid-run: never from the title, game-over or victory.
+    // PHASE 3 2: the layout editor owns the screen, so pausing/resuming is
+    // locked out until it is saved or cancelled.
+    if (layoutEditorOpen) return;
     if (!hasStarted || gameLoop.isGameOver || victoryOpenRef.current) return;
     const willPause = !gameLoop.isPaused;
     if (willPause) clearVirtualInputs();
     gameLoop.togglePause();
     setTick(t => (t + 1) % 1000);
-  }, [gameLoop, hasStarted, clearVirtualInputs]);
+  }, [gameLoop, hasStarted, clearVirtualInputs, layoutEditorOpen]);
 
   const togglePauseRef = useRef(togglePause);
 
@@ -591,6 +601,7 @@ export default function App() {
       setShowAppearance(false);
       setShowAchievements(false);
       setShowProfile(false);
+      setLayoutEditorOpen(false);
       SoundFX.playDoorOpen();
     },
     [gameLoop, lockLandscape, clearVirtualInputs, resetRunTelemetry]
@@ -621,6 +632,8 @@ export default function App() {
     setShowAppearance(false);
     setShowAchievements(false);
     setShowProfile(false);
+    setLayoutEditorOpen(false);
+    setShowExitConfirm(false);
     setTick(t => (t + 1) % 1000);
   }, [gameLoop, clearVirtualInputs, resetRunTelemetry, bankCoins, commitProfile]);
 
@@ -680,6 +693,25 @@ export default function App() {
     setSettings(prev => ({ ...prev, ...patch }));
   }, []);
 
+  /* PHASE 3 2 — touch layout editor session -------------------------- */
+  const openLayoutEditor = useCallback(() => {
+    setLayoutDraft(settings.touchLayout);
+    setShowOptions(false);
+    setLayoutEditorOpen(true);
+  }, [settings.touchLayout]);
+
+  const moveLayoutControl = useCallback((id: TouchControlId, offset: { x: number; y: number }) => {
+    setLayoutDraft(prev => ({
+      preset: 'custom',
+      offsets: { ...(prev?.offsets ?? {}), [id]: offset },
+    }));
+  }, []);
+
+  const saveLayoutEditor = useCallback(() => {
+    updateSettings({ touchLayout: layoutDraft });
+    setLayoutEditorOpen(false);
+  }, [updateSettings, layoutDraft]);
+
   // Settings → engine + document (quality tier drives the CSS effect budget)
   useEffect(() => {
     applyQuality(settings.quality);
@@ -689,6 +721,15 @@ export default function App() {
     gameLoop.quality = settings.quality;
     // PHASE 1B E6: gameplay haptics gate (pad rumble + phone vibration)
     Haptics.enabled = settings.haptics;
+    // PHASE 3 1: gamepad deadzones + stick sensitivity
+    gameLoop.inputManager.applyTuning({
+      moveDeadzone: settings.padMoveDeadzone,
+      aimDeadzone: settings.padAimDeadzone,
+      moveSensitivity: settings.padMoveSensitivity,
+      aimSensitivity: settings.padAimSensitivity,
+    });
+    // PHASE 3 4: aim magnetism level (mirrored through GameLoop so fullReset keeps it)
+    gameLoop.aimAssist = settings.aimAssist;
     setIsMuted(settings.sfxVolume === 0);
     saveSettings(settings);
     // PHASE 2: settings ride along in the profile (audio/graphics survive a wipe)
@@ -714,34 +755,108 @@ export default function App() {
     gameLoop.inputManager.onPauseRequested = () => {
       togglePauseRef.current();
     };
-    gameLoop.inputManager.onGamepadChange = () => {
+    gameLoop.inputManager.onGamepadChange = (status) => {
       setTick(t => (t + 1) % 1000);
+      // PHASE 3 1: announce connect/disconnect so the player knows which
+      // input device owns the fight right now.
+      pushToast(
+        status.connected
+          ? { kind: 'info', title: 'GAMEPAD CONNECTED', body: `${status.name} — standard layout active` }
+          : { kind: 'info', title: 'GAMEPAD DISCONNECTED', body: 'Touch controls remain active' }
+      );
     };
-  }, [gameLoop]);
+  }, [gameLoop, pushToast]);
 
   const isPaused = gameLoop.isPaused;
   const isGameOver = gameLoop.isGameOver;
+
+  // Escape / Android back both run this shared overlay stack so a system
+  // back press can never do something the Escape key wouldn't.
+  const closeTopmostOverlay = useCallback((): boolean => {
+    if (showExitConfirm) {
+      setShowExitConfirm(false);
+      return true;
+    }
+    if (layoutEditorOpen) {
+      setLayoutEditorOpen(false);
+      return true;
+    }
+    if (showOptions) setShowOptions(false);
+    else if (showStageSelect) setShowStageSelect(false);
+    else if (showHowToPlay) setShowHowToPlay(false);
+    else if (showHelp) setShowHelp(false);
+    else if (showUpgrades) setShowUpgrades(false);
+    else if (showAppearance) setShowAppearance(false);
+    else if (showAchievements) setShowAchievements(false);
+    else if (showProfile) setShowProfile(false);
+    else if (showPerks) setShowPerks(false);
+    else if (showMilestones) setShowMilestones(false);
+    else if (showAIAgents) setShowAIAgents(false);
+    else return false;
+    return true;
+  }, [
+    showExitConfirm,
+    layoutEditorOpen,
+    showOptions,
+    showStageSelect,
+    showHowToPlay,
+    showHelp,
+    showPerks,
+    showMilestones,
+    showAIAgents,
+    showUpgrades,
+    showAppearance,
+    showAchievements,
+    showProfile,
+  ]);
 
   // Escape closes the topmost dialog, otherwise it toggles the pause menu
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      if (showOptions) setShowOptions(false);
-      else if (showStageSelect) setShowStageSelect(false);
-      else if (showHowToPlay) setShowHowToPlay(false);
-      else if (showHelp) setShowHelp(false);
-      else if (showUpgrades) setShowUpgrades(false);
-      else if (showAppearance) setShowAppearance(false);
-      else if (showAchievements) setShowAchievements(false);
-      else if (showProfile) setShowProfile(false);
-      else if (showPerks) setShowPerks(false);
-      else if (showMilestones) setShowMilestones(false);
-      else if (showAIAgents) setShowAIAgents(false);
-      else if (hasStarted && !isGameOver && !showVictory) togglePauseRef.current();
+      if (closeTopmostOverlay()) return;
+      if (hasStarted && !isGameOver && !showVictory) togglePauseRef.current();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [showOptions, showStageSelect, showHowToPlay, showHelp, showPerks, showMilestones, showAIAgents, showUpgrades, showAppearance, showAchievements, showProfile, hasStarted, isGameOver, showVictory]);
+  }, [closeTopmostOverlay, hasStarted, isGameOver, showVictory]);
+
+  /**
+   * PHASE 3 5 — the one system-back policy (Android hardware back, browser
+   * back, and the same rules Escape follows). Returns true when the press was
+   * consumed: close topmost overlay → pause an active run → resume a paused
+   * run → quit a finished run to the title → confirm exit at the root screen.
+   */
+  const handleSystemBack = useCallback((): boolean => {
+    if (closeTopmostOverlay()) return true;
+    if (hasStarted && !isGameOver && !victoryOpenRef.current) {
+      togglePauseRef.current(); // active run → pause; paused run → resume
+      return true;
+    }
+    if (hasStarted) {
+      goToTitle(); // game over / victory → title screen
+      return true;
+    }
+    setShowExitConfirm(true); // root screen → explicit confirm, never a dead tap
+    return true;
+  }, [closeTopmostOverlay, hasStarted, isGameOver, goToTitle]);
+
+  const backHandlerRef = useRef(handleSystemBack);
+  useEffect(() => {
+    backHandlerRef.current = handleSystemBack;
+  });
+
+  // PHASE 3 5/6: wire the platform back gesture (Android hardware back,
+  // browser back) and the pinch/double-tap zoom guards once at boot.
+  useEffect(() => {
+    void initBackButton(() => backHandlerRef.current());
+    installTouchGuards();
+  }, []);
+
+  // PHASE 3 6: hold the screen awake while a run is on screen
+  useEffect(() => {
+    setScreenAwake(hasStarted && !isGameOver && !showVictory);
+  }, [hasStarted, isGameOver, showVictory]);
 
   // Run tracker: clock, kill tally, wave-clear progression and victory detection
   useEffect(() => {
@@ -877,8 +992,14 @@ export default function App() {
       {/* 1b. CINEMATIC VIGNETTE — only mounted at the Cinematic graphics tier */}
       <div className="menu-vignette" aria-hidden="true" />
 
-      {/* 2. TOP HUD LAYER */}
-      <header className="absolute top-0 left-0 right-0 p-3 sm:p-5 pointer-events-none z-30 grid grid-cols-[1fr_auto] gap-x-2 gap-y-2 sm:flex sm:items-start sm:justify-between sm:gap-0">
+      {/* 2. TOP HUD LAYER (hidden while the layout editor owns the screen) */}
+      <header
+        className="absolute top-0 left-0 right-0 p-3 sm:p-5 pointer-events-none z-30 grid grid-cols-[1fr_auto] gap-x-2 gap-y-2 sm:flex sm:items-start sm:justify-between sm:gap-0"
+        style={{
+          display: layoutEditorOpen ? 'none' : undefined,
+          opacity: settings.hudOpacity !== 100 ? settings.hudOpacity / 100 : undefined,
+        }}
+      >
         {/* PLAYER STATUS (Health, Stamina, Tactical Ammo) */}
         <div className="flex flex-col gap-1.5 pointer-events-auto bg-black/60 backdrop-blur-md px-3.5 py-2.5 rounded-xl border border-white/10 shadow-2xl sm:order-1">
           <div className="flex items-center justify-between gap-4">
@@ -1068,7 +1189,7 @@ export default function App() {
           {anyStaggered && (
             <div className="px-3.5 py-1 rounded-full bg-amber-500/20 border border-amber-400 text-amber-300 text-xs font-bold tracking-wider animate-bounce flex items-center gap-1.5 shadow-xl">
               <Zap className="w-3.5 h-3.5 text-amber-400" />
-              ENEMY STAGGERED • TAP GRAB / RB FOR TAKEDOWN!
+              ENEMY STAGGERED • TAP GRAB / R3 FOR TAKEDOWN!
             </div>
           )}
 
@@ -1306,16 +1427,18 @@ export default function App() {
                   Type-C Gamepad Controls (Kishi / Backbone)
                 </div>
                 <div className="text-neutral-300"><span className="text-white font-semibold">Left Stick / D-Pad:</span> Locomotion & Slide Aim</div>
+                <div className="text-neutral-300"><span className="text-sky-300 font-semibold">Right Stick:</span> Twin-stick aim (precision aim model)</div>
                 <div className="text-neutral-300"><span className="text-sky-300 font-semibold">A / Cross:</span> Jump Ascent</div>
                 <div className="text-neutral-300"><span className="text-emerald-300 font-semibold">B / Circle:</span> Combat Dodge Roll / Slide</div>
-                <div className="text-neutral-300"><span className="text-rose-300 font-semibold">X / Square:</span> PUNCH — jab / cross / spin string</div>
-                <div className="text-neutral-300"><span className="text-amber-300 font-semibold">Y / Triangle:</span> KICK — long-reach power kick (guard break)</div>
-                <div className="text-neutral-300"><span className="text-blue-300 font-semibold">LB / L1:</span> Guard Block / Perfect Parry</div>
-                <div className="text-neutral-300"><span className="text-yellow-300 font-semibold">RB / R1:</span> Grab / Close-Quarters Takedown</div>
-                <div className="text-neutral-300"><span className="text-neutral-400 font-semibold">LT / L2:</span> Tactical Pistol Reload</div>
+                <div className="text-neutral-300"><span className="text-neutral-300 font-semibold">X / Square:</span> Context — enter door / tactical reload</div>
+                <div className="text-neutral-300"><span className="text-amber-300 font-semibold">Y / Triangle:</span> Cycle Firearms (pistol → SMG → shotgun → rifle)</div>
+                <div className="text-neutral-300"><span className="text-rose-300 font-semibold">LB / L1:</span> PUNCH — jab / cross / spin string</div>
+                <div className="text-neutral-300"><span className="text-amber-300 font-semibold">RB / R1:</span> KICK — long-reach power kick (guard break)</div>
+                <div className="text-neutral-300"><span className="text-blue-300 font-semibold">L3 (click):</span> Guard Block / Perfect Parry</div>
+                <div className="text-neutral-300"><span className="text-orange-300 font-semibold">R3 (click):</span> Grab / Close-Quarters Takedown</div>
+                <div className="text-neutral-300"><span className="text-neutral-400 font-semibold">LT / L2 (hold):</span> Precision Aim — laser + tightened spread</div>
                 <div className="text-neutral-300"><span className="text-amber-400 font-semibold">RT / R2:</span> Gun-Fu Fire / Shotgun / Throw</div>
-                <div className="text-neutral-300"><span className="text-purple-300 font-semibold">Select / R3:</span> Bullet-Time Focus</div>
-                <div className="text-neutral-300"><span className="text-sky-300 font-semibold">L3:</span> Cycle Firearms (pistol → SMG → shotgun → rifle)</div>
+                <div className="text-neutral-300"><span className="text-purple-300 font-semibold">Select / Share:</span> Bullet-Time Focus</div>
                 <div className="text-neutral-300"><span className="text-neutral-400 font-semibold">Start / Menu:</span> Tactical Pause Menu</div>
               </div>
 
@@ -1327,6 +1450,8 @@ export default function App() {
                 </div>
                 <div className="text-neutral-400">• <span className="text-white font-semibold">Left Thumb:</span> 360° dynamic virtual joystick for running and sliding.</div>
                 <div className="text-neutral-400">• <span className="text-white font-semibold">Right Thumb:</span> Big PUNCH + KICK hero buttons, plus block, dodge, jump and gun cluster.</div>
+                <div className="text-neutral-400">• <span className="text-amber-300 font-semibold">Swipes:</span> Flick right on the look area to swap, flick down to reload, two-finger tap for focus.</div>
+                <div className="text-neutral-400">• <span className="text-sky-300 font-semibold">Layout:</span> Options → Touch Controls resizes the buttons and lets you drag every control into place.</div>
                 <div className="text-neutral-400">• <span className="text-rose-300 font-semibold">Combos:</span> Chain hits inside the timing window — damage scales up and every 5 hits loads a FINISHER.</div>
                 <div className="text-neutral-400">• <span className="text-yellow-300 font-semibold">Gun-Fu Double Tap:</span> Tap Shoot at point-blank range (&lt;95px) for critical slow-mo executions.</div>
                 <div className="text-neutral-400">• <span className="text-sky-300 font-semibold">Guard Break:</span> Tap KICK when enemies guard (🛡️ GUARD) to shatter stance!</div>
@@ -1667,7 +1792,9 @@ export default function App() {
       )}
 
       {/* 6. TACTICAL PAUSE MENU OVERLAY */}
-      {hasStarted && isPaused && !isGameOver && !showVictory && (
+      {/* 6. PAUSE MENU (hidden while the layout editor is open so the live
+          controls stay visible and draggable) */}
+      {hasStarted && isPaused && !isGameOver && !showVictory && !layoutEditorOpen && (
         <PauseMenu
           gameLoop={gameLoop}
           runTimeSec={runTimeSec}
@@ -1688,14 +1815,31 @@ export default function App() {
         />
       )}
 
-      {/* 7. MOBILE ON-SCREEN VIRTUAL CONTROLS (gameplay only — never over title/end screens) */}
-      {hasStarted && !isGameOver && !showVictory && (
+      {/* 7. MOBILE ON-SCREEN VIRTUAL CONTROLS (gameplay + layout editing) */}
+      {(hasStarted && !isGameOver && !showVictory) || layoutEditorOpen ? (
         <VirtualControls
           inputManager={gameLoop.inputManager}
           equippedWeapon={physics.equippedWeapon}
           nearDoor={isNearDoor}
+          buttonScale={settings.touchButtonScale / 100}
+          layout={layoutEditorOpen ? layoutDraft : settings.touchLayout}
+          editing={layoutEditorOpen}
+          gesturesEnabled={settings.swipeGestures}
+          opacity={settings.hudOpacity}
+          onMoveControl={moveLayoutControl}
         />
-      )}
+      ) : null}
+
+      {/* 7a. PHASE 3 2 — drag-to-place touch layout editor */}
+      <TouchLayoutEditor
+        isOpen={layoutEditorOpen}
+        layout={layoutDraft}
+        onChange={setLayoutDraft}
+        onDefault={() => setLayoutDraft(null)}
+        onRevert={() => setLayoutDraft(settings.touchLayout)}
+        onSave={saveLayoutEditor}
+        onCancel={() => setLayoutEditorOpen(false)}
+      />
 
       {/* 6b. PHASE 2 — level-up / unlock / achievement toasts */}
       <ProgressionToasts toasts={toasts} />
@@ -1717,7 +1861,12 @@ export default function App() {
       />
 
       {/* 8b. HOW TO PLAY — compact real-bindings legend (title screen + pause menu) */}
-      <HowToPlayModal isOpen={showHowToPlay} onClose={() => setShowHowToPlay(false)} />
+      <HowToPlayModal
+        isOpen={showHowToPlay}
+        onClose={() => setShowHowToPlay(false)}
+        padConnected={gameLoop.inputManager.gamepadStatus.connected}
+        padName={gameLoop.inputManager.gamepadStatus.name}
+      />
 
       {/* 8c. PHASE 2 — Safehouse upgrades (coins → permanent tiers) */}
       <UpgradesModal
@@ -1783,12 +1932,15 @@ export default function App() {
         />
       )}
 
-      {/* 11. OPTIONS — sound volume, graphics quality & HUD */}
+      {/* 11. OPTIONS — sound volume, graphics quality, HUD & PHASE 3 controls */}
       <OptionsModal
         isOpen={showOptions}
         settings={settings}
         onChange={updateSettings}
         onResetProfile={handleResetProfile}
+        onEditLayout={openLayoutEditor}
+        padConnected={gameLoop.inputManager.gamepadStatus.connected}
+        padName={gameLoop.inputManager.gamepadStatus.name}
         onClose={() => setShowOptions(false)}
       />
 
@@ -1799,6 +1951,41 @@ export default function App() {
         onSelect={startStage}
         onClose={() => setShowStageSelect(false)}
       />
+
+      {/* 13. PHASE 3 5 — back gesture at the root screen asks before leaving */}
+      {showExitConfirm && (
+        <div className="fixed inset-0 z-[80] bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="menu-in w-full max-w-sm bg-[#0d0f15] border border-amber-500/40 rounded-2xl p-5 shadow-[0_0_60px_rgba(245,158,11,0.25)] flex flex-col gap-4 text-neutral-200 text-center">
+            <div>
+              <h2 className="text-base font-black uppercase tracking-widest text-amber-300 font-mono">
+                Leave John Stick?
+              </h2>
+              <p className="text-[11px] font-mono text-neutral-400 mt-2 leading-relaxed">
+                {isNativePlatform()
+                  ? 'Progress is saved — the app closes on exit.'
+                  : 'Progress is saved — close this tab to quit.'}
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => setShowExitConfirm(false)}
+                className="min-h-[44px] rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-300 font-black uppercase tracking-widest text-xs transition-colors cursor-pointer"
+              >
+                Stay
+              </button>
+              <button
+                onClick={() => {
+                  setShowExitConfirm(false);
+                  exitApp();
+                }}
+                className="min-h-[44px] rounded-xl bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white font-black uppercase tracking-widest text-xs transition-transform active:scale-95 cursor-pointer"
+              >
+                Exit
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

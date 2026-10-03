@@ -224,6 +224,12 @@ export class CombatDirector {
   // P5-02: FX budgets per quality tier (high == the static defaults above;
   // pools stay sized for high so a mid-run tier switch never overflows).
   public quality: 'low' | 'medium' | 'high' = 'high';
+  /**
+   * PHASE 3 4 — aim magnetism level. `low` reproduces the shipped PHASE 1B
+   * cone exactly (12° / 700 px); `off` disables it; `high` widens to 20° / 900 px.
+   * GameLoop mirrors settings.aimAssist in here (re-applied after fullReset).
+   */
+  public aimAssist: 'off' | 'low' | 'high' = 'low';
   public get sparkCap(): number {
     return this.quality === 'high' ? CombatDirector.MAX_SPARKS : this.quality === 'medium' ? 180 : 100;
   }
@@ -807,13 +813,33 @@ export class CombatDirector {
     let ang = aim;
     const mx = player.physics.position.x + (Math.cos(ang) >= 0 ? 34 : -34);
     const my = player.physics.position.y - 62;
-    const ASSIST = 0.2094; // 12°
-    let bestDiff = ASSIST;
+
+    // PHASE 3 4 — magnetism cone/range per setting. Low is byte-for-byte the
+    // shipped 12° / 700 px behaviour, so combat feel is unchanged by default.
+    let cone: number;
+    let reachSq: number;
+    let headBand: number;
+    if (this.aimAssist === 'off') {
+      cone = 0;
+      reachSq = 0;
+      headBand = 0;
+    } else if (this.aimAssist === 'high') {
+      cone = 0.3491; // 20°
+      reachSq = 810000; // 900 px
+      headBand = 360;
+    } else {
+      cone = 0.2094; // 12°
+      reachSq = 490000; // 700 px
+      headBand = 320;
+    }
+
+    let bestDiff = cone;
     for (const e of enemies) {
+      if (cone <= 0) break;
       if (e.health <= 0 && e.state === 'DOWNED') continue;
       const hx = e.position.x - mx;
       const hy = e.position.y - 96 - my;
-      if (Math.abs(hy) > 320 || hx * hx + hy * hy > 490000) continue;
+      if (Math.abs(hy) > headBand || hx * hx + hy * hy > reachSq) continue;
       const toHead = Math.atan2(hy, hx);
       const diff = Math.abs(((toHead - ang + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
       if (diff < bestDiff) {

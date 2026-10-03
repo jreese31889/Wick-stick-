@@ -19,7 +19,7 @@ import {
   UPGRADES,
   type UpgradeId,
 } from './Catalogs';
-import { DEFAULT_SETTINGS, loadSettings, type GameSettings } from '../components/settings';
+import { DEFAULT_SETTINGS, loadSettings, sanitizeTouchLayout, type GameSettings } from '../components/settings';
 
 export const PROFILE_KEY = 'johnstick-profile-v1';
 export const PROFILE_VERSION = 1;
@@ -125,6 +125,11 @@ function int(value: unknown, fallback: number): number {
   return Math.max(0, Math.round(num(value, fallback)));
 }
 
+/** Rounded + bounded int (PHASE 3: deadzones, sensitivities, sliders). */
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.round(num(value, fallback))));
+}
+
 function bool(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
 }
@@ -146,6 +151,21 @@ function sanitizeSettings(raw: unknown): GameSettings {
     quality,
     showFps: bool(obj.showFps, fallback.showFps),
     haptics: bool(obj.haptics, fallback.haptics),
+    // PHASE 3 — input & platform polish rides along in the profile so the
+    // touch layout / pad tuning survives a reload the same way XP does.
+    padMoveDeadzone: clampInt(obj.padMoveDeadzone, fallback.padMoveDeadzone, 0, 40),
+    padAimDeadzone: clampInt(obj.padAimDeadzone, fallback.padAimDeadzone, 0, 40),
+    padMoveSensitivity: clampInt(obj.padMoveSensitivity, fallback.padMoveSensitivity, 50, 200),
+    padAimSensitivity: clampInt(obj.padAimSensitivity, fallback.padAimSensitivity, 50, 200),
+    aimAssist:
+      obj.aimAssist === 'off' || obj.aimAssist === 'low' || obj.aimAssist === 'high'
+        ? obj.aimAssist
+        : fallback.aimAssist,
+    swipeGestures: bool(obj.swipeGestures, fallback.swipeGestures),
+    touchButtonScale: clampInt(obj.touchButtonScale, fallback.touchButtonScale, 70, 140),
+    hudOpacity: clampInt(obj.hudOpacity, fallback.hudOpacity, 40, 100),
+    touchLayout:
+      obj.touchLayout !== undefined ? sanitizeTouchLayout(obj.touchLayout) : fallback.touchLayout,
   };
 }
 

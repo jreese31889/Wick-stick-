@@ -10,6 +10,38 @@ import { SoundFX } from '../engine/SoundFX';
 
 export type Quality = 'low' | 'medium' | 'high';
 
+/** PHASE 3 4 — aim magnetism strength (Low is the shipped PHASE 1B cone). */
+export type AimAssistLevel = 'off' | 'low' | 'high';
+
+/** PHASE 3 2 — the touch controls a custom layout may reposition. */
+export type TouchControlId =
+  | 'joystick'
+  | 'aimpad'
+  | 'punch'
+  | 'kick'
+  | 'shoot'
+  | 'grab'
+  | 'dodge'
+  | 'block'
+  | 'jump'
+  | 'focus'
+  | 'interact'
+  | 'swap'
+  | 'reload';
+
+/** Normalised (fraction of screen) offset from a control's default spot. */
+export interface TouchOffset {
+  x: number;
+  y: number;
+}
+
+export interface TouchLayout {
+  /** Named preset in force, or 'custom' once a drag no longer matches one. */
+  preset: 'default' | 'southpaw' | 'custom';
+  /** Per-control offsets; a missing id means "default position". */
+  offsets: Partial<Record<TouchControlId, TouchOffset>>;
+}
+
 export interface GameSettings {
   /** Master SFX volume, 0-100. 0 silences every effect. */
   sfxVolume: number;
@@ -19,6 +51,27 @@ export interface GameSettings {
   showFps: boolean;
   /** PHASE 1B E6: gameplay haptics (pad rumble + phone vibration). */
   haptics: boolean;
+  /* -------------------------------------------------------------- */
+  /* PHASE 3 — input & platform polish                               */
+  /* -------------------------------------------------------------- */
+  /** PHASE 3 1: gamepad left-stick radial deadzone, 5-40 (%). */
+  padMoveDeadzone: number;
+  /** PHASE 3 1: gamepad right-stick (aim) radial deadzone, 5-40 (%). */
+  padAimDeadzone: number;
+  /** PHASE 3 1: left-stick sensitivity, 50-200 (%). 100 = shipped feel. */
+  padMoveSensitivity: number;
+  /** PHASE 3 1: right-stick (aim) sensitivity, 50-200 (%). 100 = shipped feel. */
+  padAimSensitivity: number;
+  /** PHASE 3 4: aim magnetism — Off / Low (shipped 12°) / High (20°). */
+  aimAssist: AimAssistLevel;
+  /** PHASE 3 3: swipe gestures on the look area (swap / reload / focus). */
+  swipeGestures: boolean;
+  /** PHASE 3 2: on-screen button scale, 70-140 (%). 100 = shipped size. */
+  touchButtonScale: number;
+  /** PHASE 3 2: HUD + touch-control opacity, 40-100 (%). */
+  hudOpacity: number;
+  /** PHASE 3 2: custom touch layout (null = default positions). */
+  touchLayout: TouchLayout | null;
 }
 
 export const DEFAULT_SETTINGS: GameSettings = {
@@ -26,7 +79,22 @@ export const DEFAULT_SETTINGS: GameSettings = {
   quality: 'high',
   showFps: true,
   haptics: true,
+  padMoveDeadzone: 15,
+  padAimDeadzone: 22,
+  padMoveSensitivity: 100,
+  padAimSensitivity: 100,
+  aimAssist: 'low',
+  swipeGestures: true,
+  touchButtonScale: 100,
+  hudOpacity: 100,
+  touchLayout: null,
 };
+
+export const AIM_ASSIST_OPTIONS: { id: AimAssistLevel; label: string; blurb: string }[] = [
+  { id: 'off', label: 'Off', blurb: 'Raw stick — no magnetism, every shot flies exactly where you point.' },
+  { id: 'low', label: 'Low', blurb: 'Shipped default: 12° head-magnetism inside the reticle cone.' },
+  { id: 'high', label: 'High', blurb: 'Wider 20° cone and longer reach — friendlier on a small screen.' },
+];
 
 export const QUALITY_OPTIONS: { id: Quality; label: string; blurb: string }[] = [
   {
@@ -101,6 +169,42 @@ function num(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+const TOUCH_CONTROL_IDS: TouchControlId[] = [
+  'joystick', 'aimpad', 'punch', 'kick', 'shoot', 'grab', 'dodge',
+  'block', 'jump', 'focus', 'interact', 'swap', 'reload',
+];
+
+/** Largest |offset| a control may be dragged from its default spot (35 % of screen). */
+export const LAYOUT_LIMIT = 0.35;
+
+/** Field-by-field guard for a stored touch layout (corrupt blobs can't crash). */
+export function sanitizeTouchLayout(raw: unknown): TouchLayout | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const obj = raw as Partial<TouchLayout>;
+  const preset = obj.preset === 'southpaw' ? 'southpaw' : obj.preset === 'default' ? 'default' : 'custom';
+  const offsets: Partial<Record<TouchControlId, TouchOffset>> = {};
+  const rawOffsets = obj.offsets && typeof obj.offsets === 'object'
+    ? (obj.offsets as Record<string, unknown>)
+    : {};
+  let count = 0;
+  for (const id of TOUCH_CONTROL_IDS) {
+    const entry = rawOffsets[id];
+    if (!entry || typeof entry !== 'object') continue;
+    const point = entry as Partial<TouchOffset>;
+    const x = clamp(num(point.x, 0), -LAYOUT_LIMIT, LAYOUT_LIMIT);
+    const y = clamp(num(point.y, 0), -LAYOUT_LIMIT, LAYOUT_LIMIT);
+    if (x === 0 && y === 0) continue;
+    offsets[id] = { x, y };
+    count++;
+  }
+  if (count === 0) return null;
+  return { preset, offsets };
+}
+
+function sanitizeAimAssist(value: unknown, fallback: AimAssistLevel): AimAssistLevel {
+  return value === 'off' || value === 'low' || value === 'high' ? value : fallback;
+}
+
 export function loadSettings(): GameSettings {
   const raw = readJson(SETTINGS_KEY);
   if (!raw) return { ...DEFAULT_SETTINGS };
@@ -113,6 +217,16 @@ export function loadSettings(): GameSettings {
     quality,
     showFps: typeof raw.showFps === 'boolean' ? raw.showFps : DEFAULT_SETTINGS.showFps,
     haptics: typeof raw.haptics === 'boolean' ? raw.haptics : DEFAULT_SETTINGS.haptics,
+    // PHASE 3 — input polish
+    padMoveDeadzone: clamp(Math.round(num(raw.padMoveDeadzone, DEFAULT_SETTINGS.padMoveDeadzone)), 0, 40),
+    padAimDeadzone: clamp(Math.round(num(raw.padAimDeadzone, DEFAULT_SETTINGS.padAimDeadzone)), 0, 40),
+    padMoveSensitivity: clamp(Math.round(num(raw.padMoveSensitivity, DEFAULT_SETTINGS.padMoveSensitivity)), 50, 200),
+    padAimSensitivity: clamp(Math.round(num(raw.padAimSensitivity, DEFAULT_SETTINGS.padAimSensitivity)), 50, 200),
+    aimAssist: sanitizeAimAssist(raw.aimAssist, DEFAULT_SETTINGS.aimAssist),
+    swipeGestures: typeof raw.swipeGestures === 'boolean' ? raw.swipeGestures : DEFAULT_SETTINGS.swipeGestures,
+    touchButtonScale: clamp(Math.round(num(raw.touchButtonScale, DEFAULT_SETTINGS.touchButtonScale)), 70, 140),
+    hudOpacity: clamp(Math.round(num(raw.hudOpacity, DEFAULT_SETTINGS.hudOpacity)), 40, 100),
+    touchLayout: sanitizeTouchLayout(raw.touchLayout),
   };
 }
 

@@ -60,6 +60,17 @@ export class GameLoop {
     this.renderer.quality = q;
     this.combatDirector.quality = q;
   }
+
+  // PHASE 3 4 — aim magnetism level mirrored from settings (like quality, it
+  // has to survive fullReset's CombatDirector swap, so it lives here too).
+  private _aimAssist: 'off' | 'low' | 'high' = 'low';
+  public get aimAssist(): 'off' | 'low' | 'high' {
+    return this._aimAssist;
+  }
+  public set aimAssist(level: 'off' | 'low' | 'high') {
+    this._aimAssist = level;
+    this.combatDirector.aimAssist = level;
+  }
   /** P6-01: averaged sim-ms and render-ms over the last 0.5 s window. */
   public updateMs = 0;
   public renderMs = 0;
@@ -85,7 +96,6 @@ export class GameLoop {
 
   // P6B-03: auto-pause while the tab/app is hidden
   private visibilityHandler: (() => void) | null = null;
-  private autoPausedByVisibility = false;
 
   // P6-03: one spawn→clear performance measure per wave
   private waveSpawnMark = '';
@@ -125,6 +135,23 @@ export class GameLoop {
   /** P6B-02: forces the next paused/idle frame to repaint (used on resize). */
   public requestIdleRender(): void {
     this.idleRenderDue = true;
+  }
+
+  /**
+   * PHASE 3 1 — one input entry point. Pushes this frame's context (facing,
+   * door reach, reload state) down first so the pad's context button and ADS
+   * hold resolve against the live simulation, then merges every device into
+   * the shared action state.
+   */
+  private pollInput() {
+    const physics = this.player.physics;
+    this.inputManager.hint.facingRight = physics.facingRight;
+    this.inputManager.hint.nearDoor =
+      this.environmentManager.doorOpen &&
+      Math.abs(physics.position.x - this.environmentManager.doorX) < 80;
+    this.inputManager.hint.canReload =
+      !physics.isReloading && physics.ammo < physics.maxAmmo && physics.reserveAmmo > 0;
+    return this.inputManager.poll();
   }
 
   /** P6-03: opens a spawn→clear measure window for the current wave. */
@@ -355,6 +382,8 @@ export class GameLoop {
     this.combatDirector = new CombatDirector();
     // P5-02: the replacement starts at high — carry the current tier over
     this.combatDirector.quality = this._quality;
+    // PHASE 3 4: ...and the aim magnetism level with it
+    this.combatDirector.aimAssist = this._aimAssist;
     this.renderer.clearAfterimages();
     this.environmentManager.reset();
     this.environmentManager.setupRoomForWave(1);
@@ -370,18 +399,17 @@ export class GameLoop {
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
 
-    // P6B-03: freeze the sim while the tab/app is hidden instead of letting
-    // rAF keep burning battery in the background. Only pauses this handler
-    // opened itself are auto-resumed, so a manual pause stays paused.
+    // P6B-03 + PHASE 3 6: freeze the sim while the tab/app is hidden instead
+    // of letting rAF keep burning battery in the background. Returning to the
+    // foreground LANDS IN PAUSE — the run never resumes under the player's
+    // thumb, they pick it up from the pause menu (or it was already paused).
     this.visibilityHandler = () => {
       if (document.hidden) {
         if (!this.isPaused && !this.isGameOver) {
           this.setPaused(true);
-          this.autoPausedByVisibility = true;
+          // No held buttons while the app sits in the background.
+          this.inputManager.releaseAll();
         }
-      } else if (this.autoPausedByVisibility) {
-        this.autoPausedByVisibility = false;
-        this.setPaused(false);
       }
     };
     document.addEventListener('visibilitychange', this.visibilityHandler);
@@ -462,6 +490,10 @@ export class GameLoop {
       }
 
       if (skipSim) {
+        // PHASE 3 1: keep the pad alive while the sim is held so Start can
+        // resume from the pause menu (its footer promises it) — the state
+        // this produces is never read by the frozen simulation.
+        if (this.isPaused) this.pollInput();
         if (renderFrame) renderScene();
         this.animFrameId = requestAnimationFrame(loop);
         return;
@@ -473,7 +505,7 @@ export class GameLoop {
       const effectiveDt = baseDt * this.combatDirector.slowMoFactor;
 
       // 1. INPUT
-      const input = this.inputManager.poll();
+      const input = this.pollInput();
 
       // 1b. Share the armed chain-finisher flag so the next press plays it
       this.player.finisherArmed = this.combatDirector.stats.finisherArmed;

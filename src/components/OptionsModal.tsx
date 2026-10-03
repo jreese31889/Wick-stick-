@@ -1,7 +1,21 @@
 import React from 'react';
-import { X, Volume2, VolumeX, Gauge, MonitorPlay, RotateCcw, Vibrate, Trash2, AlertTriangle } from 'lucide-react';
+import {
+  X,
+  Volume2,
+  VolumeX,
+  Gauge,
+  MonitorPlay,
+  RotateCcw,
+  Vibrate,
+  Trash2,
+  AlertTriangle,
+  Gamepad2,
+  Crosshair,
+  Smartphone,
+  Move,
+} from 'lucide-react';
 import type { GameSettings } from './settings';
-import { DEFAULT_SETTINGS, QUALITY_OPTIONS } from './settings';
+import { AIM_ASSIST_OPTIONS, DEFAULT_SETTINGS, QUALITY_OPTIONS } from './settings';
 
 interface OptionsModalProps {
   isOpen: boolean;
@@ -9,6 +23,11 @@ interface OptionsModalProps {
   onChange: (patch: Partial<GameSettings>) => void;
   /** PHASE 2: wipes the progression profile (level, coins, unlocks, medals). */
   onResetProfile: () => void;
+  /** PHASE 3 2: opens the full-screen drag-to-place touch layout editor. */
+  onEditLayout: () => void;
+  /** PHASE 3 1: live gamepad status for the tuning section. */
+  padConnected: boolean;
+  padName: string;
   onClose: () => void;
 }
 
@@ -16,8 +35,41 @@ const ROW = 'flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:
 const LABEL = 'font-black uppercase tracking-widest text-xs text-neutral-100 flex items-center gap-2';
 const BLURB = 'text-[11px] font-mono text-neutral-400 mt-1 leading-snug max-w-sm';
 
+/** Compact labelled slider used by every numeric PHASE 3 setting. */
+const Slider: React.FC<{
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  suffix?: string;
+  onChange: (value: number) => void;
+}> = ({ label, value, min, max, step = 1, suffix = '%', onChange }) => (
+  <div className="flex flex-col gap-1">
+    <div className="flex items-center justify-between gap-2">
+      <span className="text-[10px] font-mono uppercase tracking-wider text-neutral-400">{label}</span>
+      <span className="font-mono font-black text-xs text-amber-300">
+        {value}
+        {suffix}
+      </span>
+    </div>
+    <input
+      type="range"
+      min={min}
+      max={max}
+      step={step}
+      value={value}
+      aria-label={label}
+      onChange={(e) => onChange(Number(e.target.value))}
+      className="menu-range w-full"
+      style={{ '--vol': `${((value - min) / (max - min)) * 100}%` } as React.CSSProperties}
+    />
+  </div>
+);
+
 /**
- * Options: master SFX volume, graphics quality tier and the HUD FPS chip.
+ * Options: master SFX volume, graphics quality tier, the HUD FPS chip and the
+ * PHASE 3 input / platform controls (gamepad tuning, aim assist, touch layout).
  * Every control is thumb-sized for landscape phones.
  */
 export const OptionsModal: React.FC<OptionsModalProps> = ({
@@ -25,6 +77,9 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
   settings,
   onChange,
   onResetProfile,
+  onEditLayout,
+  padConnected,
+  padName,
   onClose,
 }) => {
   const [armed, setArmed] = React.useState(false);
@@ -50,7 +105,7 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
                 Options
               </h2>
               <span className="text-[10px] font-mono uppercase tracking-wider text-neutral-400">
-                Audio, graphics & HUD
+                Audio, graphics, HUD & controls
               </span>
             </div>
           </div>
@@ -186,6 +241,161 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
           </div>
         </div>
 
+        {/* AIM ASSIST — PHASE 3 4 */}
+        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5 space-y-3">
+          <div>
+            <div className={LABEL}>
+              <Crosshair className="w-4 h-4 text-rose-400" />
+              Aim Assist
+            </div>
+            <div className={BLURB}>
+              Head magnetism inside the reticle cone. Low is the shipped default; Off is raw stick.
+            </div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {AIM_ASSIST_OPTIONS.map((option) => {
+              const active = settings.aimAssist === option.id;
+              return (
+                <button
+                  key={option.id}
+                  onClick={() => onChange({ aimAssist: option.id })}
+                  className={`min-h-[52px] rounded-xl border px-3 py-2.5 text-left transition-all cursor-pointer ${
+                    active
+                      ? 'bg-gradient-to-r from-rose-500/25 to-amber-500/15 border-rose-400 shadow-[0_0_16px_rgba(244,63,94,0.3)]'
+                      : 'bg-neutral-900 border-white/10 hover:border-white/25'
+                  }`}
+                >
+                  <div
+                    className={`text-xs font-black uppercase tracking-widest ${
+                      active ? 'text-rose-300' : 'text-neutral-300'
+                    }`}
+                  >
+                    {option.label}
+                  </div>
+                  <div className="text-[10px] font-mono text-neutral-400 leading-snug mt-0.5">
+                    {option.blurb}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* GAMEPAD TUNING — PHASE 3 1 */}
+        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5 space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className={LABEL}>
+                <Gamepad2 className="w-4 h-4 text-emerald-400" />
+                Gamepad Tuning
+              </div>
+              <div className={BLURB}>
+                Radial deadzones and stick sensitivity for Type-C controllers. 100% = shipped feel.
+              </div>
+            </div>
+            <span
+              className={`shrink-0 px-2.5 py-1 rounded-lg border font-mono text-[10px] font-bold ${
+                padConnected
+                  ? 'bg-emerald-500/15 border-emerald-400/50 text-emerald-300'
+                  : 'bg-neutral-900 border-white/10 text-neutral-500'
+              }`}
+            >
+              {padConnected ? padName : 'No pad'}
+            </span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Slider
+              label="Move deadzone"
+              value={settings.padMoveDeadzone}
+              min={0}
+              max={40}
+              onChange={(v) => onChange({ padMoveDeadzone: v })}
+            />
+            <Slider
+              label="Aim deadzone"
+              value={settings.padAimDeadzone}
+              min={0}
+              max={40}
+              onChange={(v) => onChange({ padAimDeadzone: v })}
+            />
+            <Slider
+              label="Move sensitivity"
+              value={settings.padMoveSensitivity}
+              min={50}
+              max={200}
+              onChange={(v) => onChange({ padMoveSensitivity: v })}
+            />
+            <Slider
+              label="Aim sensitivity"
+              value={settings.padAimSensitivity}
+              min={50}
+              max={200}
+              onChange={(v) => onChange({ padAimSensitivity: v })}
+            />
+          </div>
+          <div className="text-[10px] font-mono text-neutral-500 leading-snug border-t border-white/10 pt-2">
+            A jump · B dodge · X interact / reload · Y swap · LB/RB combo · L3 block · R3 grab ·
+            LT aim · RT fire · Start pause
+          </div>
+        </div>
+
+        {/* TOUCH CONTROLS — PHASE 3 2 / 3 */}
+        <div className="bg-black/50 border border-white/10 rounded-xl p-3.5 space-y-3">
+          <div>
+            <div className={LABEL}>
+              <Smartphone className="w-4 h-4 text-sky-400" />
+              Touch Controls
+            </div>
+            <div className={BLURB}>
+              Button size, HUD fade, look-area swipe gestures and the drag-to-place layout.
+            </div>
+          </div>
+          <div className={ROW}>
+            <div>
+              <div className="text-[10px] font-mono uppercase tracking-wider text-neutral-400">
+                Swipe gestures
+              </div>
+              <div className="text-[10px] font-mono text-neutral-500 mt-0.5 leading-snug">
+                Flick right = swap · flick down = reload · two-finger tap = focus.
+              </div>
+            </div>
+            <button
+              onClick={() => onChange({ swipeGestures: !settings.swipeGestures })}
+              className={`min-h-[44px] px-5 rounded-xl border font-black uppercase tracking-widest text-xs transition-all cursor-pointer ${
+                settings.swipeGestures
+                  ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300'
+                  : 'bg-neutral-900 border-white/10 text-neutral-400'
+              }`}
+            >
+              {settings.swipeGestures ? 'On' : 'Off'}
+            </button>
+          </div>
+          <div className="flex items-center gap-3">
+            <Move className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+            <Slider
+              label="Button size"
+              value={settings.touchButtonScale}
+              min={70}
+              max={140}
+              onChange={(v) => onChange({ touchButtonScale: v })}
+            />
+          </div>
+          <Slider
+            label="HUD opacity"
+            value={settings.hudOpacity}
+            min={40}
+            max={100}
+            onChange={(v) => onChange({ hudOpacity: v })}
+          />
+          <button
+            onClick={onEditLayout}
+            className="w-full min-h-[44px] px-4 rounded-xl bg-sky-500/10 hover:bg-sky-500/20 border border-sky-400/40 text-sky-200 font-black uppercase tracking-widest text-[11px] flex items-center justify-center gap-2 transition-colors cursor-pointer"
+          >
+            <Move className="w-4 h-4" />
+            Edit touch layout
+          </button>
+        </div>
+
         {/* DANGER ZONE — PHASE 2 profile wipe (two-step confirm) */}
         <div className="bg-red-950/20 border border-red-500/30 rounded-xl p-3.5">
           <div className={ROW}>
@@ -232,7 +442,7 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
 
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2 pt-1 border-t border-white/10">
           <button
-            onClick={() => onChange({ ...DEFAULT_SETTINGS })}
+            onClick={() => onChange({ ...DEFAULT_SETTINGS, touchLayout: settings.touchLayout })}
             className="min-h-[44px] px-4 rounded-xl bg-neutral-900 hover:bg-neutral-800 border border-white/10 text-neutral-300 font-bold uppercase tracking-widest text-[11px] flex items-center justify-center gap-2 transition-colors cursor-pointer"
           >
             <RotateCcw className="w-3.5 h-3.5" />

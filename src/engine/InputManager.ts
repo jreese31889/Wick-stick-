@@ -6,6 +6,92 @@ export interface GamepadStatus {
   name: string;
 }
 
+/** Virtual (touch / gesture) button channels — also used by keyboard + pad. */
+export type VirtualButton =
+  | 'jump'
+  | 'dodge'
+  | 'attack'
+  | 'heavy'
+  | 'block'
+  | 'grab'
+  | 'shoot'
+  | 'reload'
+  | 'interact'
+  | 'focus'
+  | 'special'
+  | 'swap';
+
+/**
+ * PHASE 3 1 — one shared action channel table. Touch, keyboard and gamepad
+ * all write into the same 12 slots; `poll()` merges them with a single OR and
+ * derives every "just pressed" edge from the same merged history, so there is
+ * exactly one place where an action can become true.
+ */
+const ACT_JUMP = 0;
+const ACT_DODGE = 1;
+const ACT_ATTACK = 2;
+const ACT_HEAVY = 3;
+const ACT_BLOCK = 4;
+const ACT_GRAB = 5;
+const ACT_SHOOT = 6;
+const ACT_RELOAD = 7;
+const ACT_INTERACT = 8;
+const ACT_FOCUS = 9;
+const ACT_SPECIAL = 10;
+const ACT_SWAP = 11;
+const ACTION_COUNT = 12;
+
+const BUTTON_INDEX: Record<VirtualButton, number> = {
+  jump: ACT_JUMP,
+  dodge: ACT_DODGE,
+  attack: ACT_ATTACK,
+  heavy: ACT_HEAVY,
+  block: ACT_BLOCK,
+  grab: ACT_GRAB,
+  shoot: ACT_SHOOT,
+  reload: ACT_RELOAD,
+  interact: ACT_INTERACT,
+  focus: ACT_FOCUS,
+  special: ACT_SPECIAL,
+  swap: ACT_SWAP,
+};
+
+/**
+ * PHASE 3 1 — per-frame hints the engine pushes down before `poll()` so the
+ * pad's context button and the ADS hold can resolve against real game state
+ * without InputManager reaching back into the simulation.
+ */
+export interface InputHint {
+  /** Player facing — ADS without stick deflection aims along it. */
+  facingRight: boolean;
+  /** Open exit door within reach → the context button means "enter". */
+  nearDoor: boolean;
+  /** A tactical reload is actually possible right now. */
+  canReload: boolean;
+}
+
+/** Radial stick transform result (reused across frames — no allocation). */
+interface StickSample {
+  x: number;
+  y: number;
+  active: boolean;
+}
+
+/**
+ * PHASE 3 1 — module-level gamepad readers. Free functions (not closures
+ * built inside poll()) so the 60 Hz input path allocates nothing.
+ */
+function padPressed(buttons: readonly GamepadButton[], index: number): boolean {
+  const btn = buttons[index];
+  return Boolean(btn && (btn.pressed || btn.value > 0.45));
+}
+
+function padValue(buttons: readonly GamepadButton[], index: number): number {
+  const btn = buttons[index];
+  if (!btn) return 0;
+  return btn.value > 0 ? btn.value : btn.pressed ? 1 : 0;
+}
+
 export class InputManager {
   private state: InputState = {
     moveX: 0,
@@ -38,76 +124,51 @@ export class InputManager {
     swapJustPressed: false,
   };
 
-  // Mobile virtual control inputs (pure touch)
-  private virtualMoveX = 0;
-  private virtualMoveY = 0;
-  private virtualAimX = 0;
-  private virtualAimY = 0;
-  private virtualAimActive = false;
-  private virtualJump = false;
-  private virtualDodge = false;
-  private virtualAttack = false;
-  private virtualHeavy = false;
-  private virtualBlock = false;
-  private virtualGrab = false;
-  private virtualShoot = false;
-  private virtualReload = false;
-  private virtualInteract = false;
-  private virtualFocus = false;
-  private virtualSpecial = false;
-  private virtualSwap = false;
+  // --- Touch (virtual) channel ---------------------------------------
+  private virtX = 0;
+  private virtY = 0;
+  private virtAimX = 0;
+  private virtAimY = 0;
+  private virtAimActive = false;
+  private virt = new Uint8Array(ACTION_COUNT);
 
-  private prevVirtualJump = false;
-  private prevVirtualDodge = false;
-  private prevVirtualAttack = false;
-  private prevVirtualHeavy = false;
-  private prevVirtualBlock = false;
-  private prevVirtualGrab = false;
-  private prevVirtualShoot = false;
-  private prevVirtualReload = false;
-  private prevVirtualInteract = false;
-  private prevVirtualFocus = false;
-  private prevVirtualSpecial = false;
-  private prevVirtualSwap = false;
-
-  // Keyboard bindings (desktop fallback — mobile stays touch-first)
-  private kbJump = false;
-  private kbDodge = false;
-  private kbAttack = false;
-  private kbHeavy = false;
-  private kbBlock = false;
-  private kbGrab = false;
-  private kbShoot = false;
-  private kbReload = false;
-  private kbInteract = false;
-  private kbFocus = false;
-  private kbSpecial = false;
-  private kbSwap = false;
+  // --- Keyboard channel (desktop fallback) ----------------------------
+  private kb = new Uint8Array(ACTION_COUNT);
   private kbMoveX = 0;
   private kbMoveY = 0;
 
-  private prevKbJump = false;
-  private prevKbDodge = false;
-  private prevKbAttack = false;
-  private prevKbHeavy = false;
-  private prevKbGrab = false;
-  private prevKbShoot = false;
-  private prevKbReload = false;
-  private prevKbInteract = false;
-  private prevKbFocus = false;
-  private prevKbSpecial = false;
-  private prevKbSwap = false;
-  private prevKbBlock = false;
+  // --- Gamepad channel ------------------------------------------------
+  private pad = new Uint8Array(ACTION_COUNT);
+  /** LT held → precision-aim lock (PHASE 3 1: ADS / precision). */
+  private padAdsHeld = false;
+  private prevPadStart = false;
 
-  // Type-C / USB-C Gamepad state
+  // --- Merge history (edges are derived from this, one source of truth) --
+  private prevMerged = new Uint8Array(ACTION_COUNT);
+
+  // Reusable samples so poll() never allocates.
+  private readonly moveStick: StickSample = { x: 0, y: 0, active: false };
+  private readonly aimStick: StickSample = { x: 0, y: 0, active: false };
+
+  // PHASE 3: pad tuning (fractions + gains) pushed from GameSettings.
+  private moveDeadzone = 0.15;
+  private aimDeadzone = 0.22;
+  private moveGain = 1;
+  private aimGain = 1;
+
+  /** Engine-provided context for ADS aim direction and the pad X button. */
+  public readonly hint: InputHint = { facingRight: true, nearDoor: false, canReload: false };
+
+  // PHASE 3: touch-button pulses (swipe gestures) — released after a frame
+  // budget so a gesture reads as exactly one press through the edge detector.
+  // A fixed-size table (not a Map) keeps poll() allocation-free at 60 Hz.
+  private readonly pulseUntilAt = new Float64Array(ACTION_COUNT);
+  /** Gates the pulse expiry scan so idle frames do zero work. */
+  private pulsesActive = false;
+
   public gamepadStatus: GamepadStatus = { connected: false, name: '' };
-  // P2-02: fixed-length history (was rebuilt as a new array every frame)
-  private prevGamepadButtons: boolean[] = [
-    false, false, false, false, false, false, false, false, false, false,
-  ];
-  private prevGamepadStart = false;
-  /** L3 edge history for the gun-swap binding (L3 left the focus chord). */
-  private prevPadSwap = false;
+  /** Raw id of the pad seen last frame — gates name formatting (allocation). */
+  private lastPadId = '';
 
   // Callbacks
   public onPauseRequested?: () => void;
@@ -133,8 +194,23 @@ export class InputManager {
     }
   }
 
+  /** PHASE 3 1: deadzones (%) and sensitivities (%) from the Options menu. */
+  public applyTuning(tuning: {
+    moveDeadzone: number;
+    aimDeadzone: number;
+    moveSensitivity: number;
+    aimSensitivity: number;
+  }): void {
+    this.moveDeadzone = Math.min(0.4, Math.max(0, tuning.moveDeadzone / 100));
+    this.aimDeadzone = Math.min(0.4, Math.max(0, tuning.aimDeadzone / 100));
+    this.moveGain = Math.min(2, Math.max(0.5, tuning.moveSensitivity / 100));
+    this.aimGain = Math.min(2, Math.max(0.5, tuning.aimSensitivity / 100));
+  }
+
   private handleGamepadConnected = (e: GamepadEvent): void => {
     const cleanName = this.formatGamepadName(e.gamepad.id);
+    this.lastPadId = e.gamepad.id;
+    if (this.gamepadStatus.connected && this.gamepadStatus.name === cleanName) return;
     this.gamepadStatus = { connected: true, name: cleanName };
     if (this.onGamepadChange) this.onGamepadChange(this.gamepadStatus);
   };
@@ -144,63 +220,52 @@ export class InputManager {
   };
 
   /**
-   * Desktop keyboard fallback. Mobile remains touch-first; gamepads keep their
-   * existing Type-C bindings. Q (or PUNCH+KICK together) fires the combo special.
+   * Desktop keyboard fallback. Mobile remains touch-first; gamepads use the
+   * PHASE 3 standard layout. Q (or PUNCH+KICK together) fires the combo special.
    */
   private handleKeyDown = (e: KeyboardEvent): void => {
     if (e.repeat) return;
     switch (e.code) {
-      case 'Space': this.kbJump = true; break;
+      case 'Space': this.kb[ACT_JUMP] = 1; break;
       case 'KeyW': case 'ArrowUp': this.kbMoveY = -1; break;
       case 'KeyS': case 'ArrowDown': this.kbMoveY = 1; break;
       case 'KeyA': case 'ArrowLeft': this.kbMoveX = -1; break;
       case 'KeyD': case 'ArrowRight': this.kbMoveX = 1; break;
-      case 'ShiftLeft': case 'ShiftRight': this.kbDodge = true; break;
-      case 'KeyJ': this.kbAttack = true; break;
-      case 'KeyK': this.kbHeavy = true; break;
-      case 'KeyL': this.kbBlock = true; break;
-      case 'KeyE': this.kbGrab = true; this.kbInteract = true; break;
-      case 'KeyF': this.kbShoot = true; break;
-      case 'KeyR': this.kbReload = true; break;
-      case 'KeyC': this.kbFocus = true; break;
-      case 'KeyQ': this.kbSpecial = true; break;
-      case 'KeyX': this.kbSwap = true; break;
+      case 'ShiftLeft': case 'ShiftRight': this.kb[ACT_DODGE] = 1; break;
+      case 'KeyJ': this.kb[ACT_ATTACK] = 1; break;
+      case 'KeyK': this.kb[ACT_HEAVY] = 1; break;
+      case 'KeyL': this.kb[ACT_BLOCK] = 1; break;
+      case 'KeyE': this.kb[ACT_GRAB] = 1; this.kb[ACT_INTERACT] = 1; break;
+      case 'KeyF': this.kb[ACT_SHOOT] = 1; break;
+      case 'KeyR': this.kb[ACT_RELOAD] = 1; break;
+      case 'KeyC': this.kb[ACT_FOCUS] = 1; break;
+      case 'KeyQ': this.kb[ACT_SPECIAL] = 1; break;
+      case 'KeyX': this.kb[ACT_SWAP] = 1; break;
     }
   };
 
   private handleKeyUp = (e: KeyboardEvent): void => {
     switch (e.code) {
-      case 'Space': this.kbJump = false; break;
+      case 'Space': this.kb[ACT_JUMP] = 0; break;
       case 'KeyW': case 'ArrowUp': if (this.kbMoveY < 0) this.kbMoveY = 0; break;
       case 'KeyS': case 'ArrowDown': if (this.kbMoveY > 0) this.kbMoveY = 0; break;
       case 'KeyA': case 'ArrowLeft': if (this.kbMoveX < 0) this.kbMoveX = 0; break;
       case 'KeyD': case 'ArrowRight': if (this.kbMoveX > 0) this.kbMoveX = 0; break;
-      case 'ShiftLeft': case 'ShiftRight': this.kbDodge = false; break;
-      case 'KeyJ': this.kbAttack = false; break;
-      case 'KeyK': this.kbHeavy = false; break;
-      case 'KeyL': this.kbBlock = false; break;
-      case 'KeyE': this.kbGrab = false; this.kbInteract = false; break;
-      case 'KeyF': this.kbShoot = false; break;
-      case 'KeyR': this.kbReload = false; break;
-      case 'KeyC': this.kbFocus = false; break;
-      case 'KeyQ': this.kbSpecial = false; break;
-      case 'KeyX': this.kbSwap = false; break;
+      case 'ShiftLeft': case 'ShiftRight': this.kb[ACT_DODGE] = 0; break;
+      case 'KeyJ': this.kb[ACT_ATTACK] = 0; break;
+      case 'KeyK': this.kb[ACT_HEAVY] = 0; break;
+      case 'KeyL': this.kb[ACT_BLOCK] = 0; break;
+      case 'KeyE': this.kb[ACT_GRAB] = 0; this.kb[ACT_INTERACT] = 0; break;
+      case 'KeyF': this.kb[ACT_SHOOT] = 0; break;
+      case 'KeyR': this.kb[ACT_RELOAD] = 0; break;
+      case 'KeyC': this.kb[ACT_FOCUS] = 0; break;
+      case 'KeyQ': this.kb[ACT_SPECIAL] = 0; break;
+      case 'KeyX': this.kb[ACT_SWAP] = 0; break;
     }
   };
 
   private releaseKeyboard = (): void => {
-    this.kbJump = false;
-    this.kbDodge = false;
-    this.kbAttack = false;
-    this.kbHeavy = false;
-    this.kbBlock = false;
-    this.kbGrab = false;
-    this.kbShoot = false;
-    this.kbReload = false;
-    this.kbInteract = false;
-    this.kbFocus = false;
-    this.kbSpecial = false;
-    this.kbSwap = false;
+    this.kb.fill(0);
     this.kbMoveX = 0;
     this.kbMoveY = 0;
   };
@@ -224,7 +289,11 @@ export class InputManager {
       const gp = gamepads[i];
       if (gp && gp.connected) {
         found = true;
+        // Fast path: the same pad as last frame — skip name formatting
+        // (formatGamepadName allocates, and this runs every poll).
+        if (this.gamepadStatus.connected && this.lastPadId === gp.id) return;
         const name = this.formatGamepadName(gp.id);
+        this.lastPadId = gp.id;
         if (!this.gamepadStatus.connected || this.gamepadStatus.name !== name) {
           this.gamepadStatus = { connected: true, name };
           if (this.onGamepadChange) this.onGamepadChange(this.gamepadStatus);
@@ -233,6 +302,7 @@ export class InputManager {
       }
     }
     if (!found && this.gamepadStatus.connected) {
+      this.lastPadId = '';
       this.gamepadStatus = { connected: false, name: '' };
       if (this.onGamepadChange) this.onGamepadChange(this.gamepadStatus);
     }
@@ -249,127 +319,184 @@ export class InputManager {
 
   // Virtual control hooks from mobile touch UI
   public setVirtualJoystick(x: number, y: number): void {
-    this.virtualMoveX = x;
-    this.virtualMoveY = y;
+    this.virtX = x;
+    this.virtY = y;
   }
 
   public setVirtualAim(x: number, y: number, active: boolean): void {
-    this.virtualAimX = x;
-    this.virtualAimY = y;
-    this.virtualAimActive = active;
+    this.virtAimX = x;
+    this.virtAimY = y;
+    this.virtAimActive = active;
   }
 
-  public setVirtualButton(
-    button: 'jump' | 'dodge' | 'attack' | 'heavy' | 'block' | 'grab' | 'shoot' | 'reload' | 'interact' | 'focus' | 'special' | 'swap',
-    pressed: boolean
-  ): void {
-    switch (button) {
-      case 'jump': this.virtualJump = pressed; break;
-      case 'dodge': this.virtualDodge = pressed; break;
-      case 'attack': this.virtualAttack = pressed; break;
-      case 'heavy': this.virtualHeavy = pressed; break;
-      case 'block': this.virtualBlock = pressed; break;
-      case 'grab': this.virtualGrab = pressed; break;
-      case 'shoot': this.virtualShoot = pressed; break;
-      case 'reload': this.virtualReload = pressed; break;
-      case 'interact': this.virtualInteract = pressed; break;
-      case 'focus': this.virtualFocus = pressed; break;
-      case 'special': this.virtualSpecial = pressed; break;
-      case 'swap': this.virtualSwap = pressed; break;
-    }
+  public setVirtualButton(button: VirtualButton, pressed: boolean): void {
+    const index = BUTTON_INDEX[button];
+    this.virt[index] = pressed ? 1 : 0;
+    if (!pressed) this.pulseUntilAt[index] = 0;
   }
 
   /**
-   * Polls inputs and prepares the single unified InputState for this frame.
-   * Completely mobile-first: merges touch virtual inputs with Type-C gamepad.
+   * PHASE 3 3 — one-shot press for swipe gestures. The pulse holds the shared
+   * virtual channel for a few frames so the same edge detector that serves the
+   * on-screen buttons also serves gestures (no second input path).
+   */
+  public pulseButton(button: VirtualButton, durationMs = 140): void {
+    const index = BUTTON_INDEX[button];
+    this.virt[index] = 1;
+    this.pulseUntilAt[index] = performance.now() + durationMs;
+    this.pulsesActive = true;
+  }
+
+  /** Drops every held input (pause / background / stage start). */
+  public releaseAll(): void {
+    this.virt.fill(0);
+    this.kb.fill(0);
+    this.pad.fill(0);
+    this.kbMoveX = 0;
+    this.kbMoveY = 0;
+    this.virtX = 0;
+    this.virtY = 0;
+    this.setVirtualAim(0, 0, false);
+    this.padAdsHeld = false;
+    this.pulseUntilAt.fill(0);
+    this.pulsesActive = false;
+  }
+
+  /**
+   * Radial deadzone + sensitivity. `deadzone` is the raw fraction, `gain` the
+   * sensitivity multiplier: raising sensitivity shrinks the effective deadzone
+   * (the stick engages sooner) and scales travel toward full deflection.
+   * Writes into a reused sample — never allocates.
+   */
+  private readStick(
+    rawX: number,
+    rawY: number,
+    deadzone: number,
+    gain: number,
+    out: StickSample
+  ): void {
+    const len = Math.sqrt(rawX * rawX + rawY * rawY);
+    const dz = Math.min(0.55, Math.max(0.01, deadzone / gain));
+    if (len <= dz || len === 0) {
+      out.x = 0;
+      out.y = 0;
+      out.active = false;
+      return;
+    }
+    let mx = rawX * gain;
+    let my = rawY * gain;
+    const mag = Math.sqrt(mx * mx + my * my);
+    if (mag > 1) {
+      mx /= mag;
+      my /= mag;
+    }
+    out.x = mx;
+    out.y = my;
+    out.active = true;
+  }
+
+  /**
+   * PHASE 3 1 — polls keyboard, touch and gamepad into ONE action state.
+   * Every channel lands in the same 12-slot table; edges come from the merged
+   * history, so no device can produce a "just pressed" the others can't see.
    */
   public poll(): InputState {
     this.checkConnectedGamepad();
 
-    let moveX = this.virtualMoveX;
-    let moveY = this.virtualMoveY;
-    let aimX = this.virtualAimX;
-    let aimY = this.virtualAimY;
-    let aimActive = this.virtualAimActive;
+    // --- expire gesture pulses (fixed table — no allocation) ----------
+    if (this.pulsesActive) {
+      const now = performance.now();
+      let stillActive = false;
+      for (let k = 0; k < ACTION_COUNT; k++) {
+        const until = this.pulseUntilAt[k];
+        if (until === 0) continue;
+        if (now >= until) {
+          this.virt[k] = 0;
+          this.pulseUntilAt[k] = 0;
+        } else {
+          stillActive = true;
+        }
+      }
+      this.pulsesActive = stillActive;
+    }
 
-    let padJump = false;
-    let padDodge = false;
-    let padAttack = false;
-    let padHeavy = false;
-    let padBlock = false;
-    let padGrab = false;
-    let padShoot = false;
-    let padReload = false;
-    let padInteract = false;
-    let padFocus = false;
-    let padSwap = false;
+    // --- gamepad ------------------------------------------------------
+    let moveX = this.virtX;
+    let moveY = this.virtY;
+    let aimX = this.virtAimX;
+    let aimY = this.virtAimY;
+    let aimActive = this.virtAimActive;
+    let padSeen = false;
     let padStart = false;
+    this.padAdsHeld = false;
+    this.pad.fill(0);
 
-    // Type-C Gamepad reading
     if (typeof navigator !== 'undefined' && navigator.getGamepads) {
       const gamepads = navigator.getGamepads();
       for (let i = 0; i < gamepads.length; i++) {
         const gp = gamepads[i];
         if (!gp || !gp.connected) continue;
+        padSeen = true;
 
-        // Left Analog Stick with Deadzone (0.15)
-        const axisX = gp.axes[0] || 0;
-        const axisY = gp.axes[1] || 0;
-        const deadzone = 0.15;
-
-        if (Math.abs(axisX) > deadzone) {
-          moveX = axisX;
-        }
-        if (Math.abs(axisY) > deadzone) {
-          moveY = axisY;
+        // Left stick — locomotion (radial deadzone + sensitivity)
+        this.readStick(gp.axes[0] || 0, gp.axes[1] || 0, this.moveDeadzone, this.moveGain, this.moveStick);
+        if (this.moveStick.active) {
+          moveX = this.moveStick.x;
+          moveY = this.moveStick.y;
         }
 
-        // Right Analog Stick for Twin-Stick Precision Free Aim
-        const rightAxisX = gp.axes[2] !== undefined ? gp.axes[2] : (gp.axes[3] !== undefined ? gp.axes[3] : 0);
-        const rightAxisY = gp.axes[3] !== undefined && gp.axes[2] !== undefined ? gp.axes[3] : 0;
-        const rightDeadzone = 0.22;
-        const rightLen = Math.sqrt(rightAxisX * rightAxisX + rightAxisY * rightAxisY);
-        if (rightLen > rightDeadzone) {
-          aimX = rightAxisX / rightLen;
-          aimY = rightAxisY / rightLen;
+        // Right stick — twin-stick aim feeding the precision-aim model
+        const rx = gp.axes[2] !== undefined ? gp.axes[2] : 0;
+        const ry = gp.axes[3] !== undefined ? gp.axes[3] : 0;
+        this.readStick(rx, ry, this.aimDeadzone, this.aimGain, this.aimStick);
+        if (this.aimStick.active) {
+          const len = Math.sqrt(this.aimStick.x * this.aimStick.x + this.aimStick.y * this.aimStick.y) || 1;
+          aimX = this.aimStick.x / len;
+          aimY = this.aimStick.y / len;
           aimActive = true;
         }
 
         const b = gp.buttons;
         if (b && b.length > 0) {
-          const isDown = (index: number) => Boolean(b[index] && (b[index].pressed || b[index].value > 0.45));
+          // D-Pad override (digital full deflection, shipped behaviour)
+          if (padPressed(b, 14)) moveX = -1;
+          if (padPressed(b, 15)) moveX = 1;
+          if (padPressed(b, 12)) moveY = -1;
+          if (padPressed(b, 13)) moveY = 1;
 
-          // D-Pad override
-          if (isDown(14)) moveX = -1; // Left
-          if (isDown(15)) moveX = 1;  // Right
-          if (isDown(12)) moveY = -1; // Up
-          if (isDown(13)) moveY = 1;  // Down
+          /* PHASE 3 standard pad layout:
+             A jump · B dodge · X context (interact / reload) · Y swap
+             LB punch · RB kick · LT ADS (hold) · RT fire
+             L3 block · R3 grab · Select focus · Start pause */
+          this.pad[ACT_JUMP] = padPressed(b, 0) ? 1 : 0;
+          this.pad[ACT_DODGE] = padPressed(b, 1) ? 1 : 0;
+          this.pad[ACT_SWAP] = padPressed(b, 3) ? 1 : 0;
+          this.pad[ACT_ATTACK] = padPressed(b, 4) ? 1 : 0;
+          this.pad[ACT_HEAVY] = padPressed(b, 5) ? 1 : 0;
+          this.pad[ACT_SHOOT] = padPressed(b, 7) ? 1 : 0;
+          this.pad[ACT_FOCUS] = padPressed(b, 8) ? 1 : 0;
+          this.pad[ACT_BLOCK] = padPressed(b, 10) ? 1 : 0;
+          this.pad[ACT_GRAB] = padPressed(b, 11) ? 1 : 0;
+          padStart = padPressed(b, 9);
 
-          // Standard Action Buttons
-          padJump = isDown(0);                      // A / Cross
-          padDodge = isDown(1);                     // B / Circle
-          padAttack = isDown(2);                    // X / Square (Primary Combo)
-          padHeavy = isDown(3);                     // Y / Triangle (Guard Crush)
-          padBlock = isDown(4);                     // L1 / LB (Block / Parry)
-          padGrab = isDown(5);                      // R1 / RB (Takedown / Grab)
-          padReload = isDown(6);                    // L2 / LT (Reload)
-          padShoot = isDown(7);                     // R2 / RT (Pistol / Shotgun / Throw)
-          padFocus = isDown(8) || isDown(11);   // Select / R3 (L3 is SWAP)
-          padSwap = isDown(10);                 // L3 — cycle the owned firearms
-          padStart = isDown(9);                 // Start / Menu
-          padInteract = isDown(0) || isDown(7);     // Contextual action
+          // LT — ADS / precision aim while held (analog trigger aware)
+          this.padAdsHeld = padValue(b, 6) > 0.45;
+
+          // X — context button: enter door when one is open and in reach,
+          // reload when a tactical reload is actually possible, else interact.
+          if (padPressed(b, 2)) {
+            if (this.hint.nearDoor) this.pad[ACT_INTERACT] = 1;
+            else if (this.hint.canReload) this.pad[ACT_RELOAD] = 1;
+            else this.pad[ACT_INTERACT] = 1;
+          }
         }
         break; // Process primary active gamepad
       }
     }
 
-    // Trigger Pause via Type-C Gamepad Start/Options button
-    if (padStart && !this.prevGamepadStart) {
-      if (this.onPauseRequested) {
-        this.onPauseRequested();
-      }
-    }
-    this.prevGamepadStart = padStart;
+    // Trigger Pause via Start / Menu
+    if (padStart && !this.prevPadStart && this.onPauseRequested) this.onPauseRequested();
+    this.prevPadStart = padStart;
 
     // Keyboard fallback (only when touch stick / gamepad are idle)
     if (Math.abs(moveX) < 0.01 && this.kbMoveX !== 0) moveX = this.kbMoveX;
@@ -382,106 +509,57 @@ export class InputManager {
       moveY /= len;
     }
 
-    // Combine Touch Controls + Type-C Gamepad + Keyboard
-    const jump = this.virtualJump || padJump || this.kbJump;
-    const dodge = this.virtualDodge || padDodge || this.kbDodge;
-    const attack = this.virtualAttack || padAttack || this.kbAttack;
-    const heavy = this.virtualHeavy || padHeavy || this.kbHeavy;
-    const block = this.virtualBlock || padBlock || this.kbBlock;
-    const grab = this.virtualGrab || padGrab || this.kbGrab;
-    const shoot = this.virtualShoot || padShoot || this.kbShoot;
-    const reload = this.virtualReload || padReload || this.kbReload;
-    const interact = this.virtualInteract || padInteract || this.kbInteract;
-    const focus = this.virtualFocus || padFocus || this.kbFocus;
-    const swap = this.virtualSwap || padSwap || this.kbSwap;
-    // Combo special: dedicated binding OR holding PUNCH + KICK together
-    const special = this.virtualSpecial || this.kbSpecial || (attack && heavy);
+    // ADS precision lock: LT held with no live aim stick aims along the
+    // facing the engine reports, so touch and pad enter the same precision
+    // aim state (laser, tightened spread, camera push-in).
+    if (!aimActive && this.padAdsHeld && padSeen) {
+      aimX = this.hint.facingRight ? 1 : -1;
+      aimY = 0;
+      aimActive = true;
+    }
 
-    // Detect "just pressed" edges
-    const prevJump = this.prevVirtualJump || Boolean(this.prevGamepadButtons[0]) || this.prevKbJump;
-    const prevDodge = this.prevVirtualDodge || Boolean(this.prevGamepadButtons[1]) || this.prevKbDodge;
-    const prevAttack = this.prevVirtualAttack || Boolean(this.prevGamepadButtons[2]) || this.prevKbAttack;
-    const prevHeavy = this.prevVirtualHeavy || Boolean(this.prevGamepadButtons[3]) || this.prevKbHeavy;
-    const prevBlock = this.prevVirtualBlock || Boolean(this.prevGamepadButtons[4]) || this.prevKbBlock;
-    const prevGrab = this.prevVirtualGrab || Boolean(this.prevGamepadButtons[5]) || this.prevKbGrab;
-    const prevReload = this.prevVirtualReload || Boolean(this.prevGamepadButtons[6]) || this.prevKbReload;
-    const prevShoot = this.prevVirtualShoot || Boolean(this.prevGamepadButtons[7]) || this.prevKbShoot;
-    const prevFocus = this.prevVirtualFocus || Boolean(this.prevGamepadButtons[8]) || this.prevKbFocus;
-    const prevInteract = this.prevVirtualInteract || Boolean(this.prevGamepadButtons[7] || this.prevGamepadButtons[0]) || this.prevKbInteract;
-    const prevSpecial = this.prevVirtualSpecial || this.prevKbSpecial || (prevAttack && prevHeavy);
-    const prevSwap = this.prevVirtualSwap || this.prevPadSwap || this.prevKbSwap;
-
-    // P2-02: mutated in place — poll() no longer allocates a fresh state
-    // object every frame (PlayerController keeps a live reference to it).
+    // --- merge every channel into the single action state -------------
     const s = this.state;
+    const merged = this.mergedScratch;
+    for (let k = 0; k < ACTION_COUNT; k++) {
+      merged[k] = this.virt[k] || this.kb[k] || this.pad[k] ? 1 : 0;
+    }
+    // Combo special: dedicated binding OR holding PUNCH + KICK together
+    merged[ACT_SPECIAL] = merged[ACT_SPECIAL] || (merged[ACT_ATTACK] && merged[ACT_HEAVY]) ? 1 : 0;
+
+    const prev = this.prevMerged;
     s.moveX = moveX;
     s.moveY = moveY;
     s.aimX = aimX;
     s.aimY = aimY;
     s.aimActive = aimActive;
-    s.jump = jump;
-    s.jumpJustPressed = jump && !prevJump;
-    s.dodge = dodge;
-    s.dodgeJustPressed = dodge && !prevDodge;
-    s.attack = attack;
-    s.attackJustPressed = attack && !prevAttack;
-    s.heavyAttack = heavy;
-    s.heavyAttackJustPressed = heavy && !prevHeavy;
-    s.block = block;
-    s.grab = grab;
-    s.grabJustPressed = grab && !prevGrab;
-    s.shoot = shoot;
-    s.shootJustPressed = shoot && !prevShoot;
-    s.reload = reload;
-    s.reloadJustPressed = reload && !prevReload;
-    s.interact = interact;
-    s.interactJustPressed = interact && !prevInteract;
-    s.focus = focus;
-    s.focusJustPressed = focus && !prevFocus;
-    s.special = special;
-    s.specialJustPressed = special && !prevSpecial;
-    s.swap = swap;
-    s.swapJustPressed = swap && !prevSwap;
+    s.jump = merged[ACT_JUMP] === 1;
+    s.jumpJustPressed = s.jump && prev[ACT_JUMP] === 0;
+    s.dodge = merged[ACT_DODGE] === 1;
+    s.dodgeJustPressed = s.dodge && prev[ACT_DODGE] === 0;
+    s.attack = merged[ACT_ATTACK] === 1;
+    s.attackJustPressed = s.attack && prev[ACT_ATTACK] === 0;
+    s.heavyAttack = merged[ACT_HEAVY] === 1;
+    s.heavyAttackJustPressed = s.heavyAttack && prev[ACT_HEAVY] === 0;
+    s.block = merged[ACT_BLOCK] === 1;
+    s.grab = merged[ACT_GRAB] === 1;
+    s.grabJustPressed = s.grab && prev[ACT_GRAB] === 0;
+    s.shoot = merged[ACT_SHOOT] === 1;
+    s.shootJustPressed = s.shoot && prev[ACT_SHOOT] === 0;
+    s.reload = merged[ACT_RELOAD] === 1;
+    s.reloadJustPressed = s.reload && prev[ACT_RELOAD] === 0;
+    s.interact = merged[ACT_INTERACT] === 1;
+    s.interactJustPressed = s.interact && prev[ACT_INTERACT] === 0;
+    s.focus = merged[ACT_FOCUS] === 1;
+    s.focusJustPressed = s.focus && prev[ACT_FOCUS] === 0;
+    s.special = merged[ACT_SPECIAL] === 1;
+    s.specialJustPressed = s.special && prev[ACT_SPECIAL] === 0;
+    s.swap = merged[ACT_SWAP] === 1;
+    s.swapJustPressed = s.swap && prev[ACT_SWAP] === 0;
 
-    // Update history for next frame
-    this.prevVirtualJump = this.virtualJump;
-    this.prevVirtualDodge = this.virtualDodge;
-    this.prevVirtualAttack = this.virtualAttack;
-    this.prevVirtualHeavy = this.virtualHeavy;
-    this.prevVirtualBlock = this.virtualBlock;
-    this.prevVirtualGrab = this.virtualGrab;
-    this.prevVirtualShoot = this.virtualShoot;
-    this.prevVirtualReload = this.virtualReload;
-    this.prevVirtualInteract = this.virtualInteract;
-    this.prevVirtualFocus = this.virtualFocus;
-    this.prevVirtualSpecial = this.virtualSpecial;
-    this.prevVirtualSwap = this.virtualSwap;
-
-    this.prevKbJump = this.kbJump;
-    this.prevKbDodge = this.kbDodge;
-    this.prevKbAttack = this.kbAttack;
-    this.prevKbHeavy = this.kbHeavy;
-    this.prevKbBlock = this.kbBlock;
-    this.prevKbGrab = this.kbGrab;
-    this.prevKbShoot = this.kbShoot;
-    this.prevKbReload = this.kbReload;
-    this.prevKbInteract = this.kbInteract;
-    this.prevKbFocus = this.kbFocus;
-    this.prevKbSpecial = this.kbSpecial;
-    this.prevKbSwap = this.kbSwap;
-
-    this.prevGamepadButtons[0] = padJump;
-    this.prevGamepadButtons[1] = padDodge;
-    this.prevGamepadButtons[2] = padAttack;
-    this.prevGamepadButtons[3] = padHeavy;
-    this.prevGamepadButtons[4] = padBlock;
-    this.prevGamepadButtons[5] = padGrab;
-    this.prevGamepadButtons[6] = padReload;
-    this.prevGamepadButtons[7] = padShoot;
-    this.prevGamepadButtons[8] = padFocus;
-    this.prevGamepadButtons[9] = padStart;
-    this.prevPadSwap = padSwap;
-
-    return this.state;
+    prev.set(merged);
+    return s;
   }
+
+  private readonly mergedScratch = new Uint8Array(ACTION_COUNT);
 }

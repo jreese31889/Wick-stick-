@@ -19,6 +19,7 @@ import {
   Clock,
 } from 'lucide-react';
 import { formatDuration } from './settings';
+import { padFooterHint } from './PadBindings';
 
 interface PauseMenuProps {
   gameLoop: GameLoop;
@@ -255,6 +256,14 @@ export const PauseMenu: React.FC<PauseMenuProps> = ({
             Rig
           </button>
         </div>
+
+        {/* PHASE 3 1 — live pad legend while a controller is wired in */}
+        {gameLoop.inputManager.gamepadStatus.connected && (
+          <div className="text-[10px] text-center text-neutral-300 font-mono bg-emerald-500/10 border border-emerald-400/30 rounded-lg py-1.5 px-2 leading-snug">
+            <Gamepad2 className="w-3 h-3 inline text-emerald-400" />{' '}
+            {padFooterHint(gameLoop.inputManager.gamepadStatus.name)}
+          </div>
+        )}
 
         <div className="text-[10px] text-center text-neutral-400 font-mono">
           <Zap className="w-3 h-3 inline text-amber-400" /> Tap Resume or press Start on your Type-C
