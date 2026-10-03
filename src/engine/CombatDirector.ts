@@ -1,5 +1,6 @@
 import { PlayerController } from './PlayerController';
 import { EnemyController, resolveDamage, enemyBulletPool } from './EnemyController';
+import { emitProgress, PROGRESS_EVENTS } from '../profile/ProgressEvents';
 import { Camera } from './Camera';
 import { SoundFX } from './SoundFX';
 import { Haptics } from './Haptics';
@@ -484,6 +485,16 @@ export class CombatDirector {
       // Check Enemy Defeat Loot Drop (Continental Gold Coins & Weapons)
       if (enemy.health <= 0 && !enemy.hasDroppedLoot && environmentManager) {
         enemy.hasDroppedLoot = true;
+        // PHASE 2: one KILL event per death — XP / lifetime stats / achievements
+        // fan out from App.tsx. `env` marks a barrel blast (counts toward
+        // COLLATERAL DAMAGE), `boss` toward HIGH TABLE SLAYER.
+        emitProgress(PROGRESS_EVENTS.KILL, {
+          enemyType: enemy.type,
+          env: enemy.killedByExplosion,
+          boss: enemy.type === 'BOSS' || enemy.type === 'MARQUIS',
+          heavy:
+            enemy.type === 'HEAVY' || enemy.type === 'ELITE' || enemy.type === 'DEFENDER',
+        });
         this.stats.score += this.scoreForKill();
         const coinCount = enemy.type === 'BOSS' ? 6 : enemy.type === 'HEAVY' ? 3 : 1;
         for (let c = 0; c < coinCount; c++) {
@@ -727,6 +738,7 @@ export class CombatDirector {
         this.stats.takedownCount++;
         this.stats.score += 150;
         this.registerStyle('GUNFU');
+        emitProgress(PROGRESS_EVENTS.EXECUTION, { move: 'GUN-FU' });
         Haptics.cue('heavy');
       } else {
         // Standard bullet impact. PHASE 1B hit zones: a round that lands in
@@ -899,6 +911,7 @@ export class CombatDirector {
         this.addCombo(1, 3.0);
         this.registerStyle('RICOCHET');
         Haptics.cue('hit');
+        if (enemy.health <= 0) emitProgress(PROGRESS_EVENTS.RICOCHET_KILL);
       } else {
         this.spawnSparks(impactX, impactY, -dir, 5, '#94a3b8');
       }
@@ -1159,6 +1172,7 @@ export class CombatDirector {
       const dmg = Math.max(1, Math.round(55 * scale));
       const landed = enemy.takeDamage(dmg, dirE * 540 * scale, -270 * scale, false);
       if (landed > 0) {
+        if (enemy.health <= 0) enemy.killedByExplosion = true;
         this.addCombo(1, 3.0);
         this.spawnBlood(enemy.position.x, enemy.position.y - 50, dirE, 6);
         this.spawnSparks(enemy.position.x, enemy.position.y - 50, dirE, 10, '#fdba74');
@@ -1577,6 +1591,7 @@ export class CombatDirector {
           this.announceMove('DISARM');
           this.registerStyle('DISARM');
           this.stats.score += 50;
+          emitProgress(PROGRESS_EVENTS.DISARM);
           this.spawnSparks(impactX, impactY, dirAway, 14, '#38bdf8');
           SoundFX.playGunCock();
           Haptics.cue('takedown');
@@ -2036,6 +2051,7 @@ export class CombatDirector {
         this.stats.score += 150;
         this.stats.totalDamageDealt += damage;
         this.addCombo(2, 3.2);
+        emitProgress(PROGRESS_EVENTS.EXECUTION, { move: 'JUDO SLAM' });
 
         this.spawnShockwave(enemy.position.x, py - 5, 55, '#f59e0b');
         this.spawnSparks(enemy.position.x, py - 8, -f, 18, '#fbbf24');
@@ -2133,6 +2149,7 @@ export class CombatDirector {
         this.stats.score += 150;
         this.addCombo(2, 3.5);
         this.announceMove('GRIP EXECUTION');
+        emitProgress(PROGRESS_EVENTS.EXECUTION, { move: 'GRIP EXECUTION' });
         // PHASE 1B 9/8: temple shot gets its own push-in + style credit
         camera.pushIn(1.45, 1.0);
         this.registerStyle('EXECUTION');

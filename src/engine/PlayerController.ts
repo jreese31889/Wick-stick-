@@ -5,6 +5,8 @@ import { StickRig } from './StickRig';
 import { SoundFX } from './SoundFX';
 import { Ragdoll } from './Ragdoll';
 import { GUNS, GUN_ORDER, GunId, isGun } from './Weapons';
+import { emitProgress, PROGRESS_EVENTS } from '../profile/ProgressEvents';
+import type { RunProfile } from '../profile/Progression';
 
 /** Rate-limited step toward a target: reaches it exactly, at any frame rate. */
 function moveToward(current: number, target: number, maxDelta: number): number {
@@ -26,6 +28,16 @@ export class PlayerController {
   public lastHitKbx = 0;
   public lastHitKby = 0;
 
+  // ---- PHASE 2: run-scoped profile stats (tier 0 = shipped baseline) ----
+  /** Movement-speed multiplier from the Footwork upgrade. */
+  private runSpeedMult = 1;
+  /** Reload-duration multiplier (Swift Reload move unlocks a faster cycle). */
+  private runReloadMult = 1;
+  /** Fraction of max Focus granted on wave clear / execution. */
+  private runFocusGainRatio = 0;
+  /** Damage taken during the current wave (drives the UNTOUCHABLE achievement). */
+  public waveDamageTaken = 0;
+
   // Constants
   private readonly RUN_SPEED = 320;
   private readonly SLIDE_SPEED = 480;
@@ -35,6 +47,17 @@ export class PlayerController {
   private readonly ACCELERATION = 2200;
   private readonly FRICTION = 1800;
   private readonly GROUND_Y = 0; // Stage floor baseline
+
+  /** PHASE 2: profile-scaled locomotion speeds (identical at tier 0). */
+  private runSpeed(): number {
+    return this.RUN_SPEED * this.runSpeedMult;
+  }
+  private slideSpeed(): number {
+    return this.SLIDE_SPEED * this.runSpeedMult;
+  }
+  private rollSpeed(): number {
+    return this.ROLL_SPEED * this.runSpeedMult;
+  }
 
   // Godot-style CharacterBody2D Jump Buffering & Coyote Time
   private jumpBufferTimer = 0;
@@ -214,7 +237,8 @@ export class PlayerController {
     if (this.physics.ammo >= gun.magSize || this.physics.reserveAmmo <= 0) return;
     const stats = GUNS[this.currentGun];
     this.physics.isReloading = true;
-    this.physics.reloadTimer = this.physics.ammo > 0 ? stats.reloadTactical : stats.reloadEmpty;
+    const base = this.physics.ammo > 0 ? stats.reloadTactical : stats.reloadEmpty;
+    this.physics.reloadTimer = base * this.runReloadMult;
     SoundFX.playReload();
   }
 
@@ -312,14 +336,79 @@ export class PlayerController {
     this.physics.reserveAmmo = this.gunState[this.currentGun].reserve;
   }
 
+  /** Focus costs a flat chunk to trigger — never below 0 after the spend. */
+  private static readonly FOCUS_COST = 35;
+
   public triggerFocus(): boolean {
-    if (this.physics.focus >= 35 && !this.physics.isFocusActive) {
+    if (this.physics.focus >= PlayerController.FOCUS_COST && !this.physics.isFocusActive) {
+      this.physics.focus = Math.max(0, this.physics.focus - PlayerController.FOCUS_COST);
       this.physics.isFocusActive = true;
       this.physics.focusTimer = 5.5;
       SoundFX.playWhoosh(0.5);
       return true;
     }
     return false;
+  }
+
+  /**
+   * PHASE 2: Focus grant on wave clear / execution (tier 0 ratio = 0, so the
+   * shipped one-burst-per-run behaviour is untouched until upgraded).
+   */
+  public grantFocus(ratio: number): void {
+    if (ratio <= 0) return;
+    this.physics.focus = Math.min(
+      this.physics.maxFocus,
+      this.physics.focus + this.physics.maxFocus * ratio
+    );
+  }
+
+  /**
+   * PHASE 2: paints the profile's run stats onto this fighter. Called once per
+   * run start (after fullReset, which builds a fresh controller).
+   */
+  public applyRunProfile(run: RunProfile): void {
+    this.runSpeedMult = run.speedMult > 0 ? run.speedMult : 1;
+    this.runReloadMult = run.reloadMult > 0 ? run.reloadMult : 1;
+    this.runFocusGainRatio = Math.max(0, run.focusGainRatio);
+    this.waveDamageTaken = 0;
+
+    if (run.healthBonus > 0) {
+      this.physics.maxHealth += run.healthBonus;
+      this.physics.health = Math.min(
+        this.physics.maxHealth,
+        this.physics.health + run.healthBonus
+      );
+    }
+    if (run.focusMaxBonus > 0) {
+      this.physics.maxFocus += run.focusMaxBonus;
+      this.physics.focus = Math.min(
+        this.physics.maxFocus,
+        this.physics.focus + run.focusStartBonus
+      );
+    }
+    if (run.startFullReserve) {
+      for (const id of GUN_ORDER) {
+        const gun = this.gunState[id];
+        gun.reserve = GUNS[id].reserveMax;
+      }
+      this.physics.reserveAmmo = this.gunState[this.currentGun].reserve;
+    }
+
+    const LOADOUT_WEAPONS: Record<string, WeaponType | null> = {
+      FISTS: null,
+      SMG: 'SMG',
+      SHOTGUN: 'SHOTGUN',
+      RIFLE: 'RIFLE',
+      KATANA: 'KATANA',
+    };
+    const weapon = LOADOUT_WEAPONS[run.loadout];
+    if (weapon === 'KATANA') this.equipWeapon('KATANA');
+    else if (weapon) this.pickupGun(weapon);
+  }
+
+  /** Ratio the next wave-clear / execution Focus grant will pay out. */
+  public get focusGainRatio(): number {
+    return this.runFocusGainRatio;
   }
 
   public applyPerk(perkId: PerkId): void {
@@ -343,7 +432,14 @@ export class PlayerController {
     }
     this.lastHitKbx = knockbackX;
     this.lastHitKby = knockbackY;
+    const healthBefore = this.physics.health;
     this.physics.health = Math.max(0, this.physics.health - damage);
+    // PHASE 2: wave damage ledger (UNTOUCHABLE) + progression listener
+    const taken = healthBefore - this.physics.health;
+    if (taken > 0) {
+      this.waveDamageTaken += taken;
+      emitProgress(PROGRESS_EVENTS.PLAYER_DAMAGED, { amount: taken });
+    }
     this.physics.velocity.x = knockbackX;
     this.physics.velocity.y = knockbackY;
     this.physics.grounded = false;
@@ -410,10 +506,10 @@ export class PlayerController {
     // Bullet-Time Focus timer countdown
     if (this.physics.isFocusActive) {
       this.physics.focusTimer -= dt;
-      this.physics.focus = Math.max(0, (this.physics.focusTimer / 5.5) * 100);
+      // PHASE 2: the Focus pool is a consumable now — it was spent on trigger
+      // and is no longer drained/zeroed by the burst timer.
       if (this.physics.focusTimer <= 0) {
         this.physics.isFocusActive = false;
-        this.physics.focus = 0;
       }
     }
 
@@ -424,7 +520,7 @@ export class PlayerController {
       Math.abs(input.moveX) > 0.6 &&
       this.physics.velocity.x !== 0 &&
       Math.sign(input.moveX) === Math.sign(this.physics.velocity.x) &&
-      Math.abs(this.physics.velocity.x) >= this.RUN_SPEED * 0.95;
+      Math.abs(this.physics.velocity.x) >= this.runSpeed() * 0.95;
     if (
       atFullRun &&
       !this.isAttackState(this.physics.state) &&
@@ -525,7 +621,7 @@ export class PlayerController {
         this.setState('SLIDE');
         this.physics.isSliding = true;
         const dir = this.physics.facingRight ? 1 : -1;
-        this.physics.velocity.x = dir * this.SLIDE_SPEED;
+        this.physics.velocity.x = dir * this.slideSpeed();
         SoundFX.playSlide();
         return;
       } else {
@@ -534,7 +630,7 @@ export class PlayerController {
         this.physics.isDodging = true;
         const moveDir = Math.abs(input.moveX) > 0.1 ? Math.sign(input.moveX) : (this.physics.facingRight ? 1 : -1);
         this.physics.facingRight = moveDir > 0;
-        this.physics.velocity.x = moveDir * this.ROLL_SPEED;
+        this.physics.velocity.x = moveDir * this.rollSpeed();
         return;
       }
     }
@@ -795,7 +891,7 @@ export class PlayerController {
     if (
       this.physics.grounded &&
       this.runSustainTimer >= PlayerController.FLYING_KICK_SUSTAIN &&
-      Math.abs(this.physics.velocity.x) >= this.RUN_SPEED * 0.95
+      Math.abs(this.physics.velocity.x) >= this.runSpeed() * 0.95
     ) {
       this.consumeWeaponOnStrike();
       this.setState('ATTACK_FLYING_KICK');
@@ -873,7 +969,7 @@ export class PlayerController {
     // target (an exponential approach never arrives, which reads as input lag
     // at the top end of the stick).
     if (!this.physics.isDodging && !this.physics.isSliding && !this.physics.isBlocking && !isAttacking) {
-      const targetSpeed = input.moveX * this.RUN_SPEED;
+      const targetSpeed = input.moveX * this.runSpeed();
 
       if (Math.abs(input.moveX) > 0.08) {
         this.physics.velocity.x = moveToward(

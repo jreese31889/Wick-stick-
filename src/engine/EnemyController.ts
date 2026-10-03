@@ -42,11 +42,31 @@ export const enemyBulletPool = new ObjectPool<EnemyBullet>(
 );
 
 /**
+ * PHASE 2: player damage-upgrade multiplier. Applied here so every source of
+ * outgoing damage — melee, bullets, ricochets, chip — flows through one path.
+ * The engine sets it once per run start (GameLoop.applyRunProfile); at tier 0
+ * it stays 1 and resolveDamage returns the exact Phase 1B number.
+ */
+let profileDamageMult = 1;
+
+/** Paints the run's damage multiplier (called once per run start). */
+export function setProfileDamageMult(mult: number): void {
+  profileDamageMult = Number.isFinite(mult) && mult > 0 ? mult : 1;
+}
+
+/** Current run damage multiplier (1 = upgrades at tier 0). */
+export function getProfileDamageMult(): number {
+  return profileDamageMult;
+}
+
+/**
  * The one place the punish-window bonus is applied, so the number a popup shows
  * and the number that actually lands are always the same value.
  */
 export function resolveDamage(enemy: EnemyController, damage: number): number {
-  return enemy.isVulnerable ? Math.round(damage * VULNERABLE_DAMAGE_MULT) : damage;
+  // Tier 0 keeps the exact Phase 1B number (no rounding drift).
+  const scaled = profileDamageMult === 1 ? damage : Math.round(damage * profileDamageMult);
+  return enemy.isVulnerable ? Math.round(scaled * VULNERABLE_DAMAGE_MULT) : scaled;
 }
 
 export class EnemyController {
@@ -66,6 +86,8 @@ export class EnemyController {
   public staggerMeter: number = 0;
   public maxStagger: number = 50;
   public isStaggered: boolean = false;
+  /** PHASE 2: set when a barrel blast lands the killing blow (COLLATERAL). */
+  public killedByExplosion: boolean = false;
 
   // State Machine
   public state: EnemyActionState = 'IDLE';

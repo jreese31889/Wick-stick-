@@ -51,6 +51,37 @@ import {
   saveSettings,
 } from './components/settings';
 import type { GameProgress, GameSettings } from './components/settings';
+import {
+  loadProfile,
+  saveProfile,
+  resetProfile as resetProfileStore,
+  type GameProfile,
+} from './profile/ProfileStore';
+import {
+  grantXp,
+  computeRunProfile,
+  refreshUnlocks,
+  evaluateAchievements,
+  styleRankIndex,
+  xpToNext,
+  XP_VALUES,
+} from './profile/Progression';
+import {
+  ACHIEVEMENT_MAP,
+  UNLOCK_MAP,
+  UPGRADE_MAP,
+  upgradeCost,
+  SKIN_PALETTES,
+  TINT_PALETTES,
+  type UpgradeId,
+} from './profile/Catalogs';
+import { onProgress, PROGRESS_EVENTS, type ProgressEvent } from './profile/ProgressEvents';
+import { applyPlayerPalette, applyWeaponTintPalette } from './engine/Palettes';
+import { UpgradesModal } from './components/UpgradesModal';
+import { AppearanceModal } from './components/AppearanceModal';
+import { AchievementsModal } from './components/AchievementsModal';
+import { ProfileStatsModal } from './components/ProfileStatsModal';
+import { ProgressionToasts, type ProgressToast } from './components/ProgressionToasts';
 
 export interface MilestoneItem {
   id: number;
@@ -202,6 +233,11 @@ export default function App() {
   const [showOptions, setShowOptions] = useState(false);
   const [showStageSelect, setShowStageSelect] = useState(false);
   const [showVictory, setShowVictory] = useState(false);
+  // PHASE 2 progression screens
+  const [showUpgrades, setShowUpgrades] = useState(false);
+  const [showAppearance, setShowAppearance] = useState(false);
+  const [showAchievements, setShowAchievements] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [hasStarted, setHasStarted] = useState(false);
   const [rotateDismissed, setRotateDismissed] = useState(false);
@@ -294,12 +330,216 @@ export default function App() {
 
   const togglePauseRef = useRef(togglePause);
 
+  // ============================================================
+  // PHASE 2 — persistent profile: XP / levels, banked coins, unlocks,
+  // upgrades, achievements and lifetime stats.
+  //
+  // The profile object is the single mutable source of truth; it is
+  // written in place and mirrored to localStorage only on event-driven
+  // commits (wave clear, purchase, unlock, run end, settings change) —
+  // never per frame.
+  // ============================================================
+  const profileRef = useRef<GameProfile | null>(null);
+  if (profileRef.current === null) {
+    profileRef.current = loadProfile();
+    // Boot paint: the equipped cosmetics win before the first frame renders.
+    applyPlayerPalette(SKIN_PALETTES[profileRef.current.selectedSkin]);
+    applyWeaponTintPalette(TINT_PALETTES[profileRef.current.selectedTint]);
+  }
+  /** Coins swept out of the run purse during THIS run (end-screen total). */
+  const runBankRef = useRef(0);
+  /** Last wave number that paid a WAVE_CLEAR (debug spawns can re-wipe). */
+  const lastClearedWaveRef = useRef<number | null>(null);
+  const toastIdRef = useRef(1);
+  const [toasts, setToasts] = useState<ProgressToast[]>([]);
+
+  /** Stacks a progression notification (max 3) that self-expires. */
+  const pushToast = useCallback((toast: Omit<ProgressToast, 'id'>) => {
+    const id = toastIdRef.current++;
+    setToasts((prev) => [...prev.slice(-2), { ...toast, id }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 4500);
+  }, []);
+
+  /** Grants XP and narrates any level-up with a toast + fanfare. */
+  const grantXpWithToast = useCallback(
+    (amount: number) => {
+      const p = profileRef.current;
+      if (!p || amount <= 0) return;
+      const levels = grantXp(p, amount);
+      if (levels > 0) {
+        SoundFX.playLevelUp();
+        pushToast({
+          kind: 'level',
+          title: `LEVEL ${p.level}`,
+          body: 'New gear unlocked — see Safehouse & Wardrobe',
+        });
+      }
+    },
+    [pushToast]
+  );
+
+  /**
+   * Settles a mutated profile: grants now-qualified unlocks, evaluates
+   * achievements, pays their coin/XP rewards (which can cascade into more
+   * levels/unlocks), persists, and wakes the UI. One save per call.
+   */
+  const commitProfile = useCallback(() => {
+    const p = profileRef.current;
+    if (!p) return;
+    let rounds = 0;
+    while (rounds++ < 8) {
+      const unlockedIds = refreshUnlocks(p);
+      const achievementIds = evaluateAchievements(p);
+      if (unlockedIds.length === 0 && achievementIds.length === 0) break;
+      for (const id of unlockedIds) {
+        const def = UNLOCK_MAP[id];
+        pushToast({
+          kind: 'unlock',
+          title: 'UNLOCKED',
+          body: def ? `${def.name} — ${def.description}` : id,
+        });
+      }
+      for (const id of achievementIds) {
+        const def = ACHIEVEMENT_MAP[id];
+        if (!def) continue;
+        p.coins += def.rewardCoins;
+        SoundFX.playAchievement();
+        pushToast({
+          kind: 'achievement',
+          title: def.title,
+          body: `+${def.rewardCoins} coins • +${def.rewardXp} XP`,
+        });
+        grantXpWithToast(def.rewardXp);
+      }
+    }
+    saveProfile(p);
+    setTick((t) => (t + 1) % 1000);
+  }, [pushToast, grantXpWithToast]);
+
+  /** Sweeps the run purse into the bank and folds it into lifetime earnings. */
+  const bankCoins = useCallback(() => {
+    const p = profileRef.current;
+    if (!p) return;
+    const purse = gameLoop.player.physics.coins;
+    if (purse <= 0) return;
+    gameLoop.player.physics.coins = 0;
+    p.coins += purse;
+    p.stats.coinsEarned += purse;
+    runBankRef.current += purse;
+  }, [gameLoop]);
+
+  /** Gameplay events → XP, lifetime stats, banking and achievement checks. */
+  const handleProgressEvent = useCallback(
+    (event: ProgressEvent) => {
+      const p = profileRef.current;
+      if (!p) return;
+      const data = event.data ?? {};
+      const num = (key: string) => (typeof data[key] === 'number' ? (data[key] as number) : 0);
+
+      switch (event.type) {
+        case PROGRESS_EVENTS.KILL: {
+          p.stats.kills += 1;
+          if (data.env) p.stats.envKills += 1;
+          if (data.boss) p.stats.bossKills += 1;
+          grantXpWithToast(
+            data.boss ? XP_VALUES.BOSS_KILL : data.heavy ? XP_VALUES.HEAVY_KILL : XP_VALUES.KILL
+          );
+          commitProfile();
+          break;
+        }
+        case PROGRESS_EVENTS.EXECUTION: {
+          p.stats.executions += 1;
+          grantXpWithToast(XP_VALUES.EXECUTION);
+          gameLoop.player.grantFocus(gameLoop.player.focusGainRatio);
+          commitProfile();
+          break;
+        }
+        case PROGRESS_EVENTS.DISARM: {
+          p.stats.disarms += 1;
+          commitProfile();
+          break;
+        }
+        case PROGRESS_EVENTS.RICOCHET_KILL: {
+          p.stats.ricochetKills += 1;
+          commitProfile();
+          break;
+        }
+        case PROGRESS_EVENTS.WAVE_CLEAR: {
+          const wave = Math.max(1, num('wave'));
+          if (lastClearedWaveRef.current === wave) break;
+          lastClearedWaveRef.current = wave;
+          bankCoins();
+          p.stats.wavesCleared += 1;
+          p.stats.bestWave = Math.max(p.stats.bestWave, wave);
+          p.stats.bestCombo = Math.max(p.stats.bestCombo, num('maxCombo'));
+          const rank = typeof data.styleRank === 'string' ? data.styleRank : 'D';
+          p.stats.bestStyleRank = Math.max(p.stats.bestStyleRank, styleRankIndex(rank));
+          if (num('damageTaken') <= 0) p.stats.noDamageWaves += 1;
+          grantXpWithToast(XP_VALUES.WAVE_CLEAR + (XP_VALUES.STYLE_BONUS[rank] ?? 0));
+          commitProfile();
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    [commitProfile, grantXpWithToast, bankCoins, gameLoop]
+  );
+
+  // Subscribe once per handler identity (both are stable across renders).
+  useEffect(() => onProgress(handleProgressEvent), [handleProgressEvent]);
+
+  /** PHASE 2: buys the next tier of a Safehouse upgrade with banked coins. */
+  const buyUpgrade = (id: UpgradeId) => {
+    const p = profileRef.current;
+    if (!p) return;
+    bankCoins(); // purse counts toward the spendable balance
+    const tier = p.upgrades[id] ?? 0;
+    const def = UPGRADE_MAP[id];
+    const cost = upgradeCost(id, tier);
+    if (!def || cost <= 0 || p.coins < cost) return;
+    p.coins -= cost;
+    p.upgrades[id] = tier + 1;
+    SoundFX.playCoinPickup();
+    commitProfile();
+  };
+
+  /** Applies a selected loadout / suit / tint (only ever on unlocked ids). */
+  const selectCosmetic = (kind: 'loadout' | 'skin' | 'tint', id: string) => {
+    const p = profileRef.current;
+    if (!p || !p.unlocks.includes(id)) return;
+    if (kind === 'loadout') p.selectedLoadout = id;
+    else if (kind === 'skin') p.selectedSkin = id;
+    else p.selectedTint = id;
+    if (kind === 'skin') applyPlayerPalette(SKIN_PALETTES[id]);
+    if (kind === 'tint') applyWeaponTintPalette(TINT_PALETTES[id]);
+    SoundFX.playGunCock();
+    commitProfile();
+  };
+
+  /** Wipes progression (Options → Reset Profile) but keeps audio/graphics. */
+  const handleResetProfile = useCallback(() => {
+    const fresh = resetProfileStore();
+    fresh.settings = { ...settings };
+    profileRef.current = fresh;
+    applyPlayerPalette(SKIN_PALETTES[fresh.selectedSkin]);
+    applyWeaponTintPalette(TINT_PALETTES[fresh.selectedTint]);
+    saveProfile(fresh);
+    pushToast({ kind: 'info', title: 'PROFILE WIPED', body: 'Level, coins and unlocks reset' });
+    setTick((t) => (t + 1) % 1000);
+  }, [settings, pushToast]);
+
   const buyPerk = (perkId: typeof PERK_CATALOG[number]['id'], cost: number) => {
-    if (physics.coins >= cost && !physics.perks[perkId]) {
-      physics.coins -= cost;
+    // PHASE 2: sweep the purse first so banked + field coins buy perks.
+    bankCoins();
+    const p = profileRef.current;
+    if (p && p.coins >= cost && !physics.perks[perkId]) {
+      p.coins -= cost;
       gameLoop.player.applyPerk(perkId);
       SoundFX.playCoinPickup();
-      setTick(t => (t + 1) % 1000);
+      commitProfile();
     }
   };
 
@@ -314,6 +554,9 @@ export default function App() {
     victoryLatchedRef.current = false;
     victoryOpenRef.current = false;
     clearedWaveRef.current = null;
+    // PHASE 2: fresh run — new coin ledger, new wave-clear payout window
+    runBankRef.current = 0;
+    lastClearedWaveRef.current = null;
     setShowVictory(false);
   }, []);
 
@@ -325,6 +568,9 @@ export default function App() {
       resetRunTelemetry();
 
       gameLoop.fullReset();
+      // PHASE 2: paint damage / health / speed / focus / loadout onto the run
+      const p = profileRef.current;
+      if (p) gameLoop.applyRunProfile(computeRunProfile(p));
       gameLoop.waveNumber = stage.wave;
       if (stage.spawn === 'boss') gameLoop.spawnBossDuel();
       else if (stage.spawn === 'elite') gameLoop.spawnEliteDuo();
@@ -341,6 +587,10 @@ export default function App() {
       setShowAIAgents(false);
       setShowHelp(false);
       setShowHowToPlay(false);
+      setShowUpgrades(false);
+      setShowAppearance(false);
+      setShowAchievements(false);
+      setShowProfile(false);
       SoundFX.playDoorOpen();
     },
     [gameLoop, lockLandscape, clearVirtualInputs, resetRunTelemetry]
@@ -352,6 +602,9 @@ export default function App() {
 
   /** Quit to the title screen with a clean slate. */
   const goToTitle = useCallback(() => {
+    // PHASE 2: sweep the purse before fullReset drops the fighter's coins
+    bankCoins();
+    commitProfile();
     clearVirtualInputs();
     resetRunTelemetry();
     gameLoop.fullReset();
@@ -364,8 +617,12 @@ export default function App() {
     setShowAIAgents(false);
     setShowHelp(false);
     setShowHowToPlay(false);
+    setShowUpgrades(false);
+    setShowAppearance(false);
+    setShowAchievements(false);
+    setShowProfile(false);
     setTick(t => (t + 1) % 1000);
-  }, [gameLoop, clearVirtualInputs, resetRunTelemetry]);
+  }, [gameLoop, clearVirtualInputs, resetRunTelemetry, bankCoins, commitProfile]);
 
   /** Stage cleared → record progression (unlocks the next contract). */
   const recordWaveCleared = useCallback((wave: number) => {
@@ -397,9 +654,17 @@ export default function App() {
       bestKills: Math.max(prev.bestKills, killsRef.current),
       bestTimeSec: prev.bestTimeSec > 0 ? Math.min(prev.bestTimeSec, timeSec) : timeSec,
     }));
+    // PHASE 2: lifetime victory + coin sweep for the profile
+    const p = profileRef.current;
+    if (p) {
+      p.stats.victories += 1;
+      p.stats.bestCombo = Math.max(p.stats.bestCombo, stats.maxCombo);
+      bankCoins();
+      commitProfile();
+    }
     setShowVictory(true);
     setTick(t => (t + 1) % 1000);
-  }, [gameLoop, clearVirtualInputs]);
+  }, [gameLoop, clearVirtualInputs, bankCoins, commitProfile]);
 
   const continueEndless = useCallback(() => {
     clearVirtualInputs();
@@ -426,6 +691,12 @@ export default function App() {
     Haptics.enabled = settings.haptics;
     setIsMuted(settings.sfxVolume === 0);
     saveSettings(settings);
+    // PHASE 2: settings ride along in the profile (audio/graphics survive a wipe)
+    const p = profileRef.current;
+    if (p) {
+      p.settings = { ...settings };
+      saveProfile(p);
+    }
   }, [settings, gameLoop]);
 
   useEffect(() => {
@@ -459,6 +730,10 @@ export default function App() {
       else if (showStageSelect) setShowStageSelect(false);
       else if (showHowToPlay) setShowHowToPlay(false);
       else if (showHelp) setShowHelp(false);
+      else if (showUpgrades) setShowUpgrades(false);
+      else if (showAppearance) setShowAppearance(false);
+      else if (showAchievements) setShowAchievements(false);
+      else if (showProfile) setShowProfile(false);
       else if (showPerks) setShowPerks(false);
       else if (showMilestones) setShowMilestones(false);
       else if (showAIAgents) setShowAIAgents(false);
@@ -466,7 +741,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [showOptions, showStageSelect, showHowToPlay, showHelp, showPerks, showMilestones, showAIAgents, hasStarted, isGameOver, showVictory]);
+  }, [showOptions, showStageSelect, showHowToPlay, showHelp, showPerks, showMilestones, showAIAgents, showUpgrades, showAppearance, showAchievements, showProfile, hasStarted, isGameOver, showVictory]);
 
   // Run tracker: clock, kill tally, wave-clear progression and victory detection
   useEffect(() => {
@@ -502,6 +777,19 @@ export default function App() {
         setKills(nextKills);
       }
 
+      // PHASE 2: lifetime bests commit the moment they improve (also powers
+      // the STYLE ICON / COMBO KING commendations mid-run).
+      const p = profileRef.current;
+      if (p) {
+        const rankIdx = styleRankIndex(gameLoop.combatDirector.styleRank);
+        const bestCombo = gameLoop.combatDirector.stats.maxCombo;
+        if (rankIdx > p.stats.bestStyleRank || bestCombo > p.stats.bestCombo) {
+          p.stats.bestStyleRank = Math.max(p.stats.bestStyleRank, rankIdx);
+          p.stats.bestCombo = Math.max(p.stats.bestCombo, bestCombo);
+          commitProfile();
+        }
+      }
+
       const allDowned =
         gameLoop.enemies.length > 0 &&
         gameLoop.enemies.every(e => e.health <= 0 && e.state === 'DOWNED');
@@ -525,7 +813,7 @@ export default function App() {
     }, 250);
 
     return () => window.clearInterval(id);
-  }, [hasStarted, gameLoop, recordWaveCleared, triggerVictory]);
+  }, [hasStarted, gameLoop, recordWaveCleared, triggerVictory, commitProfile]);
 
   // Defeat: freeze inputs and bank the personal bests for this run
   useEffect(() => {
@@ -538,8 +826,17 @@ export default function App() {
       bestMaxCombo: Math.max(prev.bestMaxCombo, stats.maxCombo),
       bestKills: Math.max(prev.bestKills, killsRef.current),
     }));
-  }, [isGameOver, gameLoop, clearVirtualInputs]);
+    // PHASE 2: sweep the purse into the bank + fold the run into lifetime stats
+    const p = profileRef.current;
+    if (p) {
+      p.stats.bestCombo = Math.max(p.stats.bestCombo, stats.maxCombo);
+      p.stats.bestWave = Math.max(p.stats.bestWave, gameLoop.waveNumber);
+      bankCoins();
+      commitProfile();
+    }
+  }, [isGameOver, gameLoop, clearVirtualInputs, bankCoins, commitProfile]);
 
+  const profile = profileRef.current ?? loadProfile();
   const physics = gameLoop.player.physics;
   const enemies = gameLoop.enemies;
   const combat = gameLoop.combatDirector;
@@ -563,7 +860,8 @@ export default function App() {
     takedowns: combat.stats.takedownCount,
     parries: combat.stats.parryCount,
     damage: combat.stats.totalDamageDealt,
-    coins: physics.coins,
+    // Run total = coins swept to the bank this run + what is still in the purse
+    coins: runBankRef.current + physics.coins,
     style: combat.stats.styleRating,
   };
   const isNewRecord = currentStats.score > 0 && currentStats.score >= progress.bestScore;
@@ -646,11 +944,27 @@ export default function App() {
               </div>
             )}
           </div>
-          {/* High Table Gold Coins & Equipped Weapon */}
-          <div className="flex items-center gap-2 pt-1 border-t border-white/5">
+          {/* High Table Gold Coins, Level & Equipped Weapon */}
+          <div className="flex items-center gap-2 pt-1 border-t border-white/5 flex-wrap">
             <div className="flex items-center gap-1.5 text-amber-300 font-mono text-[11px] font-bold">
               <Coins className="w-3.5 h-3.5 text-yellow-400" />
-              <span>{physics.coins} COINS</span>
+              <span>{profile.coins + physics.coins} COINS</span>
+            </div>
+
+            {/* PHASE 2: level chip with a thin XP pip */}
+            <div
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-400/30 text-emerald-300 font-mono text-[10px] font-bold"
+              title={`${profile.xp} / ${xpToNext(profile.level)} XP`}
+            >
+              <span>LV {profile.level}</span>
+              <span className="inline-block w-10 h-1 bg-black/60 rounded-full overflow-hidden align-middle">
+                <span
+                  className="block h-full bg-emerald-400 rounded-full"
+                  style={{
+                    width: `${Math.min(100, Math.round((profile.xp / Math.max(1, xpToNext(profile.level))) * 100))}%`,
+                  }}
+                />
+              </span>
             </div>
 
             {physics.equippedWeapon !== 'UNARMED' && (
@@ -1084,7 +1398,7 @@ export default function App() {
                     High Table Specie Balance
                   </div>
                   <div className="text-xl font-black font-mono text-amber-300 flex items-center gap-1.5">
-                    <span>{physics.coins}</span>
+                    <span>{profile.coins + physics.coins}</span>
                     <span className="text-xs font-normal text-amber-400/80">GOLD COINS</span>
                   </div>
                 </div>
@@ -1114,7 +1428,8 @@ export default function App() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-h-[58vh] overflow-y-auto pr-1">
               {PERK_CATALOG.map((perk) => {
                 const isOwned = Boolean(physics.perks[perk.id]);
-                const canAfford = physics.coins >= perk.cost;
+                const spendable = profile.coins + physics.coins;
+                const canAfford = spendable >= perk.cost;
                 const IconComponent = PERK_ICONS[perk.id] || Sparkles;
 
                 return (
@@ -1175,7 +1490,7 @@ export default function App() {
                           }`}
                         >
                           <Award className="w-3.5 h-3.5" />
-                          {canAfford ? 'UNLOCK' : `NEED ${perk.cost - physics.coins}`}
+                          {canAfford ? 'UNLOCK' : `NEED ${perk.cost - spendable}`}
                         </button>
                       )}
                     </div>
@@ -1356,6 +1671,7 @@ export default function App() {
         <PauseMenu
           gameLoop={gameLoop}
           runTimeSec={runTimeSec}
+          coins={profile.coins + physics.coins}
           isMuted={isMuted}
           showDebug={showDebug}
           onResume={togglePause}
@@ -1381,6 +1697,9 @@ export default function App() {
         />
       )}
 
+      {/* 6b. PHASE 2 — level-up / unlock / achievement toasts */}
+      <ProgressionToasts toasts={toasts} />
+
       {/* 7b. LANDSCAPE HINT — portrait handhelds get a rotate-your-device prompt */}
       <RotateDeviceOverlay
         visible={!rotateDismissed && shouldShowRotateHint(isPortrait)}
@@ -1400,13 +1719,51 @@ export default function App() {
       {/* 8b. HOW TO PLAY — compact real-bindings legend (title screen + pause menu) */}
       <HowToPlayModal isOpen={showHowToPlay} onClose={() => setShowHowToPlay(false)} />
 
+      {/* 8c. PHASE 2 — Safehouse upgrades (coins → permanent tiers) */}
+      <UpgradesModal
+        isOpen={showUpgrades}
+        profile={profile}
+        spendable={profile.coins + physics.coins}
+        onBuy={buyUpgrade}
+        onClose={() => setShowUpgrades(false)}
+      />
+
+      {/* 8d. PHASE 2 — loadout / suit colourway / weapon tint */}
+      <AppearanceModal
+        isOpen={showAppearance}
+        profile={profile}
+        onSelectLoadout={(id) => selectCosmetic('loadout', id)}
+        onSelectSkin={(id) => selectCosmetic('skin', id)}
+        onSelectTint={(id) => selectCosmetic('tint', id)}
+        onClose={() => setShowAppearance(false)}
+      />
+
+      {/* 8e. PHASE 2 — career commendations */}
+      <AchievementsModal
+        isOpen={showAchievements}
+        profile={profile}
+        onClose={() => setShowAchievements(false)}
+      />
+
+      {/* 8f. PHASE 2 — lifetime dossier */}
+      <ProfileStatsModal
+        isOpen={showProfile}
+        profile={profile}
+        onClose={() => setShowProfile(false)}
+      />
+
       {/* 9. MAIN MENU — Play / Stages / Options / How to Play */}
       {!hasStarted && (
         <MainMenu
           progress={progress}
+          profile={profile}
           nextStage={nextStage}
           onPlay={() => startStage(nextStage)}
           onStageSelect={() => setShowStageSelect(true)}
+          onUpgrades={() => setShowUpgrades(true)}
+          onAppearance={() => setShowAppearance(true)}
+          onAchievements={() => setShowAchievements(true)}
+          onProfile={() => setShowProfile(true)}
           onOptions={() => setShowOptions(true)}
           onHowToPlay={() => setShowHowToPlay(true)}
         />
@@ -1431,6 +1788,7 @@ export default function App() {
         isOpen={showOptions}
         settings={settings}
         onChange={updateSettings}
+        onResetProfile={handleResetProfile}
         onClose={() => setShowOptions(false)}
       />
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Volume2, VolumeX, Gauge, MonitorPlay, RotateCcw, Vibrate } from 'lucide-react';
+import { X, Volume2, VolumeX, Gauge, MonitorPlay, RotateCcw, Vibrate, Trash2, AlertTriangle } from 'lucide-react';
 import type { GameSettings } from './settings';
 import { DEFAULT_SETTINGS, QUALITY_OPTIONS } from './settings';
 
@@ -7,6 +7,8 @@ interface OptionsModalProps {
   isOpen: boolean;
   settings: GameSettings;
   onChange: (patch: Partial<GameSettings>) => void;
+  /** PHASE 2: wipes the progression profile (level, coins, unlocks, medals). */
+  onResetProfile: () => void;
   onClose: () => void;
 }
 
@@ -22,8 +24,10 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
   isOpen,
   settings,
   onChange,
+  onResetProfile,
   onClose,
 }) => {
+  const [armed, setArmed] = React.useState(false);
   if (!isOpen) return null;
 
   const volume = settings.sfxVolume;
@@ -178,6 +182,50 @@ export const OptionsModal: React.FC<OptionsModalProps> = ({
               }`}
             >
               {settings.haptics ? 'On' : 'Off'}
+            </button>
+          </div>
+        </div>
+
+        {/* DANGER ZONE — PHASE 2 profile wipe (two-step confirm) */}
+        <div className="bg-red-950/20 border border-red-500/30 rounded-xl p-3.5">
+          <div className={ROW}>
+            <div>
+              <div className={LABEL}>
+                <Trash2 className="w-4 h-4 text-red-400" />
+                Reset Profile
+              </div>
+              <div className={BLURB}>
+                Wipes level, XP, banked coins, upgrades, loadouts and medals. Audio and graphics
+                settings are kept. This cannot be undone.
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                if (!armed) {
+                  setArmed(true);
+                  window.setTimeout(() => setArmed(false), 4000);
+                  return;
+                }
+                setArmed(false);
+                onResetProfile();
+              }}
+              className={`min-h-[44px] px-5 rounded-xl border font-black uppercase tracking-widest text-xs transition-all cursor-pointer flex items-center justify-center gap-2 ${
+                armed
+                  ? 'bg-red-600 border-red-400 text-white animate-pulse'
+                  : 'bg-red-500/10 border-red-500/40 text-red-300 hover:bg-red-500/20'
+              }`}
+            >
+              {armed ? (
+                <>
+                  <AlertTriangle className="w-4 h-4" />
+                  Tap again to wipe
+                </>
+              ) : (
+                <>
+                  <Trash2 className="w-4 h-4" />
+                  Reset
+                </>
+              )}
             </button>
           </div>
         </div>

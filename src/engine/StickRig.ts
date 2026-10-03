@@ -1,5 +1,6 @@
 import { StickFigurePose, RigJoint, WeaponType } from '../types/game';
 import { TieRope } from './TieRope';
+import { PLAYER_STYLE, WEAPON_TINT } from './Palettes';
 
 /**
  * JOB 1 (visibility): the player is authored as a bright ivory silhouette so
@@ -7,25 +8,10 @@ import { TieRope } from './TieRope';
  * drawn twice — a WIDER dark outline stroke first, the bright body stroke on
  * top — which both separates him from the background and keeps the crisp
  * stick-figure edge. A faint warm rim/glow sits behind the whole figure.
+ *
+ * PHASE 2: the live palette + weapon tint live in ./Palettes as module state,
+ * so a skin/tint swap repaints on the next frame with no render-code edits.
  */
-const PLAYER_STYLE = {
-  /** Bright body stroke — front limbs and torso fill */
-  ivory: '#f6efdf',
-  /** Back limbs sit one shade deeper for depth without going dark */
-  ivoryBack: '#e3dbc7',
-  /** Dress shoes / fist shade: mid-tone so they never sink into a dark floor */
-  shoe: '#c9c0aa',
-  /** Dark outline pass drawn underneath everything */
-  outline: '#08090e',
-  shirt: '#ffffff',
-  shirtEdge: '#14151c',
-  tie: '#0b0c11',
-  cuff: '#ffffff',
-  /** Rim glow rgb prefix (alpha appended per draw) */
-  glow: '255, 240, 206',
-  /** Soft interior edge for the shirt / lapel work */
-  detail: '#1b1c24',
-};
 
 /** Dark under-stroke growth applied in the outline pass (half = rim width). */
 const OUTLINE_GROW = 3.6;
@@ -228,7 +214,7 @@ export class StickRig {
     }
 
     // Handle (Tsuka)
-    ctx.strokeStyle = '#18181b';
+    ctx.strokeStyle = WEAPON_TINT.grip;
     ctx.lineWidth = 4;
     ctx.beginPath();
     ctx.moveTo(-10, 0);
@@ -236,7 +222,7 @@ export class StickRig {
     ctx.stroke();
 
     // Guard (Tsuba)
-    ctx.strokeStyle = '#d97706';
+    ctx.strokeStyle = WEAPON_TINT.guard;
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(2, -6);
@@ -244,7 +230,7 @@ export class StickRig {
     ctx.stroke();
 
     // Polished steel blade (Hawatari)
-    ctx.strokeStyle = '#f8fafc';
+    ctx.strokeStyle = WEAPON_TINT.blade;
     ctx.lineWidth = 2.5;
     ctx.beginPath();
     ctx.moveTo(3, 0);
@@ -253,7 +239,7 @@ export class StickRig {
     ctx.stroke();
 
     // Blade glow
-    ctx.strokeStyle = 'rgba(217, 249, 157, 0.4)';
+    ctx.strokeStyle = WEAPON_TINT.glow;
     ctx.lineWidth = 4.5;
     ctx.beginPath();
     ctx.moveTo(3, 0);
@@ -290,7 +276,7 @@ export class StickRig {
     }
 
     // Handle
-    ctx.strokeStyle = '#27272a';
+    ctx.strokeStyle = WEAPON_TINT.grip;
     ctx.lineWidth = 3.5;
     ctx.beginPath();
     ctx.moveTo(-6, 0);
@@ -298,7 +284,7 @@ export class StickRig {
     ctx.stroke();
 
     // Blade
-    ctx.strokeStyle = '#e2e8f0';
+    ctx.strokeStyle = WEAPON_TINT.blade;
     ctx.lineWidth = 2.5;
     ctx.beginPath();
     ctx.moveTo(2, 0);

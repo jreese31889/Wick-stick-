@@ -1,15 +1,38 @@
 import React from 'react';
-import { Play, Layers, Settings, Gamepad2, Trophy, Target, Flame, Clock } from 'lucide-react';
+import {
+  Play,
+  Layers,
+  Settings,
+  Gamepad2,
+  Trophy,
+  Target,
+  Flame,
+  Clock,
+  Coins,
+  Swords,
+  Shirt,
+  Award,
+  User,
+} from 'lucide-react';
 import type { GameProgress } from './settings';
 import { formatDuration } from './settings';
 import type { StageDef } from './StageSelectModal';
+import type { GameProfile } from '../profile/ProfileStore';
+import { xpToNext, STYLE_RANKS } from '../profile/Progression';
+import { ACHIEVEMENTS } from '../profile/Catalogs';
 
 interface MainMenuProps {
   progress: GameProgress;
+  /** PHASE 2: persistent profile (level / coins / commendations). */
+  profile: GameProfile;
   /** Stage the Play button launches (first uncleared stage). */
   nextStage: StageDef;
   onPlay: () => void;
   onStageSelect: () => void;
+  onUpgrades: () => void;
+  onAppearance: () => void;
+  onAchievements: () => void;
+  onProfile: () => void;
   onOptions: () => void;
   onHowToPlay: () => void;
 }
@@ -23,13 +46,21 @@ const MENU_BUTTON =
  */
 export const MainMenu: React.FC<MainMenuProps> = ({
   progress,
+  profile,
   nextStage,
   onPlay,
   onStageSelect,
+  onUpgrades,
+  onAppearance,
+  onAchievements,
+  onProfile,
   onOptions,
   onHowToPlay,
 }) => {
   const stagesCleared = progress.clearedStages.filter((id) => id <= 5).length;
+  const xpNeed = xpToNext(profile.level);
+  const xpPct = Math.min(100, Math.round((profile.xp / Math.max(1, xpNeed)) * 100));
+  const unlockedCount = ACHIEVEMENTS.filter((d) => profile.achievements[d.id]?.unlocked).length;
 
   return (
     <div className="fixed inset-0 z-[60] overflow-y-auto">
@@ -60,8 +91,45 @@ export const MainMenu: React.FC<MainMenuProps> = ({
             <span>Boss duels</span>
           </div>
 
+          {/* PHASE 2 — level, bank and commendations at a glance */}
+          <div className="mt-5 max-w-xl mx-auto lg:mx-0 rounded-xl bg-black/60 border border-amber-500/25 px-3.5 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-500/25 to-teal-600/40 border border-emerald-400/40 flex items-center justify-center">
+                  <Swords className="w-4.5 h-4.5 text-emerald-300" />
+                </div>
+                <div>
+                  <div className="text-lg font-black font-mono text-emerald-300 leading-none">
+                    LV {profile.level}
+                  </div>
+                  <div className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">
+                    Rank:{' '}
+                    {STYLE_RANKS[Math.min(5, profile.stats.bestStyleRank)]} style •{' '}
+                    {unlockedCount}/{ACHIEVEMENTS.length} medals
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5 text-amber-300 font-mono text-base font-black">
+                <Coins className="w-4 h-4 text-yellow-400" />
+                {profile.coins}
+              </div>
+            </div>
+            <div className="w-full h-1.5 bg-neutral-900 rounded-full overflow-hidden border border-white/10 mt-2.5">
+              <div
+                className="h-full bg-gradient-to-r from-emerald-500 to-teal-300 transition-all duration-300"
+                style={{ width: `${xpPct}%` }}
+              />
+            </div>
+            <div className="flex items-center justify-between text-[9px] font-mono text-neutral-500 mt-1">
+              <span>
+                {profile.xp} / {xpNeed} XP
+              </span>
+              <span>next: LV {profile.level + 1}</span>
+            </div>
+          </div>
+
           {/* Career stats — progression at a glance */}
-          <div className="mt-5 grid grid-cols-2 sm:grid-cols-4 gap-2 max-w-xl mx-auto lg:mx-0">
+          <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 max-w-xl mx-auto lg:mx-0">
             <div className="rounded-xl bg-black/60 border border-white/10 px-3 py-2 text-center">
               <Trophy className="w-3.5 h-3.5 text-amber-400 mx-auto mb-1" />
               <div className="text-sm font-black font-mono text-amber-300">{progress.victories}</div>
@@ -111,6 +179,26 @@ export const MainMenu: React.FC<MainMenuProps> = ({
             <button onClick={onHowToPlay} className={`${MENU_BUTTON} menu-btn-ghost`}>
               <Gamepad2 className="w-4 h-4 text-emerald-400" />
               How to Play
+            </button>
+          </div>
+
+          {/* PHASE 2 — progression screens */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            <button onClick={onUpgrades} className={`${MENU_BUTTON} menu-btn-ghost`}>
+              <Swords className="w-4 h-4 text-amber-400" />
+              Safehouse
+            </button>
+            <button onClick={onAppearance} className={`${MENU_BUTTON} menu-btn-ghost`}>
+              <Shirt className="w-4 h-4 text-sky-400" />
+              Wardrobe
+            </button>
+            <button onClick={onAchievements} className={`${MENU_BUTTON} menu-btn-ghost`}>
+              <Award className="w-4 h-4 text-purple-400" />
+              Medals
+            </button>
+            <button onClick={onProfile} className={`${MENU_BUTTON} menu-btn-ghost`}>
+              <User className="w-4 h-4 text-emerald-400" />
+              Dossier
             </button>
           </div>
 

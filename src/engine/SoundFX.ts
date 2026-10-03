@@ -297,6 +297,68 @@ class SoundEngine {
       // Audio safety
     }
   }
+
+  /**
+   * PHASE 2: level-up fanfare — a quick ascending arpeggio (same lightweight
+   * synth voice as playHeal, no sample needed).
+   */
+  public playLevelUp() {
+    if (!this.enabled) return;
+    this.initCtx();
+    const ctx = this.ctx;
+    if (!ctx) return;
+
+    try {
+      const now = ctx.currentTime;
+      const notes = [523.25, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6
+      notes.forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'triangle';
+        const t = now + i * 0.06;
+        osc.frequency.setValueAtTime(freq, t);
+        gain.gain.setValueAtTime(0.22, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.42);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(t);
+        osc.stop(t + 0.43);
+      });
+    } catch {
+      // Audio safety
+    }
+  }
+
+  /**
+   * PHASE 2: achievement unlock chime — two bright bell tones (the coin
+   * sample stacked twice reads cheap, so this stays on the synth voice).
+   */
+  public playAchievement() {
+    if (!this.enabled) return;
+    this.initCtx();
+    const ctx = this.ctx;
+    if (!ctx) return;
+
+    try {
+      const now = ctx.currentTime;
+      const notes = [659.25, 987.77]; // E5 -> B5
+      notes.forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        const t = now + i * 0.09;
+        osc.frequency.setValueAtTime(freq, t);
+        gain.gain.setValueAtTime(0.2, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(t);
+        osc.stop(t + 0.56);
+      });
+    } catch {
+      // Audio safety
+    }
+  }
 }
 
 export const SoundFX = new SoundEngine();

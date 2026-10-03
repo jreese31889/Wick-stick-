@@ -7,6 +7,7 @@ import { EnvironmentManager } from './EnvironmentManager';
 import { ObjectPool } from './ObjectPool';
 import { POSE_JOINTS } from './AnimationController';
 import { StickFigurePose, EnemyBullet } from '../types/game';
+import { PLAYER_STYLE, WEAPON_TINT } from './Palettes';
 
 export interface DustParticle {
   x: number;
@@ -435,7 +436,12 @@ export class Renderer {
     if (player.ragdoll && !player.ragdoll.dead) {
       // Same ivory silhouette + dark under-stroke as the live rig (JOB 1),
       // with the warm rim accent so the kill-cam body keeps its glow.
-      player.ragdoll.render(ctx, '#f6efdf', '#f6efdf', 'rgba(255, 240, 206, 0.8)');
+      player.ragdoll.render(
+        ctx,
+        PLAYER_STYLE.ivory,
+        PLAYER_STYLE.ivory,
+        `rgba(${PLAYER_STYLE.glow}, 0.8)`
+      );
     } else {
       player.rig.render(
         ctx,
@@ -1789,21 +1795,21 @@ export class Renderer {
 
       if (w.type === 'KATANA') {
         // Dropped Katana
-        ctx.strokeStyle = '#18181b';
+        ctx.strokeStyle = WEAPON_TINT.grip;
         ctx.lineWidth = 3.5;
         ctx.beginPath();
         ctx.moveTo(-18, -4);
         ctx.lineTo(-8, -4);
         ctx.stroke();
 
-        ctx.strokeStyle = '#d97706';
+        ctx.strokeStyle = WEAPON_TINT.guard;
         ctx.lineWidth = 2.5;
         ctx.beginPath();
         ctx.moveTo(-8, -8);
         ctx.lineTo(-8, 0);
         ctx.stroke();
 
-        ctx.strokeStyle = '#f8fafc';
+        ctx.strokeStyle = WEAPON_TINT.blade;
         ctx.lineWidth = 2.5;
         ctx.beginPath();
         ctx.moveTo(-7, -4);
@@ -1818,28 +1824,28 @@ export class Renderer {
         // Phase 1 B6: firearm pickups read as guns, not blades
         const long = w.type === 'RIFLE' || w.type === 'SHOTGUN';
         const barrelLen = w.type === 'RIFLE' ? 34 : w.type === 'SHOTGUN' ? 30 : w.type === 'SMG' ? 22 : 16;
-        ctx.fillStyle = '#18181b';
+        ctx.fillStyle = WEAPON_TINT.slide;
         ctx.fillRect(-12, -11, barrelLen, 7); // slide / barrel
         ctx.fillRect(-8, -5, 9, 11);          // grip
         if (w.type === 'SMG') ctx.fillRect(-3, -4, 8, 4); // box magazine
         if (w.type === 'SHOTGUN') ctx.fillRect(10, -8, 12, 4); // pump
         if (w.type === 'RIFLE') ctx.fillRect(-16, -9, 6, 5);   // stock
-        ctx.fillStyle = '#7dd3fc';
+        ctx.fillStyle = WEAPON_TINT.accent;
         ctx.fillRect(-12, -11, 5, 2);
         if (long) {
-          ctx.fillStyle = '#fbbf24';
+          ctx.fillStyle = WEAPON_TINT.sight;
           ctx.fillRect(4, -13, 10, 2);
         }
       } else {
         // Dropped Knife
-        ctx.strokeStyle = '#27272a';
+        ctx.strokeStyle = WEAPON_TINT.grip;
         ctx.lineWidth = 3;
         ctx.beginPath();
         ctx.moveTo(-10, -3);
         ctx.lineTo(-2, -3);
         ctx.stroke();
 
-        ctx.strokeStyle = '#e2e8f0';
+        ctx.strokeStyle = WEAPON_TINT.blade;
         ctx.lineWidth = 2.2;
         ctx.beginPath();
         ctx.moveTo(-2, -3);

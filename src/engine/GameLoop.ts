@@ -1,6 +1,6 @@
 import { InputManager } from './InputManager';
 import { PlayerController } from './PlayerController';
-import { EnemyController } from './EnemyController';
+import { EnemyController, setProfileDamageMult } from './EnemyController';
 import { CombatDirector } from './CombatDirector';
 import { Camera } from './Camera';
 import { Renderer } from './Renderer';
@@ -9,6 +9,8 @@ import { EnvironmentManager } from './EnvironmentManager';
 import { GUNS } from './Weapons';
 import { ragdollPool } from './Ragdoll';
 import { ObjectPool } from './ObjectPool';
+import { emitProgress, PROGRESS_EVENTS } from '../profile/ProgressEvents';
+import type { RunProfile } from '../profile/Progression';
 
 export class GameLoop {
   public inputManager = new InputManager();
@@ -20,6 +22,8 @@ export class GameLoop {
   public enemies: EnemyController[] = [];
   public squadSize: number = 1;
   public waveNumber: number = 1;
+  /** PHASE 2: profile stats painted onto the fighter at run start (read by the HUD/debug). */
+  public runProfile: RunProfile | null = null;
 
   private isRunning = false;
   private animFrameId: number | null = null;
@@ -279,6 +283,19 @@ export class GameLoop {
     }
   }
 
+  /**
+   * PHASE 2: paints the profile's run stats (damage / health / speed / focus /
+   * loadout) onto the current fighter. Call right after fullReset(), which
+   * builds a fresh PlayerController — idempotent per player instance because
+   * fullReset clears the stored block.
+   */
+  public applyRunProfile(run: RunProfile): void {
+    this.runProfile = run;
+    setProfileDamageMult(run.damageMult);
+    this.player.applyRunProfile(run);
+    if (this.onStateChange) this.onStateChange();
+  }
+
   public resetFight() {
     this.isGameOver = false;
     this.isDying = false;
@@ -331,6 +348,10 @@ export class GameLoop {
       ragdollPool.release(this.player.ragdoll);
     }
     this.player = new PlayerController(0, 0);
+    // PHASE 2: the replacement starts unpainted — App re-applies via
+    // applyRunProfile, and a stale block here would double-dip the bonuses.
+    this.runProfile = null;
+    setProfileDamageMult(1);
     this.combatDirector = new CombatDirector();
     // P5-02: the replacement starts at high — carry the current tier over
     this.combatDirector.quality = this._quality;
@@ -482,6 +503,17 @@ export class GameLoop {
         this.waveClearMarked = true;
         this.markWaveClear();
         this.player.restockAmmo();
+        // PHASE 2: Focus grant (ratio 0 at upgrade tier 0) + one progression
+        // event per wave — XP, banking, achievements and toasts fan out there.
+        this.player.grantFocus(this.player.focusGainRatio);
+        const damageTaken = this.player.waveDamageTaken;
+        this.player.waveDamageTaken = 0;
+        emitProgress(PROGRESS_EVENTS.WAVE_CLEAR, {
+          wave: this.waveNumber,
+          styleRank: this.combatDirector.styleRank,
+          maxCombo: this.combatDirector.stats.maxCombo,
+          damageTaken,
+        });
       }
       this.environmentManager.setDoorOpen(allEnemiesDefeated);
       this.environmentManager.update(effectiveDt, this.player.physics);

@@ -23,6 +23,8 @@ import { formatDuration } from './settings';
 interface PauseMenuProps {
   gameLoop: GameLoop;
   runTimeSec: number;
+  /** PHASE 2: wallet shown to the player — banked coins + field purse. */
+  coins: number;
   isMuted: boolean;
   showDebug: boolean;
   onResume: () => void;
@@ -49,6 +51,7 @@ const SECONDARY = `${ACTION} bg-neutral-900 hover:bg-neutral-800 border border-w
 export const PauseMenu: React.FC<PauseMenuProps> = ({
   gameLoop,
   runTimeSec,
+  coins,
   isMuted,
   showDebug,
   onResume,
@@ -63,7 +66,6 @@ export const PauseMenu: React.FC<PauseMenuProps> = ({
   onToggleSound,
   onToggleDebug,
 }) => {
-  const physics = gameLoop.player.physics;
   const combat = gameLoop.combatDirector;
   const enemies = gameLoop.enemies;
   const roomConfig = gameLoop.environmentManager.config;
@@ -120,10 +122,10 @@ export const PauseMenu: React.FC<PauseMenuProps> = ({
             </span>
           </div>
           <div className="flex items-center justify-between text-neutral-400">
-            <span>SPECIE COLLECTED:</span>
+            <span>SPECIE WALLET:</span>
             <span className="text-yellow-400 font-bold flex items-center gap-1">
               <Coins className="w-3.5 h-3.5" />
-              {physics.coins}
+              {coins}
             </span>
           </div>
           <div className="flex items-center justify-between text-neutral-400">
