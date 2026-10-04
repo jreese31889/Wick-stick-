@@ -50,11 +50,12 @@ interface FrameLog {
   patterns: number;
   lighter: number;
   stops: string[];
+  redFlashFills: number;
   scaleFactors: number[];
 }
 
 function freshLog(): FrameLog {
-  return { ops: 0, bad: [], gradients: 0, patterns: 0, lighter: 0, stops: [], scaleFactors: [] };
+  return { ops: 0, bad: [], gradients: 0, patterns: 0, lighter: 0, stops: [], redFlashFills: 0, scaleFactors: [] };
 }
 
 function finite(args: unknown[]): boolean {
@@ -63,11 +64,16 @@ function finite(args: unknown[]): boolean {
 
 /** Recording stand-in for CanvasRenderingContext2D (no DOM, no GPU). */
 function makeCtx(log: FrameLog): CanvasRenderingContext2D {
-  const gradient = {
-    addColorStop: (offset: number, color: string) => {
-      if (!Number.isFinite(offset)) log.bad.push(`addColorStop(${offset})`);
-      log.stops.push(color);
-    },
+  const makeGradient = () => {
+    const stops: string[] = [];
+    return {
+      stops,
+      addColorStop: (offset: number, color: string) => {
+        if (!Number.isFinite(offset)) log.bad.push(`addColorStop(${offset})`);
+        stops.push(color);
+        log.stops.push(color);
+      },
+    };
   };
   const target: Record<string | symbol, unknown> = {
     // Renderer reads .a/.b/.c/.d/.e/.f off this to rebuild batched transforms.
@@ -87,7 +93,7 @@ function makeCtx(log: FrameLog): CanvasRenderingContext2D {
         }
         if (prop === 'createRadialGradient' || prop === 'createLinearGradient') {
           log.gradients++;
-          return gradient;
+          return makeGradient();
         }
         if (prop === 'scale' && typeof args[0] === 'number') {
           log.scaleFactors.push(args[0]);
@@ -101,6 +107,12 @@ function makeCtx(log: FrameLog): CanvasRenderingContext2D {
           log.bad.push(`${prop}=${value}`);
         }
         if (prop === 'globalCompositeOperation' && value === 'lighter') log.lighter++;
+        if (prop === 'fillStyle') {
+          const stops = (value as { stops?: unknown })?.stops;
+          if (Array.isArray(stops) && stops.some((c) => typeof c === 'string' && c.includes('168, 22, 22'))) {
+            log.redFlashFills++;
+          }
+        }
       }
       t[prop] = value;
       return true;
@@ -309,11 +321,12 @@ console.log('\nF5 — damage arms the red edge-flash');
 
   // It decays: after enough particles updates the flash is gone again.
   for (let i = 0; i < 30; i++) renderer.updateParticles(DT);
-  const afterDecay = log.stops.length;
+  const flashesBefore = log.redFlashFills;
   w.player.physics.health = Math.max(1, w.player.physics.health - 25);
   step(w);
   renderFrame(renderer, ctx, w, env);
-  check('a second drop still arms the flash', log.stops.length > afterDecay);
+  check('a second drop still arms the flash', log.redFlashFills > flashesBefore,
+    `fills=${flashesBefore} → ${log.redFlashFills}`);
 }
 
 /* ---------------------------------------------------------------------- F6 */
@@ -327,6 +340,9 @@ console.log('\nF6 — LAND squash reaches the figure transform');
   const ctx = makeCtx(log);
 
   step(w);
+  // Neutral projection isolates the figure deform from the camera's base zoom.
+  w.camera.zoom = 1;
+  w.camera.targetZoom = 1;
   renderFrame(renderer, ctx, w, env);
 
   const before = log.scaleFactors.length;

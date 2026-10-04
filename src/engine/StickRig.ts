@@ -51,6 +51,10 @@ const FOOT_W = 4.5;
 
 export class StickRig {
   private tieRope = new TieRope();
+  /** Constant-shape rim halo, rebuilt only for a new context or palette. */
+  private rimGlow: CanvasGradient | null = null;
+  private rimGlowCtx: CanvasRenderingContext2D | null = null;
+  private rimGlowColor = '';
 
   /**
    * Updates the cloth-physics necktie: verlet rope pinned at the collar,
@@ -213,17 +217,25 @@ export class StickRig {
     this.renderHead(ctx, pose.head, facingRight, outline);
   }
 
-  /** Soft warm halo behind the figure — cheap radial gradient, drawn first. */
+  /** Soft warm halo behind the figure — cached radial gradient, drawn first. */
   private renderRimGlow(ctx: CanvasRenderingContext2D, pose: StickFigurePose): void {
     const cx = (pose.neck.x + pose.hips.x) * 0.5;
     const cy = (pose.neck.y + pose.hips.y) * 0.5 - 14;
     const radius = 96;
-    const glow = ctx.createRadialGradient(cx, cy, 6, cx, cy, radius);
-    glow.addColorStop(0, `rgba(${PLAYER_STYLE.glow}, 0.20)`);
-    glow.addColorStop(0.5, `rgba(${PLAYER_STYLE.glow}, 0.08)`);
-    glow.addColorStop(1, `rgba(${PLAYER_STYLE.glow}, 0)`);
-    ctx.fillStyle = glow;
-    ctx.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
+    if (!this.rimGlow || this.rimGlowCtx !== ctx || this.rimGlowColor !== PLAYER_STYLE.glow) {
+      const glow = ctx.createRadialGradient(0, 0, 6, 0, 0, radius);
+      glow.addColorStop(0, `rgba(${PLAYER_STYLE.glow}, 0.20)`);
+      glow.addColorStop(0.5, `rgba(${PLAYER_STYLE.glow}, 0.08)`);
+      glow.addColorStop(1, `rgba(${PLAYER_STYLE.glow}, 0)`);
+      this.rimGlow = glow;
+      this.rimGlowCtx = ctx;
+      this.rimGlowColor = PLAYER_STYLE.glow;
+    }
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.fillStyle = this.rimGlow;
+    ctx.fillRect(-radius, -radius, radius * 2, radius * 2);
+    ctx.restore();
   }
 
   private renderKatana(

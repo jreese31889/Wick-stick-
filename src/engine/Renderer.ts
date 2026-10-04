@@ -176,6 +176,9 @@ export class Renderer {
   /** Foreground lamp glow (near parallax layer) — constant coords, cached. */
   private lampGlow: CanvasGradient | null = null;
   private lampGlowAccent = '';
+  /** Wall sconce glow (mid parallax layer) — constant local coords, cached. */
+  private wallSconceGlow: CanvasGradient | null = null;
+  private wallSconceGlowAccent = '';
   /** Mid-layer fixture underglow — constant coords, cached. */
   private fixtureGlow: CanvasGradient | null = null;
   private fixtureGlowAccent = '';
@@ -268,7 +271,7 @@ export class Renderer {
     let img = this.backdropImages.get(path);
     if (!img) {
       img = new Image();
-      img.src = `${import.meta.env.BASE_URL}${path}`;
+      img.src = `${import.meta.env?.BASE_URL ?? '/'}${path}`;
       this.backdropImages.set(path, img);
     }
     return img.complete && img.naturalWidth > 0 ? img : null;
@@ -441,6 +444,8 @@ export class Renderer {
       this.grainPattern = null;
       this.grainPatternCtx = null;
       this.lampGlow = null;
+      this.wallSconceGlow = null;
+      this.wallSconceGlowAccent = '';
       this.fixtureGlow = null;
       this.impactGrad = null;
       this.impactGradCtx = null;
@@ -912,14 +917,21 @@ export class Renderer {
     }
 
     // Atmospheric warm light sconces on wall
-    for (let x = startPillar + 80; x < camX + 1000; x += pillarSpacing * 2) {
-      const lampX = x - parallaxX;
-      const lampGrad = ctx.createRadialGradient(lampX, groundY - 180, 5, lampX, groundY - 180, 140);
+    if (!this.wallSconceGlow || this.wallSconceGlowAccent !== accentColor) {
+      const lampGrad = ctx.createRadialGradient(0, 0, 5, 0, 0, 140);
       lampGrad.addColorStop(0, `${accentColor}33`);
       lampGrad.addColorStop(0.5, `${accentColor}0a`);
       lampGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
-      ctx.fillStyle = lampGrad;
-      ctx.fillRect(lampX - 140, groundY - 320, 280, 280);
+      this.wallSconceGlow = lampGrad;
+      this.wallSconceGlowAccent = accentColor;
+    }
+    for (let x = startPillar + 80; x < camX + 1000; x += pillarSpacing * 2) {
+      const lampX = x - parallaxX;
+      ctx.save();
+      ctx.translate(lampX, groundY - 180);
+      ctx.fillStyle = this.wallSconceGlow;
+      ctx.fillRect(-140, -140, 280, 280);
+      ctx.restore();
     }
     ctx.restore();
 

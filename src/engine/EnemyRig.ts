@@ -83,6 +83,10 @@ const HP_PCT_LABELS: string[] = (() => {
 })();
 
 export class EnemyRig {
+  /** Constant-shape rim halo, rebuilt only when the drawing context changes. */
+  private rimGlow: CanvasGradient | null = null;
+  private rimGlowCtx: CanvasRenderingContext2D | null = null;
+
   public render(
     ctx: CanvasRenderingContext2D,
     enemy: EnemyRigTarget,
@@ -218,12 +222,19 @@ export class EnemyRig {
     const cx = (pose.neck.x + pose.hips.x) * 0.5;
     const cy = (pose.neck.y + pose.hips.y) * 0.5 - 8;
     const radius = 78;
-    const glow = ctx.createRadialGradient(cx, cy, 6, cx, cy, radius);
-    glow.addColorStop(0, `rgba(${RIM_GLOW}, 0.16)`);
-    glow.addColorStop(0.5, `rgba(${RIM_GLOW}, 0.06)`);
-    glow.addColorStop(1, `rgba(${RIM_GLOW}, 0)`);
-    ctx.fillStyle = glow;
-    ctx.fillRect(cx - radius, cy - radius, radius * 2, radius * 2);
+    if (!this.rimGlow || this.rimGlowCtx !== ctx) {
+      const glow = ctx.createRadialGradient(0, 0, 6, 0, 0, radius);
+      glow.addColorStop(0, `rgba(${RIM_GLOW}, 0.16)`);
+      glow.addColorStop(0.5, `rgba(${RIM_GLOW}, 0.06)`);
+      glow.addColorStop(1, `rgba(${RIM_GLOW}, 0)`);
+      this.rimGlow = glow;
+      this.rimGlowCtx = ctx;
+    }
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.fillStyle = this.rimGlow;
+    ctx.fillRect(-radius, -radius, radius * 2, radius * 2);
+    ctx.restore();
   }
 
   private renderHead(
